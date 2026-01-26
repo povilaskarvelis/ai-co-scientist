@@ -1,0 +1,14 @@
+{
+  "name": "research-mcp",
+  "version": "1.0.0",
+  "description": "Research MCP server for biomedical evidence retrieval",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  }
+}

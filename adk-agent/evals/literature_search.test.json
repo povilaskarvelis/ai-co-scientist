@@ -1,0 +1,37 @@
+{
+  "eval_set_id": "literature_search",
+  "name": "Literature Research",
+  "description": "Tests agent's ability to search and summarize scientific literature",
+  "eval_cases": [
+    {
+      "eval_id": "find_snca_papers",
+      "conversation": [
+        {
+          "invocation_id": "inv-004",
+          "user_content": {
+            "parts": [{"text": "Find recent research papers on alpha-synuclein aggregation in Parkinson's"}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "I found several recent papers on alpha-synuclein aggregation in Parkinson's disease. Key research focuses on the mechanisms of SNCA protein misfolding and potential therapeutic approaches to prevent aggregation."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_pubmed",
+                "args": {"query": "alpha-synuclein aggregation Parkinson"}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    }
+  ]
+}

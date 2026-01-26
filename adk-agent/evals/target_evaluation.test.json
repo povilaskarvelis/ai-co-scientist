@@ -1,0 +1,45 @@
+{
+  "eval_set_id": "target_evaluation",
+  "name": "Target Druggability Evaluation",
+  "description": "Tests agent's ability to evaluate a specific target's druggability",
+  "eval_cases": [
+    {
+      "eval_id": "evaluate_lrrk2",
+      "conversation": [
+        {
+          "invocation_id": "inv-002",
+          "user_content": {
+            "parts": [{"text": "Evaluate LRRK2 as a drug target - is it druggable and what drugs exist?"}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "LRRK2 is a highly druggable target. It's a kinase with multiple small molecule inhibitors in clinical development. Several companies have LRRK2 inhibitors in trials for Parkinson's disease."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_targets",
+                "args": {"query": "LRRK2"}
+              },
+              {
+                "name": "check_druggability",
+                "args": {"target_id": "ENSG00000188906"}
+              },
+              {
+                "name": "get_target_drugs",
+                "args": {"target_id": "ENSG00000188906"}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    }
+  ]
+}

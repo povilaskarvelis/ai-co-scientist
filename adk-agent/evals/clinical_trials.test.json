@@ -1,0 +1,37 @@
+{
+  "eval_set_id": "clinical_trials_search",
+  "name": "Clinical Trials Research",
+  "description": "Tests agent's ability to find and analyze clinical trial data",
+  "eval_cases": [
+    {
+      "eval_id": "find_lrrk2_trials",
+      "conversation": [
+        {
+          "invocation_id": "inv-003",
+          "user_content": {
+            "parts": [{"text": "What clinical trials exist for LRRK2 inhibitors in Parkinson's?"}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "There are several clinical trials for LRRK2 inhibitors in Parkinson's disease. Key trials include studies by Denali Therapeutics and Biogen testing small molecule LRRK2 kinase inhibitors."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_clinical_trials",
+                "args": {"query": "LRRK2 inhibitor Parkinson"}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    }
+  ]
+}
