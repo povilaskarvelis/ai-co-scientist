@@ -1,0 +1,47 @@
+{
+  "eval_set_id": "co_investigator_workflow",
+  "name": "Co-Investigator Workflow",
+  "description": "Validates explicit planning, workflow transparency, and evidence-backed structured synthesis.",
+  "eval_cases": [
+    {
+      "eval_id": "ipf_expert_discovery_workflow",
+      "conversation": [
+        {
+          "invocation_id": "inv-ci-001",
+          "user_content": {
+            "parts": [
+              {
+                "text": "Find researchers who have published on idiopathic pulmonary fibrosis treatment in the last 3 years and summarize the evidence."
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "## Request\nFind researchers who have published on idiopathic pulmonary fibrosis treatment in the last 3 years.\n\n## Plan\n1. Define scope and inclusion criteria\n2. Gather publication/trial evidence\n3. Synthesize ranked researcher summary\n\n## Executed Steps\n- Scope and criteria defined\n- Evidence gathered from literature and/or clinical data\n- Structured synthesis completed\n\n## Evidence\nIncludes source citations such as PMIDs and trial IDs where available.\n\n## Findings\nProvides a shortlist of active researchers with rationale and caveats.\n\n## Limitations\nCoverage depends on available APIs and indexing latency.\n\n## Next Actions\nPropose follow-up validation and expanded search."
+              }
+            ],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_pubmed",
+                "args": {
+                  "query": "idiopathic pulmonary fibrosis treatment last 3 years authors"
+                }
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    }
+  ]
+}

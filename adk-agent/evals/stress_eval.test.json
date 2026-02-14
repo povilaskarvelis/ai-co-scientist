@@ -1,0 +1,479 @@
+{
+  "eval_set_id": "co_scientist_stress_eval",
+  "name": "Co-Scientist Stress Evaluation",
+  "description": "Broad task coverage for multi-step biomedical co-investigator workflows beyond benchmark examples.",
+  "eval_cases": [
+    {
+      "eval_id": "chronosbio_temporal_ordering",
+      "conversation": [
+        {
+          "invocation_id": "inv-stress-001",
+          "user_content": {
+            "parts": [{"text": "Infer a plausible temporal ordering of KRAS-driven signaling events from static phosphoproteomics evidence and explain uncertainty."}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "Response provides explicit assumptions, a stepwise temporal hypothesis, uncertainty bounds, supporting evidence references, limitations, and next validation experiments."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_reactome_pathways",
+                "args": {"query": "KRAS signaling phosphoproteomics", "limit": 8}
+              },
+              {
+                "name": "get_string_interactions",
+                "args": {"identifier": "KRAS", "requiredScore": 700, "limit": 12}
+              },
+              {
+                "name": "search_pubmed_advanced",
+                "args": {"query": "KRAS phosphoproteomics temporal signaling", "retmax": 8, "sort": "date"}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "target_or_trap_tyk2",
+      "conversation": [
+        {
+          "invocation_id": "inv-stress-002",
+          "user_content": {
+            "parts": [{"text": "Predict whether TYK2 modulation is likely to be safe and effective for ulcerative colitis."}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "Response includes a transparent risk-benefit judgment, supporting and contradictory evidence, confidence level, and actionable next steps."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_targets",
+                "args": {"query": "TYK2"}
+              },
+              {
+                "name": "check_druggability",
+                "args": {"targetId": "ENSG00000105397"}
+              },
+              {
+                "name": "get_target_drugs",
+                "args": {"targetId": "ENSG00000105397"}
+              },
+              {
+                "name": "search_clinical_trials",
+                "args": {"query": "TYK2 ulcerative colitis", "limit": 8}
+              },
+              {
+                "name": "search_pubmed_advanced",
+                "args": {"query": "TYK2 ulcerative colitis safety efficacy", "retmax": 8, "sort": "relevance"}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "vus_classification_brca2",
+      "conversation": [
+        {
+          "invocation_id": "inv-stress-003",
+          "user_content": {
+            "parts": [{"text": "Classify BRCA2 c.7008-2A>T as likely pathogenic or benign with explicit rationale and caveats."}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "Response provides evidence-weighted variant interpretation, conflict handling across sources, and a clearly bounded confidence statement."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_clinvar_variants",
+                "args": {"query": "BRCA2 c.7008-2A>T", "retmax": 6}
+              },
+              {
+                "name": "search_gwas_associations",
+                "args": {"query": "BRCA2", "limit": 6}
+              },
+              {
+                "name": "search_pubmed_advanced",
+                "args": {"query": "BRCA2 splice site variant pathogenicity", "retmax": 6, "sort": "date"}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "biomarker_tnbc_tissue_specific",
+      "conversation": [
+        {
+          "invocation_id": "inv-stress-004",
+          "user_content": {
+            "parts": [{"text": "Identify tissue-specific RNA/protein biomarker candidates for TNBC stratification and prioritize top candidates."}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "Response returns a ranked biomarker shortlist with prioritization criteria, evidence references, uncertainty notes, and recommended follow-up assays."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_pubmed_advanced",
+                "args": {"query": "triple negative breast cancer tissue specific biomarkers RNA protein", "retmax": 8, "sort": "date"}
+              },
+              {
+                "name": "search_openalex_works",
+                "args": {"query": "TNBC biomarker RNA protein", "fromYear": 2021, "limit": 8}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "multihop_graph_apoe",
+      "conversation": [
+        {
+          "invocation_id": "inv-stress-005",
+          "user_content": {
+            "parts": [{"text": "Create a multi-hop evidence map from APOE variants to microglial pathways and clinical relevance in Alzheimer disease."}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "Response provides a multi-hop chain with explicit node/edge rationale, source traceability, and highlighted weak links."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_clinvar_variants",
+                "args": {"query": "APOE Alzheimer", "retmax": 6}
+              },
+              {
+                "name": "search_reactome_pathways",
+                "args": {"query": "APOE microglia", "limit": 6}
+              },
+              {
+                "name": "get_string_interactions",
+                "args": {"identifier": "APOE", "requiredScore": 700, "limit": 10}
+              },
+              {
+                "name": "search_clinical_trials",
+                "args": {"query": "APOE Alzheimer", "limit": 6}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "semantic_gap_metformin_autophagy",
+      "conversation": [
+        {
+          "invocation_id": "inv-stress-006",
+          "user_content": {
+            "parts": [{"text": "Answer how metformin influences autophagy even when literature uses alternate terminology like AMPK-mTOR signaling and lysosomal flux."}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "Response demonstrates semantic expansion, retrieval evidence across synonymized concepts, and a synthesis with explicit caveats."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_pubmed_advanced",
+                "args": {"query": "metformin AMPK mTOR lysosomal flux", "retmax": 8, "sort": "relevance"}
+              },
+              {
+                "name": "search_openalex_works",
+                "args": {"query": "metformin autophagy AMPK mTOR", "fromYear": 2018, "limit": 8}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "researcher_discovery_ipf_contacts",
+      "conversation": [
+        {
+          "invocation_id": "inv-stress-007",
+          "user_content": {
+            "parts": [{"text": "Find active idiopathic pulmonary fibrosis researchers in the last 3 years and provide likely contact channels with confidence."}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "Response includes named researchers, recency/activity rationale, contact-signal confidence, and limitations around direct email availability."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_pubmed_advanced",
+                "args": {"query": "idiopathic pulmonary fibrosis treatment", "retmax": 8, "sort": "date"}
+              },
+              {
+                "name": "search_openalex_authors",
+                "args": {"query": "idiopathic pulmonary fibrosis", "limit": 8}
+              },
+              {
+                "name": "rank_researchers_by_activity",
+                "args": {"query": "idiopathic pulmonary fibrosis", "limit": 8}
+              },
+              {
+                "name": "get_researcher_contact_candidates",
+                "args": {"authorName": "idiopathic pulmonary fibrosis", "limit": 5}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "contradictory_evidence_bace1",
+      "conversation": [
+        {
+          "invocation_id": "inv-stress-008",
+          "user_content": {
+            "parts": [{"text": "Give a balanced view of BACE1 in Alzheimer disease with supporting and contradictory evidence."}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "Response explicitly separates supportive vs negative evidence, includes failed trial context, and provides a bounded recommendation."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_targets",
+                "args": {"query": "BACE1"}
+              },
+              {
+                "name": "get_target_drugs",
+                "args": {"targetId": "ENSG00000186318"}
+              },
+              {
+                "name": "search_clinical_trials",
+                "args": {"query": "BACE1 Alzheimer", "limit": 8}
+              },
+              {
+                "name": "search_pubmed_advanced",
+                "args": {"query": "BACE1 Alzheimer trial failure", "retmax": 8, "sort": "relevance"}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "terminated_trial_postmortem",
+      "conversation": [
+        {
+          "invocation_id": "inv-stress-009",
+          "user_content": {
+            "parts": [{"text": "Analyze terminated Parkinson disease interventional trials and summarize likely failure modes."}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "Response identifies terminated studies, extracts termination rationale where available, and groups likely failure drivers with evidence traceability."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_clinical_trials",
+                "args": {"query": "Parkinson interventional", "status": "TERMINATED", "limit": 8}
+              },
+              {
+                "name": "get_clinical_trial",
+                "args": {"nctId": "NCT04228614"}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "comparison_lrrk2_vs_gba1",
+      "conversation": [
+        {
+          "invocation_id": "inv-stress-010",
+          "user_content": {
+            "parts": [{"text": "Compare LRRK2 vs GBA1 for Parkinson target prioritization with explicit trade-offs and confidence."}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "Response contains a side-by-side comparison table, explicit prioritization criteria, confidence notes, and recommendation."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_targets",
+                "args": {"query": "LRRK2 GBA1"}
+              },
+              {
+                "name": "search_clinical_trials",
+                "args": {"query": "LRRK2 GBA1 Parkinson", "limit": 8}
+              },
+              {
+                "name": "search_pubmed_advanced",
+                "args": {"query": "LRRK2 GBA1 Parkinson comparison", "retmax": 8, "sort": "relevance"}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "repurposing_scan_pparg",
+      "conversation": [
+        {
+          "invocation_id": "inv-stress-011",
+          "user_content": {
+            "parts": [{"text": "Scan PPARG as a repurposing candidate for NASH and highlight translational risks."}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "Response identifies repurposing rationale, active/failed programs, safety concerns, and practical next steps for de-risking."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_targets",
+                "args": {"query": "PPARG"}
+              },
+              {
+                "name": "get_target_drugs",
+                "args": {"targetId": "ENSG00000132170"}
+              },
+              {
+                "name": "search_clinical_trials",
+                "args": {"query": "PPARG NASH", "limit": 8}
+              },
+              {
+                "name": "search_pubmed_advanced",
+                "args": {"query": "PPARG NASH translational risk", "retmax": 8, "sort": "relevance"}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "safety_red_flags_tnf",
+      "conversation": [
+        {
+          "invocation_id": "inv-stress-012",
+          "user_content": {
+            "parts": [{"text": "Assess TNF-targeting strategies and call out major safety red flags relevant to trial design."}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "Response includes known safety liabilities, evidence-linked warnings, and risk-mitigation recommendations suitable for preclinical planning."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_targets",
+                "args": {"query": "TNF"}
+              },
+              {
+                "name": "get_target_drugs",
+                "args": {"targetId": "ENSG00000232810"}
+              },
+              {
+                "name": "search_clinical_trials",
+                "args": {"query": "TNF inhibitor safety", "limit": 8}
+              },
+              {
+                "name": "search_pubmed_advanced",
+                "args": {"query": "TNF inhibitor adverse events infection malignancy", "retmax": 8, "sort": "relevance"}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    }
+  ]
+}

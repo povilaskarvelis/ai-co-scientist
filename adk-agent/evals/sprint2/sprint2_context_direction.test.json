@@ -1,0 +1,108 @@
+{
+  "eval_set_id": "co_scientist_sprint2_context_direction",
+  "name": "Sprint 2 Context + Direction Evaluation",
+  "description": "Focused Sprint 2 coverage for expression/cell context and genetics direction-of-effect with stable runtime.",
+  "eval_cases": [
+    {
+      "eval_id": "expression_context_tyk2",
+      "conversation": [
+        {
+          "invocation_id": "inv-s2-001",
+          "user_content": {
+            "parts": [
+              {
+                "text": "Summarize TYK2 tissue and cell-type expression context, focusing on immune system relevance and safety implications."
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "Response includes tissue/cell-context evidence, interpretable caveats, and actionable implications for target strategy."
+              }
+            ],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_targets",
+                "args": {
+                  "query": "TYK2"
+                }
+              },
+              {
+                "name": "summarize_target_expression_context",
+                "args": {
+                  "geneSymbol": "TYK2",
+                  "anatomicalSystem": "immune system",
+                  "topTissues": 10,
+                  "includeCellTypes": true
+                }
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "doe_tyk2_ulcerative_colitis",
+      "conversation": [
+        {
+          "invocation_id": "inv-s2-002",
+          "user_content": {
+            "parts": [
+              {
+                "text": "Infer direction-of-effect evidence for TYK2 in ulcerative colitis and explain whether inhibition looks supportive or risky."
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "Response provides risk-increasing vs protective genetic signals with transparent confidence and caveats."
+              }
+            ],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "infer_genetic_effect_direction",
+                "args": {
+                  "geneSymbol": "TYK2",
+                  "diseaseQuery": "ulcerative colitis",
+                  "pvalueThreshold": 0.00000005,
+                  "maxSnps": 8,
+                  "maxAssociations": 35,
+                  "timeBudgetSec": 20
+                }
+              },
+              {
+                "name": "search_gwas_associations",
+                "args": {
+                  "query": "TYK2",
+                  "limit": 8
+                }
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "eval_set_id": "variant_pathway",
+  "name": "Variant and Pathway Context",
+  "description": "Tests variant evidence retrieval and pathway/network context integration.",
+  "eval_cases": [
+    {
+      "eval_id": "brca1_variant_pathway_context",
+      "conversation": [
+        {
+          "invocation_id": "inv-vp-001",
+          "user_content": {
+            "parts": [{"text": "Check BRCA1 variant evidence and summarize pathway/network context relevant to disease risk."}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "Response includes structured evidence from ClinVar/GWAS plus pathway/network context with explicit source traceability."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_clinvar_variants",
+                "args": {"query": "BRCA1 breast cancer", "retmax": 5}
+              },
+              {
+                "name": "search_gwas_associations",
+                "args": {"query": "breast cancer", "limit": 5}
+              },
+              {
+                "name": "search_reactome_pathways",
+                "args": {"query": "BRCA1 DNA repair", "limit": 5}
+              },
+              {
+                "name": "get_string_interactions",
+                "args": {"identifier": "BRCA1", "requiredScore": 700, "limit": 8}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    }
+  ]
+}

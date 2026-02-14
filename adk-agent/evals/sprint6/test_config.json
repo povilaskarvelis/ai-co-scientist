@@ -1,0 +1,36 @@
+{
+  "criteria": {
+    "tool_trajectory_avg_score": {
+      "threshold": 0.0,
+      "match_type": "IN_ORDER"
+    },
+    "response_match_score": 0.0,
+    "rubric_based_final_response_quality_v1": {
+      "threshold": 0.5,
+      "judge_model_options": {
+        "judge_model": "gemini-2.0-flash",
+        "num_samples": 1
+      },
+      "rubrics": [
+        {
+          "rubric_id": "sprint6_auto_mode_quality",
+          "rubric_content": {
+            "text_property": "The response maps user goal language to an appropriate ranking objective and explains trade-offs clearly."
+          }
+        },
+        {
+          "rubric_id": "sprint6_clarification_quality",
+          "rubric_content": {
+            "text_property": "When goals conflict, the response asks a concise clarification instead of overconfident ranking."
+          }
+        }
+      ]
+    },
+    "hallucinations_v1": {
+      "threshold": 0.7,
+      "judge_model_options": {
+        "judge_model": "gemini-2.0-flash"
+      }
+    }
+  }
+}

@@ -24,11 +24,11 @@
               },
               {
                 "name": "check_druggability",
-                "args": {"target_id": "ENSG00000188906"}
+                "args": {"targetId": "ENSG00000188906"}
               },
               {
                 "name": "get_target_drugs",
-                "args": {"target_id": "ENSG00000188906"}
+                "args": {"targetId": "ENSG00000188906"}
               }
             ],
             "intermediate_responses": []

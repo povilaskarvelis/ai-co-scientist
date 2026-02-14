@@ -1,0 +1,49 @@
+{
+  "eval_set_id": "researcher_discovery",
+  "name": "Researcher Discovery Workflow",
+  "description": "Tests researcher discovery workflows including author extraction and activity ranking.",
+  "eval_cases": [
+    {
+      "eval_id": "ipf_researcher_discovery",
+      "conversation": [
+        {
+          "invocation_id": "inv-rd-001",
+          "user_content": {
+            "parts": [{"text": "Find active researchers working on idiopathic pulmonary fibrosis treatment in the last 3 years with evidence and contact candidates."}],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [{"text": "Response includes Request Understanding, Plan, Execution Log, Findings, Evidence, Limitations & Risks, and Next Actions with named researchers and source IDs."}],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_pubmed_advanced",
+                "args": {"query": "idiopathic pulmonary fibrosis treatment", "retmax": 8, "sort": "date"}
+              },
+              {
+                "name": "get_pubmed_paper_details",
+                "args": {"pmid": "38762797"}
+              },
+              {
+                "name": "search_openalex_authors",
+                "args": {"query": "idiopathic pulmonary fibrosis", "limit": 8}
+              },
+              {
+                "name": "rank_researchers_by_activity",
+                "args": {"query": "idiopathic pulmonary fibrosis", "limit": 8}
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    }
+  ]
+}

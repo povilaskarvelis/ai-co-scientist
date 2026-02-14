@@ -1,0 +1,36 @@
+{
+  "criteria": {
+    "tool_trajectory_avg_score": {
+      "threshold": 0.0,
+      "match_type": "IN_ORDER"
+    },
+    "response_match_score": 0.0,
+    "rubric_based_final_response_quality_v1": {
+      "threshold": 0.5,
+      "judge_model_options": {
+        "judge_model": "gemini-2.0-flash",
+        "num_samples": 1
+      },
+      "rubrics": [
+        {
+          "rubric_id": "sprint3_competition_quality",
+          "rubric_content": {
+            "text_property": "The response clearly summarizes competition density (phase/indication/mechanism) and translates it into strategic implications."
+          }
+        },
+        {
+          "rubric_id": "sprint3_safety_quality",
+          "rubric_content": {
+            "text_property": "The response reports target safety-liability evidence with transparent caveats and practical next actions."
+          }
+        }
+      ]
+    },
+    "hallucinations_v1": {
+      "threshold": 0.7,
+      "judge_model_options": {
+        "judge_model": "gemini-2.0-flash"
+      }
+    }
+  }
+}

@@ -1,0 +1,105 @@
+{
+  "eval_set_id": "co_scientist_sprint3_competition_safety",
+  "name": "Sprint 3 Competition + Safety Evaluation",
+  "description": "Focused Sprint 3 coverage for competitive landscape and safety liability synthesis.",
+  "eval_cases": [
+    {
+      "eval_id": "competition_egfr_nsclc",
+      "conversation": [
+        {
+          "invocation_id": "inv-s3-001",
+          "user_content": {
+            "parts": [
+              {
+                "text": "Assess competitive landscape for target ENSG00000146648 (EGFR) in lung cancer and give a final recommendation now, including where there may still be room for a new entrant."
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "Response includes phase/indication/mechanism competition signals, explicit uncertainty, and actionable white-space strategy suggestions."
+              }
+            ],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_targets",
+                "args": {
+                  "query": "ENSG00000146648"
+                }
+              },
+              {
+                "name": "summarize_target_competitive_landscape",
+                "args": {
+                  "targetId": "ENSG00000146648",
+                  "diseaseFilter": "lung cancer",
+                  "maxRows": 120,
+                  "topDiseases": 6,
+                  "topMechanisms": 6
+                }
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "safety_egfr_liabilities",
+      "conversation": [
+        {
+          "invocation_id": "inv-s3-002",
+          "user_content": {
+            "parts": [
+              {
+                "text": "Summarize key safety liabilities for target ENSG00000146648 (EGFR) with direction and tissue context, then provide final implications for inhibition strategy and risk mitigation."
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "Response provides safety-event evidence with direction/context, limitations, and practical mitigation-oriented next steps."
+              }
+            ],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_targets",
+                "args": {
+                  "query": "ENSG00000146648"
+                }
+              },
+              {
+                "name": "summarize_target_safety_liabilities",
+                "args": {
+                  "targetId": "ENSG00000146648",
+                  "topEvents": 8,
+                  "includeClinicalOnly": true
+                }
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    }
+  ]
+}

@@ -24,7 +24,7 @@
               },
               {
                 "name": "search_disease_targets",
-                "args": {"disease_id": "MONDO_0004975"}
+                "args": {"diseaseId": "MONDO_0004975"}
               }
             ],
             "intermediate_responses": []
@@ -48,11 +48,11 @@
               },
               {
                 "name": "check_druggability",
-                "args": {"target_id": "ENSG00000186318"}
+                "args": {"targetId": "ENSG00000186318"}
               },
               {
                 "name": "get_target_drugs",
-                "args": {"target_id": "ENSG00000186318"}
+                "args": {"targetId": "ENSG00000186318"}
               },
               {
                 "name": "search_clinical_trials",
@@ -90,11 +90,11 @@
               },
               {
                 "name": "check_druggability",
-                "args": {"target_id": "ENSG00000232810"}
+                "args": {"targetId": "ENSG00000232810"}
               },
               {
                 "name": "get_target_drugs",
-                "args": {"target_id": "ENSG00000232810"}
+                "args": {"targetId": "ENSG00000232810"}
               }
             ],
             "intermediate_responses": []

@@ -24,7 +24,7 @@
               },
               {
                 "name": "search_disease_targets",
-                "args": {"disease_id": "MONDO_0005180"}
+                "args": {"diseaseId": "MONDO_0005180"}
               }
             ],
             "intermediate_responses": []

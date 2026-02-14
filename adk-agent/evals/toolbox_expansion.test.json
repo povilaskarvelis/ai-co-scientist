@@ -1,0 +1,168 @@
+{
+  "eval_set_id": "co_scientist_toolbox_expansion",
+  "name": "Toolbox Expansion Evaluation",
+  "description": "Checks newly added toolbox coverage for trial landscapes, chemistry evidence, and ontology expansion.",
+  "eval_cases": [
+    {
+      "eval_id": "trial_landscape_lrrk2_parkinson",
+      "conversation": [
+        {
+          "invocation_id": "inv-toolbox-001",
+          "user_content": {
+            "parts": [
+              {
+                "text": "Summarize the LRRK2 Parkinson clinical landscape with phase/status breakdown and common reasons for trial termination."
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "Response includes status/phase distributions, evidence-backed failure signals, explicit uncertainties, and at least one actionable next step."
+              }
+            ],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "summarize_clinical_trials_landscape",
+                "args": {
+                  "query": "LRRK2 Parkinson",
+                  "maxStudies": 80,
+                  "maxPages": 4
+                }
+              },
+              {
+                "name": "search_clinical_trials",
+                "args": {
+                  "query": "LRRK2 Parkinson",
+                  "limit": 10
+                }
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "chembl_compounds_tyk2",
+      "conversation": [
+        {
+          "invocation_id": "inv-toolbox-002",
+          "user_content": {
+            "parts": [
+              {
+                "text": "Evaluate TYK2 tractability with chemical evidence. Prioritize potent compounds and discuss limitations of assay comparability."
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "Response provides target-linked compounds with potency context, transparent caveats, and a decision-ready recommendation."
+              }
+            ],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "search_targets",
+                "args": {
+                  "query": "TYK2"
+                }
+              },
+              {
+                "name": "search_chembl_compounds_for_target",
+                "args": {
+                  "query": "TYK2",
+                  "activityType": "IC50",
+                  "minPchembl": 6,
+                  "limit": 8
+                }
+              },
+              {
+                "name": "check_druggability",
+                "args": {
+                  "targetId": "ENSG00000105397"
+                }
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "ontology_expansion_alzheimer_synonyms",
+      "conversation": [
+        {
+          "invocation_id": "inv-toolbox-003",
+          "user_content": {
+            "parts": [
+              {
+                "text": "Expand Alzheimer disease synonyms and ontology parents, then use that context to find candidate targets."
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": {
+            "parts": [
+              {
+                "text": "Response includes ontology IDs/synonyms, parent context, target shortlist, and clear evidence references with limitations."
+              }
+            ],
+            "role": "model"
+          },
+          "intermediate_data": {
+            "tool_uses": [
+              {
+                "name": "expand_disease_context",
+                "args": {
+                  "query": "Alzheimer disease",
+                  "ontology": "efo",
+                  "limit": 5,
+                  "includeHierarchy": true
+                }
+              },
+              {
+                "name": "search_diseases",
+                "args": {
+                  "query": "Alzheimer disease",
+                  "limit": 5
+                }
+              },
+              {
+                "name": "search_disease_targets",
+                "args": {
+                  "diseaseId": "EFO_0000249",
+                  "limit": 8
+                }
+              }
+            ],
+            "intermediate_responses": []
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "researcher",
+        "state": {}
+      }
+    }
+  ]
+}
