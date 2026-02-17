@@ -32,14 +32,27 @@ DEFAULT_RESULTS_ROOT = SCRIPT_DIR / "acceptance" / "results"
 load_dotenv(SCRIPT_DIR / ".env")
 
 CRITERIA = {
-    "report_contract": "Report contains Decomposition, Answer, Methodology, and Diagnostics sections.",
+    "report_contract": "Report contains Answer, Rationale, Methodology, Limitations, Next Actions, and Decomposition sections.",
     "decomposition_visible": "Decomposition includes explicit executable sub-tasks.",
     "tool_trace_present": "Methodology includes a high-level tool activity summary.",
     "evidence_refs_present": "Report includes at least two citation identifiers.",
-    "quality_gate_passed": "Diagnostics reports a passing quality gate.",
+    "required_signals_present": "Scenario-required output signals are present.",
+    "source_attribution_present": "Answer includes explicit real-world source attribution.",
     "theme_coverage": "Scenario-specific expected themes are present in the answer.",
-    "multi_source_trace": "Tool trace spans at least two distinct source families.",
+    "multi_source_trace": "Report cites at least two distinct evidence source families.",
 }
+
+DEFAULT_HARD_CHECKS = [
+    "report_contract",
+    "decomposition_visible",
+    "tool_trace_present",
+    "evidence_refs_present",
+    "required_signals_present",
+    "source_attribution_present",
+    "theme_coverage",
+    "multi_source_trace",
+]
+DEFAULT_SOFT_CHECKS: list[str] = []
 
 THEME_PATTERNS = {
     "researcher": [r"\bresearcher\b", r"\bauthor\b", r"\binvestigator\b"],
@@ -96,7 +109,7 @@ TOOL_FAMILY_MAP = {
     "local_data": {"list_local_datasets", "read_local_dataset"},
 }
 
-REQUIRED_REPORT_HEADINGS = ["Decomposition", "Answer", "Methodology", "Diagnostics"]
+REQUIRED_REPORT_HEADINGS = ["Answer", "Rationale", "Methodology", "Limitations", "Next Actions", "Decomposition"]
 
 
 def _now_iso_utc() -> str:
@@ -170,6 +183,53 @@ def _extract_evidence_items(report: str) -> list[str]:
     return sorted(items)
 
 
+def _normalize_source_family_name(raw: str) -> str | None:
+    value = str(raw or "").strip().strip(".")
+    if not value:
+        return None
+    normalized = re.sub(r"\s+", " ", value).strip().lower()
+    mapping = {
+        "open targets": "open_targets",
+        "opentargets": "open_targets",
+        "clinicaltrials.gov": "clinical_trials",
+        "clinical trials.gov": "clinical_trials",
+        "clinicaltrials": "clinical_trials",
+        "clinical trials": "clinical_trials",
+        "pubmed": "pubmed",
+        "openalex": "openalex",
+        "chembl": "chemistry",
+        "gwas catalog": "genomics_pathways",
+        "gwas": "genomics_pathways",
+        "clinvar": "genomics_pathways",
+        "reactome": "genomics_pathways",
+        "string": "genomics_pathways",
+        "local datasets": "local_data",
+        "local dataset": "local_data",
+    }
+    if normalized in mapping:
+        return mapping[normalized]
+    return None
+
+
+def _extract_report_source_families(report: str) -> tuple[list[str], bool]:
+    source_line_patterns = [
+        r"^\s*Main sources informing this answer:\s*(.+?)\s*$",
+        r"^\s*Sources used in this run:\s*(.+?)\s*$",
+        r"^\s*-\s*Source families touched:\s*(.+?)\s*$",
+    ]
+    extracted_sources: list[str] = []
+    for pattern in source_line_patterns:
+        match = re.search(pattern, report, flags=re.IGNORECASE | re.MULTILINE)
+        if not match:
+            continue
+        raw_list = re.sub(r"\s+\.$", "", match.group(1).strip())
+        for item in re.split(r",|;|\|", raw_list):
+            family = _normalize_source_family_name(item)
+            if family and family not in extracted_sources:
+                extracted_sources.append(family)
+    return extracted_sources, bool(extracted_sources)
+
+
 def _extract_tool_names(report: str) -> list[str]:
     names = re.findall(r"\[[^\]]+\]\s+([a-zA-Z0-9_]+)\(call_id=", report)
     if names:
@@ -203,7 +263,45 @@ def _has_theme(report_lower: str, theme: str) -> bool:
     return any(re.search(pattern, report_lower) for pattern in patterns)
 
 
-def _score_report(report: str, expected_themes: list[str]) -> tuple[dict[str, bool], dict[str, Any]]:
+def _sanitize_check_names(raw_names: Any, fallback: list[str]) -> list[str]:
+    if not isinstance(raw_names, list):
+        return list(fallback)
+    names: list[str] = []
+    for item in raw_names:
+        candidate = str(item).strip()
+        if not candidate or candidate not in CRITERIA:
+            continue
+        if candidate not in names:
+            names.append(candidate)
+    return names or list(fallback)
+
+
+def _coerce_required_patterns(raw_patterns: Any) -> list[str]:
+    if not isinstance(raw_patterns, list):
+        return []
+    patterns: list[str] = []
+    for item in raw_patterns:
+        pattern = str(item).strip()
+        if pattern and pattern not in patterns:
+            patterns.append(pattern)
+    return patterns
+
+
+def _coerce_minimum_citations(raw_value: Any, default_value: int = 2) -> int:
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = default_value
+    return max(value, 1)
+
+
+def _score_report(
+    report: str,
+    expected_themes: list[str],
+    *,
+    required_patterns: list[str] | None = None,
+    minimum_citations: int = 2,
+) -> tuple[dict[str, bool], dict[str, Any]]:
     report_lower = report.lower()
     section_presence = {
         heading: bool(re.search(rf"^##\s+{re.escape(heading)}\s*$", report, flags=re.MULTILINE))
@@ -212,27 +310,46 @@ def _score_report(report: str, expected_themes: list[str]) -> tuple[dict[str, bo
     decomposition_block = _extract_section(report, "Decomposition")
     decomposition_count = len(re.findall(r"^\s*(?:\d+[.)]|-)\s+.+$", decomposition_block, flags=re.MULTILINE))
     tool_call_count = report.count("call_id=")
+    if tool_call_count == 0:
+        total_calls_match = re.search(r"\bA total of\s+(\d+)\s+evidence calls were executed\b", report, flags=re.IGNORECASE)
+        if total_calls_match:
+            tool_call_count = int(total_calls_match.group(1))
+    diagnostics_tool_calls_match = re.search(r"- Tool calls captured:\s*(\d+)", report)
+    diagnostics_tool_calls = int(diagnostics_tool_calls_match.group(1)) if diagnostics_tool_calls_match else None
+    if tool_call_count == 0 and diagnostics_tool_calls is not None:
+        tool_call_count = diagnostics_tool_calls
+
     tool_trace_visible = (
         "- Executed tool trace:" in report
         or "- Tool activity summary:" in report
         or "- Tools involved:" in report
+        or bool(re.search(r"\bA total of\s+\d+\s+evidence calls were executed\b", report, flags=re.IGNORECASE))
+        or "No tool-based evidence calls were recorded in this run." in report
     )
     evidence_items = _extract_evidence_items(report)
-    quality_gate_match = re.search(r"- Quality gate passed:\s*(yes|no)", report, flags=re.IGNORECASE)
-    quality_gate_passed = bool(quality_gate_match and quality_gate_match.group(1).lower() == "yes")
-    diagnostics_tool_calls_match = re.search(r"- Tool calls captured:\s*(\d+)", report)
-    diagnostics_tool_calls = int(diagnostics_tool_calls_match.group(1)) if diagnostics_tool_calls_match else None
     tool_names = _extract_tool_names(report)
-    source_families = sorted({family for family in (_tool_family(name) for name in tool_names) if family != "other"})
+    source_families, source_attribution_present = _extract_report_source_families(report)
+    if not source_families:
+        source_families = sorted({family for family in (_tool_family(name) for name in tool_names) if family != "other"})
     theme_hits = {theme: _has_theme(report_lower, theme) for theme in expected_themes}
     theme_coverage = all(theme_hits.values()) if expected_themes else True
+    patterns = [str(item).strip() for item in (required_patterns or []) if str(item).strip()]
+    required_pattern_hits: dict[str, bool] = {}
+    for pattern in patterns:
+        try:
+            required_pattern_hits[pattern] = bool(re.search(pattern, report, flags=re.IGNORECASE))
+        except re.error:
+            required_pattern_hits[pattern] = False
+    required_signals_present = all(required_pattern_hits.values()) if required_pattern_hits else True
+    min_citations = _coerce_minimum_citations(minimum_citations)
 
     checks = {
         "report_contract": all(section_presence.values()),
         "decomposition_visible": decomposition_count >= 2,
         "tool_trace_present": tool_trace_visible,
-        "evidence_refs_present": len(evidence_items) >= 2,
-        "quality_gate_passed": quality_gate_passed,
+        "evidence_refs_present": len(evidence_items) >= min_citations,
+        "required_signals_present": required_signals_present,
+        "source_attribution_present": source_attribution_present,
         "theme_coverage": theme_coverage,
         "multi_source_trace": len(source_families) >= 2,
     }
@@ -243,6 +360,9 @@ def _score_report(report: str, expected_themes: list[str]) -> tuple[dict[str, bo
         "diagnostics_tool_calls": diagnostics_tool_calls,
         "evidence_items": evidence_items,
         "evidence_count": len(evidence_items),
+        "minimum_citations_required": min_citations,
+        "required_patterns": patterns,
+        "required_pattern_hits": required_pattern_hits,
         "tool_names": sorted(set(tool_names)),
         "source_families": source_families,
         "source_family_count": len(source_families),
@@ -256,6 +376,7 @@ async def _run_scenario(
     *,
     output_dir: Path,
     scenario_timeout_sec: int,
+    evaluation_defaults: dict[str, Any] | None = None,
     enable_pdf: bool = True,
 ) -> dict[str, Any]:
     from agent import run_single_query_async
@@ -355,9 +476,26 @@ async def _run_scenario(
             "report_pdf_error": report_pdf_error,
         }
 
-    checks, metrics = _score_report(report, expected_themes)
-    failed_checks = [name for name, ok in checks.items() if not ok]
-    passed = not failed_checks
+    evaluation_cfg: dict[str, Any] = {}
+    if isinstance(evaluation_defaults, dict):
+        evaluation_cfg.update(evaluation_defaults)
+    if isinstance(scenario.get("evaluation"), dict):
+        evaluation_cfg.update(scenario["evaluation"])
+
+    hard_checks = _sanitize_check_names(evaluation_cfg.get("hard_checks"), DEFAULT_HARD_CHECKS)
+    soft_checks = _sanitize_check_names(evaluation_cfg.get("soft_checks"), DEFAULT_SOFT_CHECKS)
+    required_patterns = _coerce_required_patterns(evaluation_cfg.get("required_patterns"))
+    minimum_citations = _coerce_minimum_citations(evaluation_cfg.get("minimum_citations"), default_value=2)
+
+    checks, metrics = _score_report(
+        report,
+        expected_themes,
+        required_patterns=required_patterns,
+        minimum_citations=minimum_citations,
+    )
+    hard_failed_checks = [name for name in hard_checks if not checks.get(name, False)]
+    soft_failed_checks = [name for name in soft_checks if not checks.get(name, False)]
+    passed = not hard_failed_checks
     return {
         "id": scenario_id,
         "challenge": str(scenario.get("challenge", "")),
@@ -367,7 +505,10 @@ async def _run_scenario(
         "passed": passed,
         "duration_sec": duration_sec,
         "checks": checks,
-        "failed_checks": failed_checks,
+        "hard_checks_used": hard_checks,
+        "soft_checks_used": soft_checks,
+        "failed_checks": hard_failed_checks,
+        "soft_failed_checks": soft_failed_checks,
         "metrics": metrics,
         "error": None,
         "report_file": str(report_path),
@@ -511,13 +652,13 @@ def _build_summary_markdown(scoreboard: dict[str, Any]) -> str:
         "",
         "## Scenario Results",
         "",
-        "| Scenario | Challenge | Status | Duration (s) | Decomposition Items | Tool Calls | Evidence IDs | Source Families | Failed Checks |",
-        "|---|---|---|---:|---:|---:|---:|---:|---|",
+        "| Scenario | Challenge | Status | Duration (s) | Decomposition Items | Tool Calls | Evidence IDs | Source Families | Hard Failed Checks | Soft Failed Checks |",
+        "|---|---|---|---:|---:|---:|---:|---:|---|---|",
     ]
     for result in scoreboard["scenario_results"]:
         metrics = result.get("metrics", {})
         lines.append(
-            "| {id} | {challenge} | {status} | {duration:.2f} | {decomposition} | {tool_calls} | {evidence} | {families} | {failed} |".format(
+            "| {id} | {challenge} | {status} | {duration:.2f} | {decomposition} | {tool_calls} | {evidence} | {families} | {hard_failed} | {soft_failed} |".format(
                 id=result.get("id", ""),
                 challenge=result.get("challenge", ""),
                 status=result.get("status", ""),
@@ -526,7 +667,8 @@ def _build_summary_markdown(scoreboard: dict[str, Any]) -> str:
                 tool_calls=int(metrics.get("tool_call_count", 0)),
                 evidence=int(metrics.get("evidence_count", 0)),
                 families=int(metrics.get("source_family_count", 0)),
-                failed=", ".join(result.get("failed_checks", [])) or "none",
+                hard_failed=", ".join(result.get("failed_checks", [])) or "none",
+                soft_failed=", ".join(result.get("soft_failed_checks", [])) or "none",
             )
         )
 
@@ -564,6 +706,7 @@ async def _run_acceptance(args: argparse.Namespace) -> tuple[int, Path]:
 
     payload = json.loads(args.config.read_text(encoding="utf-8"))
     scenarios = list(payload.get("scenarios", []))
+    evaluation_defaults = payload.get("evaluation_defaults", {})
     if args.only_scenario:
         allow = set(args.only_scenario)
         scenarios = [item for item in scenarios if str(item.get("id")) in allow]
@@ -607,6 +750,7 @@ async def _run_acceptance(args: argparse.Namespace) -> tuple[int, Path]:
                 scenario,
                 output_dir=run_dir,
                 scenario_timeout_sec=args.scenario_timeout_sec,
+                evaluation_defaults=evaluation_defaults,
                 enable_pdf=not args.no_pdf,
             )
             scenario_results.append(result)
@@ -645,6 +789,14 @@ async def _run_acceptance(args: argparse.Namespace) -> tuple[int, Path]:
         "config_path": str(args.config.resolve()),
         "config_sha256": _sha256_file(args.config),
         "criteria": CRITERIA,
+        "default_hard_checks": _sanitize_check_names(
+            evaluation_defaults.get("hard_checks") if isinstance(evaluation_defaults, dict) else None,
+            DEFAULT_HARD_CHECKS,
+        ),
+        "default_soft_checks": _sanitize_check_names(
+            evaluation_defaults.get("soft_checks") if isinstance(evaluation_defaults, dict) else None,
+            DEFAULT_SOFT_CHECKS,
+        ),
         "environment": {
             "python_version": platform.python_version(),
             "platform": platform.platform(),

@@ -1,26 +1,56 @@
 {
+  "schema_version": "acceptance_scenarios_v2",
+  "evaluation_defaults": {
+    "hard_checks": [
+      "report_contract",
+      "decomposition_visible",
+      "tool_trace_present",
+      "evidence_refs_present",
+      "required_signals_present",
+      "source_attribution_present",
+      "theme_coverage",
+      "multi_source_trace"
+    ],
+    "soft_checks": [],
+    "minimum_citations": 2
+  },
   "scenarios": [
     {
       "id": "challenge7_co_scientist_researcher_discovery",
       "challenge": "7",
       "title": "Co-Scientist Capability Check: Researcher Discovery with Affiliations and Citations",
       "topic_fixture": "LRRK2 inhibitor development in Parkinson's disease (example fixture)",
-      "prompt": "Find researchers who have published on LRRK2 inhibitor development for Parkinson's disease in the last 3 years, include affiliations, and summarize evidence with citations.",
-      "expected_themes": ["researcher", "affiliation", "pmid"]
+      "prompt": "Find researchers who published on LRRK2 inhibitor development for Parkinson's disease between January 1, 2023 and February 17, 2026. Include affiliations and summarize evidence with citations.",
+      "expected_themes": ["researcher", "affiliation", "pmid"],
+      "evaluation": {
+        "required_patterns": [
+          "\\bPMID:\\d{5,9}\\b",
+          "\\b(?:University|Institute|Hospital|Center|Centre|Biogen|Therapeutics|NIH)\\b",
+          "\\b(?:researcher|author|investigator)\\b"
+        ]
+      }
     },
     {
       "id": "challenge2_co_scientist_target_or_trap",
       "challenge": "2",
       "title": "Co-Scientist Capability Check: Target-or-Trap Decision with Risks and Next Actions",
       "topic_fixture": "BACE1 in Alzheimer's disease (example fixture)",
-      "prompt": "Target or Trap: should BACE1 still be pursued for Alzheimer's disease? Provide a risk assessment with evidence, limitations, and next actions.",
-      "expected_themes": ["recommendation", "risk", "safety", "evidence"]
+      "prompt": "Target or Trap (as of February 17, 2026): should BACE1 still be pursued for Alzheimer's disease? Provide a risk assessment with evidence, explicit limitations, and next actions.",
+      "expected_themes": ["recommendation", "risk", "safety", "evidence"],
+      "evaluation": {
+        "required_patterns": [
+          "\\b(?:No-Go|Go|deprioriti(?:z|s)e|prioriti(?:z|s)e|recommendation)\\b",
+          "\\b(?:risk|safety|liabilit|adverse)\\b",
+          "\\b(?:limitation|uncertaint|gap)\\b",
+          "\\b(?:PMID:\\d{5,9}|NCT\\d{8})\\b"
+        ]
+      }
     }
   ],
   "hitl_probe": {
     "id": "challenge7_co_scientist_hitl_checkpoint_probe",
     "title": "Co-Scientist Capability Check: Predictable HITL Checkpoint",
     "topic_fixture": "LRRK2 inhibitor development in Parkinson's disease (example fixture)",
-    "prompt": "Find researchers who have published on LRRK2 inhibitor development for Parkinson's disease in the last 3 years."
+    "prompt": "Find researchers who published on LRRK2 inhibitor development for Parkinson's disease between January 1, 2023 and February 17, 2026."
   }
 }

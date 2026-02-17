@@ -1,8 +1,12 @@
 import asyncio
+import json
+import re
 
 import pytest
 
 import agent
+from co_scientist.runtime import quality_gates as runtime_quality
+from co_scientist.runtime.execution import validate_mcp_response_contract
 from agent import _merge_objective_with_revision
 from workflow import (
     RevisionIntent,
@@ -98,6 +102,13 @@ def test_step_prompt_with_revision_directives_enforces_general_constraints():
     assert "Carry forward revision directives as execution constraints" in step3_prompt
 
 
+def test_step_prompt_final_step_requires_inline_recommendation_citation():
+    task = create_task("Target or trap: should BACE1 still be pursued for Alzheimer's disease?")
+    prompt = step_prompt(task, task.steps[-1])
+
+    assert "first recommendation sentence must include at least one inline citation ID" in prompt
+
+
 def test_build_plan_steps_with_revision_tool_hints_prioritizes_tools():
     revised_objective = _merge_objective_with_revision(
         "find me top researchers in psychosis",
@@ -145,6 +156,16 @@ def test_revision_semantic_clinical_trial_phrase_prioritizes_clinical_tools():
     assert "search_clinical_trials" in safety_step.recommended_tools
     assert "summarize_clinical_trials_landscape" in safety_step.recommended_tools
     assert "prioritize user-requested tools" in safety_step.instruction.lower()
+
+
+def test_single_target_target_or_trap_plan_avoids_compare_only_tool():
+    steps = build_plan_steps(
+        "Target or Trap: should BACE1 still be pursued for Alzheimer's disease? Provide risks and next actions."
+    )
+
+    assert "compare_targets_multi_axis" not in steps[1].recommended_tools
+    assert "compare_targets_multi_axis" not in steps[4].recommended_tools
+    assert "search_pubmed_advanced" in steps[4].recommended_tools
 
 
 def test_should_open_checkpoint_when_feedback_is_queued():
@@ -291,6 +312,157 @@ def test_classify_tool_response_marks_critical_gap_payload_as_degraded():
     assert "critical gap" in detail.lower()
 
 
+def test_validate_mcp_response_contract_accepts_typed_compare_payload():
+    report = validate_mcp_response_contract(
+        {
+            "content": [{"type": "text", "text": "Ranked two targets."}],
+            "structuredContent": {
+                "envelope_version": "research_mcp_response_v1",
+                "tool_name": "compare_targets_multi_axis",
+                "status": "ok",
+                "text": "Ranked two targets.",
+                "payload": {
+                    "schema": "compare_targets_multi_axis.v1",
+                    "result_status": "ok",
+                    "targets_requested": ["LRRK2", "GBA1"],
+                    "targets_compared": 2,
+                    "weights": {
+                        "disease_association": 0.3,
+                        "druggability": 0.2,
+                        "clinical_maturity": 0.2,
+                        "competitive_whitespace": 0.15,
+                        "safety": 0.15,
+                    },
+                    "rankings": [],
+                },
+            },
+        }
+    )
+
+    assert report["valid"] is True
+    assert report["issues"] == []
+
+
+def test_validate_mcp_response_contract_rejects_missing_typed_payload():
+    report = validate_mcp_response_contract(
+        {
+            "content": [{"type": "text", "text": "Ranked two targets."}],
+            "structuredContent": {
+                "envelope_version": "research_mcp_response_v1",
+                "tool_name": "compare_targets_multi_axis",
+                "status": "ok",
+                "text": "Ranked two targets.",
+            },
+        }
+    )
+
+    assert report["valid"] is False
+    assert any("payload is required" in issue for issue in report["issues"])
+
+
+def test_validate_mcp_response_contract_accepts_generic_payload_for_standard_tool():
+    report = validate_mcp_response_contract(
+        {
+            "content": [{"type": "text", "text": "Retrieved 3 PubMed records."}],
+            "structuredContent": {
+                "envelope_version": "research_mcp_response_v1",
+                "tool_name": "search_pubmed",
+                "status": "ok",
+                "text": "Retrieved 3 PubMed records.",
+                "payload": {
+                    "schema": "search_pubmed.generic.v1",
+                    "result_status": "ok",
+                    "tool_name": "search_pubmed",
+                    "summary": "Retrieved 3 PubMed records.",
+                    "content_part_count": 1,
+                    "text_excerpt": "Retrieved 3 PubMed records.",
+                },
+            },
+        }
+    )
+
+    assert report["valid"] is True
+    assert report["issues"] == []
+
+
+def test_validate_mcp_response_contract_accepts_typed_clinical_landscape_payload():
+    report = validate_mcp_response_contract(
+        {
+            "content": [{"type": "text", "text": "Clinical landscape summary generated."}],
+            "structuredContent": {
+                "envelope_version": "research_mcp_response_v1",
+                "tool_name": "summarize_clinical_trials_landscape",
+                "status": "ok",
+                "text": "Clinical landscape summary generated.",
+                "payload": {
+                    "schema": "summarize_clinical_trials_landscape.v1",
+                    "result_status": "ok",
+                    "query": "LRRK2 Parkinson",
+                    "status_filter": "",
+                    "studies_analyzed": 42,
+                    "total_reported": 128,
+                    "max_studies": 60,
+                    "max_pages": 4,
+                    "has_more_pages": True,
+                    "trials_with_posted_results": 12,
+                    "status_breakdown": ["RECRUITING (18)", "COMPLETED (11)"],
+                    "phase_breakdown": ["Phase II (14)", "Phase I (9)"],
+                    "top_interventions": ["DNL151 (6)"],
+                    "top_conditions": ["Parkinson's disease (20)"],
+                    "top_termination_reasons": ["Reason not reported (3)"],
+                    "example_terminated_nct_ids": ["NCT01234567"],
+                    "notes": ["Counts are aggregated from scanned studies."],
+                },
+            },
+        }
+    )
+
+    assert report["valid"] is True
+    assert report["issues"] == []
+
+
+def test_validate_mcp_response_contract_rejects_generic_schema_for_typed_tool():
+    report = validate_mcp_response_contract(
+        {
+            "content": [{"type": "text", "text": "Safety summary generated."}],
+            "structuredContent": {
+                "envelope_version": "research_mcp_response_v1",
+                "tool_name": "summarize_target_safety_liabilities",
+                "status": "ok",
+                "text": "Safety summary generated.",
+                "payload": {
+                    "schema": "summarize_target_safety_liabilities.generic.v1",
+                    "result_status": "ok",
+                    "tool_name": "summarize_target_safety_liabilities",
+                    "summary": "Safety summary generated.",
+                    "content_part_count": 1,
+                    "text_excerpt": "Safety summary generated.",
+                },
+            },
+        }
+    )
+
+    assert report["valid"] is False
+    assert any("payload.schema must be summarize_target_safety_liabilities.v1" in issue for issue in report["issues"])
+
+
+def test_validate_mcp_response_contract_rejects_missing_generic_payload():
+    report = validate_mcp_response_contract(
+        {
+            "content": [{"type": "text", "text": "Retrieved 3 PubMed records."}],
+            "structuredContent": {
+                "envelope_version": "research_mcp_response_v1",
+                "tool_name": "search_pubmed",
+                "status": "ok",
+                "text": "Retrieved 3 PubMed records.",
+            },
+        }
+    )
+
+    assert report["valid"] is False
+    assert any("payload is required" in issue for issue in report["issues"])
+
+
 def test_quality_gate_flags_missing_successful_top_ranking():
     task = create_task("find me top researchers in psychosis")
     for step in task.steps:
@@ -346,6 +518,584 @@ def test_quality_gate_flags_missing_high_weight_genetics_after_tool_failures():
     assert quality["passed"] is False
     assert any("human genetics" in gap.lower() for gap in quality["unresolved_gaps"])
     assert any("critical missing evidence" in gap.lower() for gap in quality["unresolved_gaps"])
+
+
+def test_quality_gate_does_not_treat_descriptive_critical_gap_phrase_as_hard_failure():
+    task = create_task("Target or trap: should BACE1 still be pursued for Alzheimer's disease?")
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Evidence includes NCT03131453 and NCT02565511 with safety findings."
+        if step.recommended_tools:
+            step.tool_trace = [
+                {
+                    "tool_name": step.recommended_tools[0],
+                    "outcome": "ok",
+                    "evidence_refs": ["NCT03131453", "NCT02565511"],
+                    "response_contract": {
+                        "version": "mcp_response_v1",
+                        "valid": True,
+                        "issues": [],
+                        "text_part_count": 1,
+                        "has_structured_content": False,
+                    },
+                }
+            ]
+    task.steps[-1].output = (
+        "Recommendation: deprioritize BACE1 as a primary strategy due to terminated trials (NCT03131453). "
+        "This is a critical gap for understanding long-term risk, but current evidence is sufficient for a cautious decision."
+    )
+
+    quality = agent._evaluate_quality_gates(task)
+
+    assert quality["passed"] is True
+    assert not any("critical missing evidence" in gap.lower() for gap in quality["unresolved_gaps"])
+
+
+def test_quality_gate_does_not_fail_on_no_safety_liability_phrase_without_tool_failure():
+    task = create_task("Compare LRRK2 vs GBA1 as Parkinson's disease targets with safety weighting.")
+    task.intent_tags = sorted(set(task.intent_tags + ["safety_assessment"]))
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Evidence includes NCT03131453 and NCT02565511."
+        if step.recommended_tools:
+            step.tool_trace = [
+                {
+                    "tool_name": step.recommended_tools[0],
+                    "outcome": "ok",
+                    "evidence_refs": ["NCT03131453", "NCT02565511"],
+                    "response_contract": {
+                        "version": "mcp_response_v1",
+                        "valid": True,
+                        "issues": [],
+                        "text_part_count": 1,
+                        "has_structured_content": False,
+                    },
+                }
+            ]
+    task.steps[2].output = "No safety liabilities were directly reported in one dataset; monitor with trial evidence."
+    task.steps[-1].output = (
+        "Recommendation: deprioritize BACE1 as a primary strategy due to safety risk seen in terminated trials (NCT03131453)."
+    )
+
+    quality = agent._evaluate_quality_gates(task)
+
+    assert quality["passed"] is True
+    assert not any("safety-liability evidence is incomplete" in gap.lower() for gap in quality["unresolved_gaps"])
+
+
+def test_quality_gate_flags_missing_mcp_contract_metadata():
+    task = create_task("Summarize literature evidence for psychosis biomarkers.")
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Evidence collected."
+        if step.recommended_tools:
+            step.tool_trace = [
+                {
+                    "tool_name": step.recommended_tools[0],
+                    "outcome": "ok",
+                    "evidence_refs": ["PMID:12345678", "PMID:23456789"],
+                }
+            ]
+
+    quality = agent._evaluate_quality_gates(task)
+
+    assert quality["passed"] is False
+    assert quality["mcp_contract_violation_count"] >= 1
+    assert any("response contract" in gap.lower() for gap in quality["unresolved_gaps"])
+
+
+def test_quality_gate_ignores_contract_violation_for_error_outcome_with_recovery():
+    task = create_task("Summarize literature evidence for psychosis biomarkers.")
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Evidence includes PMID:12345678 and PMID:23456789."
+        tool_name = step.recommended_tools[0] if step.recommended_tools else "search_pubmed_advanced"
+        step.tool_trace = [
+            {
+                "tool_name": tool_name,
+                "outcome": "ok",
+                "evidence_refs": ["PMID:12345678", "PMID:23456789"],
+                "response_contract": {
+                    "version": "mcp_response_v1",
+                    "valid": True,
+                    "issues": [],
+                    "text_part_count": 1,
+                    "has_structured_content": False,
+                },
+            }
+        ]
+    task.steps[-1].tool_trace.append(
+        {
+            "tool_name": "search_pubmed_advanced",
+            "outcome": "error",
+            "detail": "Input validation error",
+            "evidence_refs": [],
+        }
+    )
+    task.steps[-1].output = (
+        "Recommendation: prioritize biomarker panel A due to stronger replicated signal support (PMID:12345678)."
+    )
+
+    quality = agent._evaluate_quality_gates(task)
+
+    assert quality["passed"] is True
+    assert quality["mcp_contract_violation_count"] == 0
+    assert not any("tool execution issues were detected" in gap.lower() for gap in quality["unresolved_gaps"])
+
+
+def test_quality_gate_uses_tool_validated_evidence_refs():
+    task = create_task("Summarize literature evidence for psychosis biomarkers.")
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Evidence includes PMID:12345678 and PMID:23456789."
+        if step.recommended_tools:
+            step.tool_trace = [
+                {
+                    "tool_name": step.recommended_tools[0],
+                    "outcome": "ok",
+                    "evidence_refs": ["PMID:12345678", "PMID:23456789"],
+                    "response_contract": {
+                        "version": "mcp_response_v1",
+                        "valid": True,
+                        "issues": [],
+                        "text_part_count": 1,
+                        "has_structured_content": False,
+                    },
+                }
+            ]
+
+    quality = agent._evaluate_quality_gates(task)
+
+    assert quality["passed"] is True
+    assert quality["evidence_count"] == 2
+    assert quality["mcp_contract_violation_count"] == 0
+    assert quality["unresolved_gaps"] == []
+
+
+def test_quality_gate_flags_researcher_flow_without_validated_pmid():
+    task = create_task("Find top researchers in schizophrenia with citations.")
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Evidence includes OpenAlex:A5035064433 and OpenAlex:A5024773860."
+
+    task.steps[1].tool_trace = [
+        {
+            "tool_name": "rank_researchers_by_activity",
+            "outcome": "ok",
+            "evidence_refs": ["OpenAlex:A5035064433", "OpenAlex:A5024773860"],
+            "response_contract": {
+                "version": "mcp_response_v1",
+                "valid": True,
+                "issues": [],
+                "text_part_count": 1,
+                "has_structured_content": False,
+            },
+        }
+    ]
+    task.steps[-1].output = "Recommendation: prioritize researcher A over B based on topic activity."
+
+    quality = agent._evaluate_quality_gates(task)
+
+    assert quality["passed"] is False
+    assert any("tool-validated pmid citation" in gap.lower() for gap in quality["unresolved_gaps"])
+
+
+def test_quality_gate_allows_recovered_researcher_flow_after_preliminary_marker():
+    task = create_task("Find top researchers in schizophrenia with citations.")
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Evidence includes PMID:12345678 and OpenAlex:A5035064433 with activity score."
+
+    task.steps[1].output = "Preliminary ranking was refined with recovered PubMed evidence and activity score."
+    task.steps[1].tool_trace = [
+        {
+            "tool_name": "rank_researchers_by_activity",
+            "outcome": "ok",
+            "evidence_refs": ["OpenAlex:A5035064433", "OpenAlex:A5024773860"],
+            "response_contract": {
+                "version": "mcp_response_v1",
+                "valid": True,
+                "issues": [],
+                "text_part_count": 1,
+                "has_structured_content": False,
+            },
+        },
+        {
+            "tool_name": "search_pubmed_advanced",
+            "outcome": "ok",
+            "evidence_refs": ["PMID:12345678", "PMID:23456789"],
+            "response_contract": {
+                "version": "mcp_response_v1",
+                "valid": True,
+                "issues": [],
+                "text_part_count": 1,
+                "has_structured_content": False,
+            },
+        },
+    ]
+    task.steps[-1].output = (
+        "Recommendation: prioritize researcher A based on higher activity score and replicated support (PMID:12345678)."
+    )
+
+    quality = agent._evaluate_quality_gates(task)
+
+    assert quality["passed"] is True
+    assert not any("degraded evidence quality" in gap.lower() for gap in quality["unresolved_gaps"])
+
+
+def test_quality_gate_tolerates_single_unverified_ref_when_evidence_is_rich():
+    task = create_task("Summarize literature evidence for psychosis biomarkers.")
+    validated_refs = [
+        "PMID:12345678",
+        "PMID:23456789",
+        "PMID:34567890",
+        "PMID:45678901",
+        "PMID:56789012",
+    ]
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Evidence includes " + ", ".join(validated_refs) + "."
+        if step.recommended_tools:
+            step.tool_trace = [
+                {
+                    "tool_name": step.recommended_tools[0],
+                    "outcome": "ok",
+                    "evidence_refs": list(validated_refs),
+                    "response_contract": {
+                        "version": "mcp_response_v1",
+                        "valid": True,
+                        "issues": [],
+                        "text_part_count": 1,
+                        "has_structured_content": False,
+                    },
+                }
+            ]
+    task.steps[-1].output = (
+        "Recommendation: prioritize panel A based on replicated signal strength (PMID:12345678). "
+        "Additional context from exploratory data (PMID:67890123)."
+    )
+
+    quality = agent._evaluate_quality_gates(task)
+
+    assert quality["passed"] is True
+    assert quality["unverified_output_refs"] == ["PMID:67890123"]
+    assert not any("not backed by captured tool responses" in gap.lower() for gap in quality["unresolved_gaps"])
+
+
+def test_quality_gate_ignores_heading_only_recommendation_labels_for_claim_provenance():
+    task = create_task("Summarize literature evidence for psychosis biomarkers.")
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Evidence includes PMID:12345678 and PMID:23456789."
+        if step.recommended_tools:
+            step.tool_trace = [
+                {
+                    "tool_name": step.recommended_tools[0],
+                    "outcome": "ok",
+                    "evidence_refs": ["PMID:12345678", "PMID:23456789"],
+                    "response_contract": {
+                        "version": "mcp_response_v1",
+                        "valid": True,
+                        "issues": [],
+                        "text_part_count": 1,
+                        "has_structured_content": False,
+                    },
+                }
+            ]
+    task.steps[-1].output = (
+        "### Recommendation:\n"
+        "BACE1 should not be pursued as a broad strategy (PMID:12345678).\n"
+        "### Rationale Narrative:\n"
+        "Safety concerns remain substantial."
+    )
+
+    quality = agent._evaluate_quality_gates(task)
+
+    assert quality["passed"] is True
+    assert quality["claim_provenance_uncited_count"] == 0
+
+
+def test_quality_gate_repairs_uncited_assertive_recommendation_claim():
+    task = create_task("Summarize literature evidence for psychosis biomarkers.")
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Evidence includes PMID:12345678 and PMID:23456789."
+        if step.recommended_tools:
+            step.tool_trace = [
+                {
+                    "tool_name": step.recommended_tools[0],
+                    "outcome": "ok",
+                    "evidence_refs": ["PMID:12345678", "PMID:23456789"],
+                    "response_contract": {
+                        "version": "mcp_response_v1",
+                        "valid": True,
+                        "issues": [],
+                        "text_part_count": 1,
+                        "has_structured_content": False,
+                    },
+                }
+            ]
+    task.steps[-1].output = (
+        "Recommendation: prioritize biomarker panel A because it has superior predictive performance "
+        "and lower clinical risk."
+    )
+
+    quality = agent._evaluate_quality_gates(task)
+
+    assert quality["passed"] is True
+    assert quality["claim_provenance_claim_count"] >= 1
+    assert quality["claim_provenance_uncited_count"] == 0
+    assert "PMID:12345678" in task.steps[-1].output
+
+
+def test_quality_gate_uses_fallback_recommendation_for_claim_provenance_repair():
+    task = create_task("Summarize literature evidence for psychosis biomarkers.")
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Evidence includes PMID:12345678 and PMID:23456789."
+        if step.recommended_tools:
+            step.tool_trace = [
+                {
+                    "tool_name": step.recommended_tools[0],
+                    "outcome": "ok",
+                    "evidence_refs": ["PMID:12345678", "PMID:23456789"],
+                    "response_contract": {
+                        "version": "mcp_response_v1",
+                        "valid": True,
+                        "issues": [],
+                        "text_part_count": 1,
+                        "has_structured_content": False,
+                    },
+                }
+            ]
+    task.steps[-1].output = "Recommendation: prioritize panel A due to superior risk profile."
+    task.fallback_recovery_notes = (
+        "selected_tools: search_pubmed_advanced\n"
+        "revised_recommendation: Recommendation: prioritize panel A due to superior risk profile (PMID:12345678).\n"
+        "key_results: replicated signal support."
+    )
+    task.fallback_tool_trace = [
+        {
+            "tool_name": "search_pubmed_advanced",
+            "outcome": "ok",
+            "evidence_refs": ["PMID:12345678"],
+            "response_contract": {
+                "version": "mcp_response_v1",
+                "valid": True,
+                "issues": [],
+                "text_part_count": 1,
+                "has_structured_content": False,
+            },
+        }
+    ]
+
+    quality = agent._evaluate_quality_gates(task)
+
+    assert quality["passed"] is True
+    assert quality["claim_provenance_uncited_count"] == 0
+
+
+def test_quality_gate_ignores_non_recommendation_fallback_claims_for_provenance():
+    task = create_task("Summarize literature evidence for psychosis biomarkers.")
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Evidence includes PMID:12345678 and PMID:23456789."
+        if step.recommended_tools:
+            step.tool_trace = [
+                {
+                    "tool_name": step.recommended_tools[0],
+                    "outcome": "ok",
+                    "evidence_refs": ["PMID:12345678", "PMID:23456789"],
+                    "response_contract": {
+                        "version": "mcp_response_v1",
+                        "valid": True,
+                        "issues": [],
+                        "text_part_count": 1,
+                        "has_structured_content": False,
+                    },
+                }
+            ]
+    task.steps[-1].output = "Recommendation: prioritize panel A due to superior risk profile."
+    task.fallback_recovery_notes = (
+        "why_chosen:\n"
+        "The fallback strategy prioritized publication-centric tools.\n"
+        "revised_recommendation:\n"
+        "Prioritize panel A due to superior risk profile (PMID:12345678).\n"
+        "remaining_gaps:\n"
+        "Need broader validation."
+    )
+    task.fallback_tool_trace = [
+        {
+            "tool_name": "search_pubmed_advanced",
+            "outcome": "ok",
+            "evidence_refs": ["PMID:12345678"],
+            "response_contract": {
+                "version": "mcp_response_v1",
+                "valid": True,
+                "issues": [],
+                "text_part_count": 1,
+                "has_structured_content": False,
+            },
+        }
+    ]
+
+    quality = agent._evaluate_quality_gates(task)
+
+    assert quality["passed"] is True
+    assert quality["claim_provenance_uncited_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_fallback_recovery_repairs_missing_pubmed_execution():
+    task = create_task("Find top researchers in schizophrenia with citations.")
+    for step in task.steps:
+        step.status = "completed"
+    task.intent_tags = sorted(set(task.intent_tags + ["researcher_discovery"]))
+    task.steps[1].tool_trace = [
+        {
+            "tool_name": "rank_researchers_by_activity",
+            "outcome": "ok",
+            "evidence_refs": ["OpenAlex:A5035064433"],
+        }
+    ]
+    call_count = {"n": 0}
+
+    async def fake_run_runner_turn_with_trace(_runner, _session_id, _user_id, _prompt):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return (
+                "selected_tools: get_pubmed_author_profile\n"
+                "revised_recommendation: Recommendation: prioritize researcher A.\n"
+                "key_results: profile confirms activity.",
+                [
+                    {
+                        "tool_name": "get_pubmed_author_profile",
+                        "outcome": "ok",
+                        "evidence_refs": [],
+                    }
+                ],
+            )
+        return (
+            "selected_tools: search_pubmed_advanced\n"
+            "revised_recommendation: Recommendation: prioritize researcher A.\n"
+            "key_results: PMID:12345678 supports direct topic relevance.",
+            [
+                {
+                    "tool_name": "search_pubmed_advanced",
+                    "outcome": "ok",
+                    "evidence_refs": ["PMID:12345678"],
+                }
+            ],
+        )
+
+    recovery, trace = await runtime_quality.run_fallback_recovery(
+        runner=None,
+        session_id="session_demo",
+        user_id="user_demo",
+        task=task,
+        run_runner_turn_with_trace_fn=fake_run_runner_turn_with_trace,
+        format_step_execution_error_fn=lambda exc, tools: f"error: {exc} ({tools})",
+    )
+
+    assert call_count["n"] == 2
+    assert any(entry.get("tool_name") == "search_pubmed_advanced" for entry in trace)
+    assert any(entry.get("phase") == "fallback_recovery_repair" for entry in trace)
+    assert "PMID:12345678" in recovery
+
+
+def test_inject_inline_citation_in_recommendation_updates_first_sentence():
+    raw = (
+        "revised_recommendation: BACE1 should not be pursued as a primary Alzheimer's target. "
+        "Late-stage failures include NCT03131453."
+    )
+
+    repaired = runtime_quality._inject_inline_citation_in_recommendation(raw, {"NCT03131453"})
+    first_sentence_match = re.search(r"revised_recommendation:\s*(.*?[.!?])", repaired, flags=re.IGNORECASE)
+
+    assert first_sentence_match is not None
+    assert "NCT03131453" in first_sentence_match.group(1)
+
+
+def test_inject_inline_citation_in_recommendation_updates_multiline_section():
+    raw = (
+        "**revised_recommendation:**\n\n"
+        "BACE1 should not be pursued as a primary Alzheimer's target. "
+        "Late-stage failures include NCT03131453."
+    )
+
+    repaired = runtime_quality._inject_inline_citation_in_recommendation(raw, {"NCT03131453"})
+    sentence_match = re.search(r"BACE1 should not be pursued.*?[.!?]", repaired, flags=re.IGNORECASE | re.DOTALL)
+
+    assert sentence_match is not None
+    assert "NCT03131453" in sentence_match.group(0)
+
+
+def test_inject_inline_citation_in_recommendation_updates_unlabeled_assertive_line():
+    raw = "No-Go. BACE1 should not be pursued as a primary Alzheimer's target."
+
+    repaired = runtime_quality._inject_inline_citation_in_recommendation(raw, {"PMID:12345678"})
+
+    assert "PMID:12345678" in repaired
+
+
+def test_quality_gate_accepts_assertive_recommendation_with_validated_inline_citation():
+    task = create_task("Summarize literature evidence for psychosis biomarkers.")
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Evidence includes PMID:12345678 and PMID:23456789."
+        if step.recommended_tools:
+            step.tool_trace = [
+                {
+                    "tool_name": step.recommended_tools[0],
+                    "outcome": "ok",
+                    "evidence_refs": ["PMID:12345678", "PMID:23456789"],
+                    "response_contract": {
+                        "version": "mcp_response_v1",
+                        "valid": True,
+                        "issues": [],
+                        "text_part_count": 1,
+                        "has_structured_content": False,
+                    },
+                }
+            ]
+    task.steps[-1].output = (
+        "Recommendation: prioritize biomarker panel A due to stronger replicated signal support (PMID:12345678)."
+    )
+
+    quality = agent._evaluate_quality_gates(task)
+
+    assert quality["passed"] is True
+    assert quality["claim_provenance_claim_count"] >= 1
+    assert quality["claim_provenance_uncited_count"] == 0
+
+
+def test_quality_gate_repairs_unlabeled_assertive_recommendation_with_inline_citation():
+    task = create_task("Summarize literature evidence for psychosis biomarkers.")
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Evidence includes PMID:12345678 and PMID:23456789."
+        tool_name = step.recommended_tools[0] if step.recommended_tools else "search_pubmed_advanced"
+        step.tool_trace = [
+            {
+                "tool_name": tool_name,
+                "outcome": "ok",
+                "evidence_refs": ["PMID:12345678", "PMID:23456789"],
+                "response_contract": {
+                    "version": "mcp_response_v1",
+                    "valid": True,
+                    "issues": [],
+                    "text_part_count": 1,
+                    "has_structured_content": False,
+                },
+            }
+        ]
+    task.steps[-1].output = "No-Go. Biomarker panel A should be deprioritized due to weak evidence."
+
+    quality = agent._evaluate_quality_gates(task)
+
+    assert quality["passed"] is True
+    assert "PMID:12345678" in task.steps[-1].output
+    assert quality["claim_provenance_uncited_count"] == 0
 
 
 def test_should_open_checkpoint_on_critical_gap_before_final_step():
@@ -458,15 +1208,26 @@ def test_render_final_report_includes_query_scope_and_timeframe():
     for step in task.steps:
         step.status = "completed"
         step.output = "Step output."
+        step.tool_trace = [
+            {
+                "tool_name": "search_pubmed_advanced",
+                "outcome": "ok",
+                "evidence_refs": ["PMID:12345678"],
+            }
+        ]
     task.steps[-1].output = "Clear ranked answer."
     report = render_final_report(task, quality_report={"passed": False, "evidence_count": 0, "tool_call_count": 1, "coverage_ratio": 1.0, "unresolved_gaps": ["gap"]})
 
     assert report.startswith("## Answer")
+    assert "Main sources informing this answer:" in report
     assert "## Rationale" in report
-    assert "### Methodology" in report
-    assert "### Limitations" in report
+    assert "## Methodology" in report
+    assert "## Limitations" in report
     assert "- gap" in report
-    assert report.strip().endswith("Resolve: gap")
+    assert "- Resolve: gap" in report
+    assert "## Diagnostics" not in report
+    assert "## Structured Output" not in report
+    assert "## Decomposition" in report
 
 
 def test_render_final_report_renders_structured_rao_fields():
@@ -480,10 +1241,61 @@ def test_render_final_report_renders_structured_rao_fields():
 
     report = render_final_report(task)
 
-    assert "### Methodology" in report
-    assert "This run executed the following workflow steps:" in report
-    assert "Tools used in this run:" in report
-    assert "Tool activity summary" in report or "No tool-call trace was recorded" in report
+    assert "## Methodology" in report
+    assert "Step-by-step execution:" in report
+    assert "No tool-based evidence calls were recorded in this run." in report
+
+
+def test_render_final_report_excludes_machine_readable_contract_block():
+    task = create_task("Summarize literature evidence for psychosis biomarkers.")
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Step output with PMID:12345678 and PMID:23456789."
+    task.steps[-1].output = "Recommendation: prioritize panel A due to stronger evidence (PMID:12345678)."
+    quality = {
+        "passed": True,
+        "evidence_count": 2,
+        "tool_call_count": 3,
+        "coverage_ratio": 1.0,
+        "mcp_contract_ok_count": 3,
+        "mcp_contract_expected_count": 3,
+        "mcp_contract_violation_count": 0,
+        "validated_evidence_refs": ["PMID:12345678", "PMID:23456789"],
+        "unverified_output_refs": [],
+        "claim_provenance_claim_count": 1,
+        "claim_provenance_uncited_count": 0,
+        "unresolved_gaps": [],
+    }
+
+    report = render_final_report(task, quality_report=quality)
+
+    assert "## Structured Output" not in report
+    assert "## Diagnostics" not in report
+
+
+def test_render_final_report_uses_human_source_names_not_internal_tool_names():
+    task = create_task("Assess target risk with trial evidence.")
+    for step in task.steps:
+        step.status = "completed"
+        step.output = "Step output."
+    task.steps[0].tool_trace = [{"tool_name": "search_pubmed_advanced", "outcome": "ok"}]
+    task.steps[1].tool_trace = [{"tool_name": "search_targets", "outcome": "ok"}]
+    task.steps[2].tool_trace = [{"tool_name": "search_clinical_trials", "outcome": "ok"}]
+    task.steps[3].tool_trace = [{"tool_name": "rank_researchers_by_activity", "outcome": "ok"}]
+    task.steps[-1].output = (
+        "Recommendation: do not proceed (NCT03131453).\n\n"
+        "Rationale Narrative: These researchers were identified using rank_researchers_by_activity."
+    )
+    report = render_final_report(task, quality_report={"unresolved_gaps": []})
+
+    assert "Main sources informing this answer:" in report
+    assert "ClinicalTrials.gov" in report
+    assert "Open Targets" in report
+    assert "PubMed" in report
+    assert "search_pubmed_advanced" not in report
+    assert "search_targets" not in report
+    assert "rank_researchers_by_activity" not in report
+    assert "OpenAlex" in report
 
 
 def test_render_final_report_uses_task_level_fallback_notes():
@@ -497,8 +1309,9 @@ def test_render_final_report_uses_task_level_fallback_notes():
 
     report = render_final_report(task)
 
-    assert "### Fallback Notes" in report
-    assert "### Selected Tools" in report
+    assert "## Limitations" in report
+    assert "Fallback recovery was used; validate high-stakes claims before external use." in report
+    assert "### Fallback Notes" not in report
     assert "Final answer only." in report
 
 
@@ -510,8 +1323,8 @@ def test_render_final_report_includes_explicit_decomposition_section():
     task.status = "completed"
     report = render_final_report(task)
 
-    assert "## Decomposition" not in report
-    assert "This run executed the following workflow steps: 1. Scope and decomposition" in report
+    assert "## Decomposition" in report
+    assert "1. Query disease/topic context and lock timeframe constraints." in report
 
 
 def test_render_final_report_avoids_redundant_rationale_subheadings():
@@ -770,3 +1583,68 @@ async def test_execute_step_timeout_marks_step_blocked(monkeypatch):
 
     assert "timed out" in output.lower()
     assert task.steps[1].status == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_execute_step_repairs_fallback_order_violation(monkeypatch):
+    call_count = 0
+
+    class DummyMcpTools:
+        async def close(self):
+            return None
+
+    async def fake_run_runner_turn_with_trace(runner, session_id, user_id, prompt):
+        del runner, session_id, user_id, prompt
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return (
+                "Fallback-only attempt.",
+                [
+                    {
+                        "sequence": 1,
+                        "call_id": "call-1",
+                        "tool_name": "get_pubmed_author_profile",
+                        "args": {"authorName": "Jane Doe"},
+                        "outcome": "ok",
+                        "detail": "mock response",
+                        "phase": "main",
+                    }
+                ],
+            )
+        return (
+            "Recovered with compliant sequencing.",
+            [
+                {
+                    "sequence": 1,
+                    "call_id": "call-2",
+                    "tool_name": "rank_researchers_by_activity",
+                    "args": {"query": "schizophrenia"},
+                    "outcome": "error",
+                    "detail": "429",
+                    "phase": "main",
+                },
+                {
+                    "sequence": 2,
+                    "call_id": "call-3",
+                    "tool_name": "get_pubmed_author_profile",
+                    "args": {"authorName": "Jane Doe"},
+                    "outcome": "ok",
+                    "detail": "mock response",
+                    "phase": "main",
+                },
+            ],
+        )
+
+    monkeypatch.setattr(agent, "_create_step_runner", lambda base_runner, allowed: (object(), DummyMcpTools()))
+    monkeypatch.setattr(agent, "_run_runner_turn_with_trace", fake_run_runner_turn_with_trace)
+    monkeypatch.setattr(agent, "_should_escalate_allowlist", lambda step, trace_entries, output: False)
+
+    task = agent.create_task("find me top researchers in schizophrenia")
+    output = await agent._execute_step(object(), "session", "researcher", task, 1)
+
+    assert call_count == 2
+    assert "Recovered with compliant sequencing." in output
+    assert task.steps[1].status == "completed"
+    assert task.steps[1].tool_trace[0]["tool_name"] == "rank_researchers_by_activity"
+    assert all(entry.get("phase") == "sequence_repair" for entry in task.steps[1].tool_trace)

@@ -201,9 +201,10 @@ def test_get_task_detail_regenerates_legacy_report_format(monkeypatch, tmp_path)
     assert detail is not None
     report_markdown = str(detail["report_markdown"] or "")
     assert report_markdown.startswith("## Answer")
+    assert "## Answer" in report_markdown
     assert "## Query" not in report_markdown
     assert "## Scope" not in report_markdown
-    assert "## Decomposition" not in report_markdown
+    assert "## Decomposition" in report_markdown
     assert "## Diagnostics" not in report_markdown
 
 

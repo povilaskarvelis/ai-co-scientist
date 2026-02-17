@@ -352,7 +352,23 @@ def _plan_for_expert_discovery(intent_tags: list[str]) -> list[WorkflowStep]:
     ]
 
 
-def _plan_for_target_assessment(intent_tags: list[str]) -> list[WorkflowStep]:
+def _is_multi_target_query(objective: str, intent_tags: list[str]) -> bool:
+    lower = str(objective or "").lower()
+    if "target or trap" in lower:
+        return False
+    if "target_comparison" in intent_tags:
+        return True
+    comparison_markers = (
+        " vs ",
+        " versus ",
+        "compare ",
+        "comparison",
+        "between ",
+    )
+    return any(marker in lower for marker in comparison_markers)
+
+
+def _plan_for_target_assessment(intent_tags: list[str], *, comparison_mode: bool) -> list[WorkflowStep]:
     preferred, fallback = tool_bundle_for_intent(intent_tags)
     core_preferred = [
         "search_targets",
@@ -361,22 +377,25 @@ def _plan_for_target_assessment(intent_tags: list[str]) -> list[WorkflowStep]:
         "search_chembl_compounds_for_target",
         "summarize_target_expression_context",
         "infer_genetic_effect_direction",
-        "compare_targets_multi_axis",
         "summarize_target_competitive_landscape",
         "summarize_target_safety_liabilities",
         "summarize_clinical_trials_landscape",
         "search_clinical_trials",
         "search_pubmed_advanced",
     ]
+    if comparison_mode:
+        core_preferred.append("compare_targets_multi_axis")
     core_fallback = ["search_pubmed", "get_pubmed_abstract", "get_clinical_trial"]
     recommended_tools = sorted(set(core_preferred + preferred))
+    if not comparison_mode:
+        recommended_tools = [tool for tool in recommended_tools if tool != "compare_targets_multi_axis"]
     fallback_tools = sorted(set(core_fallback + fallback))
     return [
         WorkflowStep(
             step_id="step_1",
             title="Scope and weighted criteria",
             instruction=(
-                "Lock the decision question, comparison targets, disease context, and weighting rules. "
+                "Lock the decision question, targets, disease context, and weighting rules. "
                 "Convert user priorities into explicit decision criteria and decomposition subtasks."
             ),
             rationale="Frame assessment criteria before tool execution.",
@@ -386,16 +405,31 @@ def _plan_for_target_assessment(intent_tags: list[str]) -> list[WorkflowStep]:
             step_id="step_2",
             title="Human genetics evidence",
             instruction=(
-                "Collect and compare genetics evidence for both targets, including association strength and "
-                "direction-of-effect when available. If directionality tools fail, run fallback genetics paths "
-                "and record the exact residual uncertainty."
+                (
+                    "Collect and compare genetics evidence for both targets, including association strength and "
+                    "direction-of-effect when available. If directionality tools fail, run fallback genetics paths "
+                    "and record the exact residual uncertainty."
+                )
+                if comparison_mode
+                else (
+                    "Collect genetics evidence for the target, including association strength and direction-of-effect "
+                    "when available. If directionality tools fail, run fallback genetics paths and record the exact residual uncertainty."
+                )
             ),
-            recommended_tools=[
-                "infer_genetic_effect_direction",
-                "search_gwas_associations",
-                "compare_targets_multi_axis",
-                "search_pubmed_advanced",
-            ],
+            recommended_tools=(
+                [
+                    "infer_genetic_effect_direction",
+                    "search_gwas_associations",
+                    "compare_targets_multi_axis",
+                    "search_pubmed_advanced",
+                ]
+                if comparison_mode
+                else [
+                    "infer_genetic_effect_direction",
+                    "search_gwas_associations",
+                    "search_pubmed_advanced",
+                ]
+            ),
             fallback_tools=fallback_tools,
             rationale="Human genetics is a high-weight decision axis and must be assessed first.",
             expected_output_fields=["selected_tools", "genetics_findings", "directionality_gaps", "confidence"],
@@ -436,14 +470,29 @@ def _plan_for_target_assessment(intent_tags: list[str]) -> list[WorkflowStep]:
         ),
         WorkflowStep(
             step_id="step_5",
-            title="Weighted comparison and trade-offs",
+            title="Weighted comparison and trade-offs" if comparison_mode else "Weighted integration and trade-offs",
             instruction=(
-                "Synthesize the evidence across criteria using the requested weighting. "
-                "Resolve contradictions, call out unresolved gaps, and produce a clear winner/loser rationale."
+                (
+                    "Synthesize the evidence across criteria using the requested weighting. "
+                    "Resolve contradictions, call out unresolved gaps, and produce a clear winner/loser rationale."
+                )
+                if comparison_mode
+                else (
+                    "Synthesize the evidence across criteria using the requested weighting. "
+                    "Resolve contradictions, call out unresolved gaps, and produce a clear go/no-go rationale."
+                )
             ),
-            recommended_tools=["compare_targets_multi_axis", "search_pubmed_advanced"],
+            recommended_tools=(
+                ["compare_targets_multi_axis", "search_pubmed_advanced"]
+                if comparison_mode
+                else ["search_pubmed_advanced"]
+            ),
             fallback_tools=fallback_tools,
-            rationale="Create an auditable comparison before final recommendation.",
+            rationale=(
+                "Create an auditable comparison before final recommendation."
+                if comparison_mode
+                else "Create an auditable single-target decision rationale before final recommendation."
+            ),
             expected_output_fields=["comparison_matrix", "tradeoffs", "unresolved_gaps", "provisional_conclusion"],
         ),
         WorkflowStep(
@@ -451,7 +500,12 @@ def _plan_for_target_assessment(intent_tags: list[str]) -> list[WorkflowStep]:
             title="Decision report",
             instruction=(
                 "Produce a concise report with recommendation first, then rationale narrative, methodology, "
-                "and exactly three next actions. Include explicit reasons for deprioritizing the loser."
+                "and exactly three next actions. "
+                + (
+                    "Include explicit reasons for deprioritizing the loser."
+                    if comparison_mode
+                    else "Include explicit go/no-go rationale and key risk-mitigation conditions."
+                )
             ),
             rationale="Convert evidence into an auditable recommendation.",
             expected_output_fields=["recommendation", "confidence", "citations", "risks", "next_actions"],
@@ -547,7 +601,10 @@ def build_plan_steps(
         "pathway_context",
     }
     if any(tag in target_assessment_tags for tag in intent_tags) or "target" in lower or "druggab" in lower or "trial" in lower:
-        steps = _plan_for_target_assessment(intent_tags)
+        steps = _plan_for_target_assessment(
+            intent_tags,
+            comparison_mode=_is_multi_target_query(objective, intent_tags),
+        )
     else:
         steps = _plan_generic(request_type, intent_tags)
     return _apply_revision_plan_overrides(steps, objective)
