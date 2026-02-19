@@ -100,37 +100,50 @@ def _first_person_progress_text(value: str) -> str:
     if not text:
         return ""
 
-    replacements: list[tuple[str, str]] = [
-        (r"\b[Tt]he agents?\b", "I"),
-        (r"\b[Aa]gents?\b", "I"),
-        (r"\b[Tt]he workflow\b", "I"),
-        (r"\b[Tt]his workflow\b", "I"),
-        (r"\b[Tt]he system\b", "I"),
+    lead_replacements: list[tuple[str, str]] = [
+        (r"^\s*(?:[Tt]he\s+)?agents?\s+(?:are|is)\s+", ""),
+        (r"^\s*(?:[Tt]he\s+)?workflow\s+(?:is|was|has|will)\s+", ""),
+        (r"^\s*[Tt]his workflow\s+(?:is|was|has|will)\s+", ""),
+        (r"^\s*(?:[Tt]he\s+)?system\s+(?:is|was|has|will)\s+", ""),
+        (r"^\s*Task\s+is\s+", ""),
+        (r"^\s*Task\s+was\s+", ""),
+        (r"^\s*Task\s+has\s+", ""),
+        (r"^\s*Task\s+will\s+", ""),
+        (r"^\s*I am\s+", ""),
+        (r"^\s*I'm\s+", ""),
+        (r"^\s*I will\s+", ""),
+        (r"^\s*I have\s+", "Have "),
+        (r"^\s*I had\s+", "Had "),
     ]
-    for pattern, repl in replacements:
-        text = re.sub(pattern, repl, text)
+    for pattern, repl in lead_replacements:
+        text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
 
-    text = re.sub(r"^\s*Task is\b", "I am", text)
-    text = re.sub(r"^\s*Task was\b", "I was", text)
-    text = re.sub(r"^\s*Task has\b", "I have", text)
-    text = re.sub(r"^\s*Task will\b", "I will", text)
-
-    grammar_fixes: list[tuple[str, str]] = [
-        (r"\bI are\b", "I am"),
-        (r"\bI is\b", "I am"),
-        (r"\bI has\b", "I have"),
-        (r"\bI does\b", "I do"),
-        (r"\bI needs\b", "I need"),
-        (r"\bI waits\b", "I wait"),
-        (r"\bI runs\b", "I run"),
-        (r"\bI opens\b", "I open"),
-        (r"\bI checks\b", "I check"),
-        (r"\bI builds\b", "I build"),
-        (r"\bI applies\b", "I apply"),
-        (r"\bI completes\b", "I complete"),
+    sentence_replacements: list[tuple[str, str]] = [
+        (r"^\s*I hit an execution error\b", "Run failed"),
+        (r"^\s*I need clarification\b", "Need clarification"),
+        (r"^\s*I started\b", "Started"),
+        (r"^\s*I created\b", "Created"),
+        (r"^\s*I completed\b", "Completed"),
+        (r"^\s*I opened\b", "Opened"),
+        (r"^\s*I resumed\b", "Resumed"),
+        (r"^\s*I queued\b", "Queued"),
+        (r"^\s*I incorporated\b", "Incorporated"),
+        (r"^\s*I updated\b", "Updated"),
+        (r"^\s*I (?:am )?waiting\b", "Waiting"),
+        (r"^\s*I (?:am )?running\b", "Running"),
+        (r"^\s*I (?:am )?checking\b", "Checking"),
+        (r"^\s*I (?:am )?building\b", "Building"),
+        (r"^\s*I (?:am )?applying\b", "Applying"),
     ]
-    for pattern, repl in grammar_fixes:
-        text = re.sub(pattern, repl, text)
+    for pattern, repl in sentence_replacements:
+        text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
+
+    text = re.sub(r"^\s*I\s+([a-z]+ing\b)", r"\1", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\s*I\s+([a-z]+ed\b)", r"\1", text, flags=re.IGNORECASE)
+    text = re.sub(r"^\s*I\s+", "", text, flags=re.IGNORECASE)
+    text = text.strip()
+    if text and text[0].islower():
+        text = text[0].upper() + text[1:]
     return text
 
 
@@ -550,20 +563,20 @@ class UiRuntime:
 
     def _default_next_steps(self, phase: str, *, status: str = "progress") -> list[str]:
         if status == "error":
-            return ["I will handle this failure or continue with the best available evidence."]
+            return ["Handling this failure or continuing with the best available evidence."]
         if phase == "intake":
-            return ["I will route intent and build an initial execution plan."]
+            return ["Routing intent and building an initial execution plan."]
         if phase == "plan":
-            return ["I will open the first checkpoint so you can start execution."]
+            return ["Opening the first checkpoint so execution can start."]
         if phase == "checkpoint":
-            return ["I will wait for your input to continue or revise the plan."]
+            return ["Waiting for your input to continue or revise the plan."]
         if phase in {"search", "analyze", "execute"}:
-            return ["I will continue evidence retrieval and update quality-state gaps."]
+            return ["Continuing evidence retrieval and updating quality-state gaps."]
         if phase == "synthesize":
-            return ["I will finalize the recommendation and compile diagnostics."]
+            return ["Finalizing the recommendation and compiling diagnostics."]
         if phase == "finalize":
-            return ["I will persist report artifacts and return the final output."]
-        return ["I will continue workflow execution."]
+            return ["Persisting report artifacts and returning final output."]
+        return ["Continuing workflow execution."]
 
     def _fallback_progress_summary(
         self,
@@ -594,7 +607,7 @@ class UiRuntime:
                 max_chars=180,
             )
         if not latest_line:
-            latest_line = "I updated progress."
+            latest_line = "Progress updated."
         headline = latest_line
         if len(headline.split()) > 12:
             headline = " ".join(headline.split()[:12])
@@ -641,7 +654,8 @@ class UiRuntime:
         prompt = (
             "Generate a high-level progress summary from observable workflow events only.\n"
             "Return strict JSON with keys: headline, summary, completed, next, confidence.\n"
-            "Use first-person voice as if speaking directly to the user (e.g., 'I ...').\n"
+            "Prefer concise implicit action phrases (e.g., 'Building plan', 'Checkpoint opened').\n"
+            "Use first-person only when necessary for clarity.\n"
             "Never refer to yourself as 'the agent', 'the workflow', or 'the system'.\n"
             f"Current phase: {phase}\n"
             f"Status: {status}\n"
@@ -1038,14 +1052,14 @@ class UiRuntime:
                     phase="intake",
                     event_type="run.started",
                     status="start",
-                    human_line=f"I started this research run: {title}",
+                    human_line=f"Started research run: {title}",
                 )
                 await self._append_progress_event(
                     run_id,
                     phase="intake",
                     event_type="clarification.check",
                     status="progress",
-                    human_line="I'm checking whether clarification is required.",
+                    human_line="Checking whether clarification is required.",
                 )
                 clarification_msg = await app_service.build_clarification_request(
                     effective_objective,
@@ -1059,7 +1073,7 @@ class UiRuntime:
                         phase="intake",
                         event_type="clarification.required",
                         status="done",
-                        human_line="I need clarification before I can execute this plan.",
+                        human_line="Clarification is required before execution.",
                     )
                     await self._update_run(
                         run_id,
@@ -1073,7 +1087,7 @@ class UiRuntime:
                     phase="plan",
                     event_type="plan.initializing",
                     status="start",
-                    human_line="I'm building the initial workflow plan.",
+                    human_line="Building initial workflow plan.",
                 )
 
                 task = await app_service.start_new_workflow_task(
@@ -1104,7 +1118,7 @@ class UiRuntime:
                     phase="plan",
                     event_type="task.created",
                     status="done",
-                    human_line=f"I created task {task.task_id} with {len(task.steps)} planned steps.",
+                    human_line=f"Created task {task.task_id} with {len(task.steps)} planned steps.",
                     task_id=task.task_id,
                     metrics={"steps_total": len(task.steps)},
                 )
@@ -1121,7 +1135,7 @@ class UiRuntime:
                         phase=self._phase_for_step(task, 0),
                         event_type="step.completed",
                         status="done",
-                        human_line=f"I completed: {first_step.title}.",
+                        human_line=f"{first_step.title} complete.",
                         task_id=task.task_id,
                         step_index=0,
                         step_title=first_step.title,
@@ -1146,7 +1160,7 @@ class UiRuntime:
                         phase="checkpoint",
                         event_type="checkpoint.opened",
                         status="done",
-                        human_line=f"I opened a checkpoint: {task.checkpoint_reason or 'pre_evidence_execution'}.",
+                        human_line=f"Checkpoint opened: {task.checkpoint_reason or 'pre_evidence_execution'}.",
                         task_id=task.task_id,
                         metrics={"checkpoint_reason": task.checkpoint_reason or "pre_evidence_execution"},
                     )
@@ -1158,7 +1172,7 @@ class UiRuntime:
                         phase="checkpoint",
                         event_type="checkpoint.waiting",
                         status="progress",
-                        human_line="I'm waiting for your start/feedback at this checkpoint.",
+                        human_line="Waiting for your start/feedback at checkpoint.",
                         task_id=task.task_id,
                     )
         except Exception as exc:
@@ -1168,7 +1182,7 @@ class UiRuntime:
                 phase="finalize",
                 event_type="run.failed",
                 status="error",
-                human_line=f"I hit an execution error: {error}",
+                human_line=f"Run failed: {error}",
             )
             await self._update_run(run_id, status="failed", error=error)
             traceback.print_exc()
@@ -1209,7 +1223,7 @@ class UiRuntime:
                 phase="plan",
                 event_type="feedback.rejected",
                 status="done",
-                human_line="I already used the one allowed plan revision for this task.",
+                human_line="Revision limit reached: one plan revision is allowed per task.",
                 task_id=task.task_id,
             )
             await self._save_task(task, note="feedback_replan_limit_reached_ui", run_id=run_id)
@@ -1258,7 +1272,7 @@ class UiRuntime:
             phase="plan",
             event_type="plan.replanned",
             status="done",
-            human_line=f"I updated the plan from your feedback: {delta.summary}.",
+            human_line=f"Plan updated from feedback: {delta.summary}.",
             task_id=task.task_id,
             metrics={
                 "added_steps": len(delta.added_steps),
@@ -1272,7 +1286,7 @@ class UiRuntime:
             phase="checkpoint",
             event_type="checkpoint.opened",
             status="done",
-            human_line=f"I opened a checkpoint after applying your feedback: {gate_reason}.",
+            human_line=f"Checkpoint opened after feedback: {gate_reason}.",
             task_id=task.task_id,
             metrics={"checkpoint_reason": gate_reason},
         )
@@ -1320,7 +1334,7 @@ class UiRuntime:
                             phase="checkpoint",
                             event_type="feedback.queued_applied",
                             status="progress",
-                            human_line="I'm applying your queued feedback at this adaptive checkpoint.",
+                            human_line="Applying queued feedback at adaptive checkpoint.",
                             task_id=task.task_id,
                             metrics={"queued_feedback_count": len(queued_feedback)},
                         )
@@ -1342,7 +1356,7 @@ class UiRuntime:
                         phase="checkpoint",
                         event_type="checkpoint.opened",
                         status="done",
-                        human_line=f"I opened an adaptive checkpoint: {gate_reason}.",
+                        human_line=f"Adaptive checkpoint opened: {gate_reason}.",
                         task_id=task.task_id,
                         metrics={"checkpoint_reason": gate_reason},
                     )
@@ -1369,7 +1383,7 @@ class UiRuntime:
                 phase=self._phase_for_step(task, next_idx),
                 event_type="step.completed",
                 status="done",
-                human_line=f"I completed: {step.title}.",
+                human_line=f"{step.title} complete.",
                 task_id=task.task_id,
                 step_index=next_idx,
                 step_title=step.title,
@@ -1397,7 +1411,7 @@ class UiRuntime:
             event_type="quality.evaluated",
             status="done",
             human_line=(
-                "I evaluated quality: "
+                "Quality evaluated: "
                 f"{final_quality.get('tool_call_count', 0)} tool calls, "
                 f"{final_quality.get('evidence_count', 0)} evidence IDs."
             ),
@@ -1450,7 +1464,7 @@ class UiRuntime:
                     phase="checkpoint",
                     event_type="checkpoint.resumed",
                     status="start",
-                    human_line=f"I resumed execution for task {task_id}.",
+                    human_line=f"Execution resumed for task {task_id}.",
                     task_id=task_id,
                 )
                 ack_token = app_service.gate_ack_token(task.checkpoint_reason, task.active_plan_version_id)
@@ -1474,7 +1488,7 @@ class UiRuntime:
                     phase="execute",
                     event_type="execution.running",
                     status="progress",
-                    human_line="I'm running from this checkpoint until completion or the next adaptive gate.",
+                    human_line="Running from checkpoint until completion or next adaptive gate.",
                     task_id=task_id,
                 )
 
@@ -1494,7 +1508,7 @@ class UiRuntime:
                         phase="checkpoint",
                         event_type="checkpoint.waiting",
                         status="done",
-                        human_line=f"I opened a checkpoint: {task.checkpoint_reason or 'adaptive_gate'}.",
+                        human_line=f"Checkpoint opened: {task.checkpoint_reason or 'adaptive_gate'}.",
                         task_id=task.task_id,
                         metrics={"checkpoint_reason": task.checkpoint_reason or "adaptive_gate"},
                     )
@@ -1513,7 +1527,7 @@ class UiRuntime:
                     event_type="quality.evaluated",
                     status="done",
                     human_line=(
-                        "I completed quality gates: "
+                        "Quality gate complete: "
                         f"evidence={quality.get('evidence_count', 0)}, "
                         f"coverage={quality.get('coverage_ratio', 0):.2f}, "
                         f"tools={quality.get('tool_call_count', 0)}."
@@ -1549,7 +1563,7 @@ class UiRuntime:
                     phase="finalize",
                     event_type="run.completed",
                     status="done",
-                    human_line="I completed the report.",
+                    human_line="Report completed.",
                     task_id=task.task_id,
                 )
         except Exception as exc:
@@ -1559,7 +1573,7 @@ class UiRuntime:
                 phase="finalize",
                 event_type="run.failed",
                 status="error",
-                human_line=f"I hit an execution error: {error}",
+                human_line=f"Run failed: {error}",
                 task_id=task_id,
             )
             await self._update_run(run_id, status="failed", error=error)
@@ -1587,7 +1601,7 @@ class UiRuntime:
                     phase="checkpoint",
                     event_type="feedback.queued",
                     status="done",
-                    human_line="I queued your feedback and will apply it at the next checkpoint.",
+                    human_line="Feedback queued and will be applied at the next checkpoint.",
                     task_id=task_id,
                     metrics={"queued_feedback_count": len(queue)},
                 )
@@ -1610,7 +1624,7 @@ class UiRuntime:
                             phase="plan",
                             event_type="feedback.rejected",
                             status="done",
-                            human_line="I already used the one allowed plan revision for this task.",
+                            human_line="Revision limit reached: one plan revision is allowed per task.",
                             task_id=task.task_id,
                         )
                         await self._update_run(run_id, status="completed", task_id=task.task_id)
@@ -1623,7 +1637,7 @@ class UiRuntime:
                         phase="checkpoint",
                         event_type="feedback.queued",
                         status="done",
-                        human_line="I'm not at a checkpoint yet, so I queued your feedback for the next adaptive gate.",
+                        human_line="Task is not at checkpoint; feedback queued for next adaptive gate.",
                         task_id=task.task_id,
                         metrics={"queued_feedback_count": len(task.pending_feedback_queue)},
                     )
@@ -1635,7 +1649,7 @@ class UiRuntime:
                     phase="plan",
                     event_type="feedback.applying",
                     status="start",
-                    human_line=f"I'm applying your feedback to task {task_id}.",
+                    human_line=f"Applying feedback to task {task_id}.",
                     task_id=task.task_id,
                 )
                 await self._apply_feedback_replan(
@@ -1650,7 +1664,7 @@ class UiRuntime:
                     phase="checkpoint",
                     event_type="feedback.applied",
                     status="done",
-                    human_line="I incorporated your feedback. The updated plan is ready at checkpoint.",
+                    human_line="Feedback incorporated. Updated plan is ready at checkpoint.",
                     task_id=task.task_id,
                 )
         except Exception as exc:
@@ -1660,7 +1674,7 @@ class UiRuntime:
                 phase="finalize",
                 event_type="run.failed",
                 status="error",
-                human_line=f"I hit an execution error: {error}",
+                human_line=f"Run failed: {error}",
                 task_id=task_id,
             )
             await self._update_run(run_id, status="failed", error=error)

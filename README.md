@@ -209,37 +209,8 @@ This suite covers:
 - task state persistence and report PDF generation
 
 Notes:
-- External network/eval harness tests were removed from the default suite to keep CI/dev runs deterministic and fast.
+- External network tests were removed from the default suite to keep CI/dev runs deterministic and fast.
 - Generated artifacts in `adk-agent/reports/` are runtime outputs and can be safely deleted.
-
-One-command acceptance demo (fixed challenge scenarios + deterministic scoreboard):
-
-```bash
-python adk-agent/run_acceptance_demo.py
-```
-
-Artifacts are written to:
-- `adk-agent/acceptance/results/<run_id>/scoreboard.json`
-- `adk-agent/acceptance/results/<run_id>/summary.md`
-- `adk-agent/acceptance/results/<run_id>/summary.pdf`
-- `adk-agent/acceptance/results/<run_id>/reports/*.md`
-- `adk-agent/acceptance/results/<run_id>/reports/*.pdf`
-
-Useful options:
-- `--limit 1`: run only the first scenario for a quick smoke
-- `--only-scenario <scenario_id>`: run specific scenario(s)
-- `--no-pdf`: skip PDF artifact generation and emit markdown-only reports
-- `--non-strict`: always exit 0 even when checks fail
-
-CI automation:
-- Workflow file: `.github/workflows/acceptance-demo.yml`
-- Trigger: pushes to `main`/`master` and all pull requests
-- Behavior: runs strict acceptance harness (no `--non-strict`) and fails build on any scenario/checkpoint failure
-- Artifacts uploaded on every run (pass or fail): `scoreboard.json`, `summary.md`, `summary.pdf`, scenario markdown/PDF reports, HITL probe log
-- Required repository secret: `GOOGLE_API_KEY`
-
-Weighted rubric for general strategy quality:
-- `adk-agent/evals/co_investigator_rubric.md`
 
 ## Data Sources
 

@@ -280,9 +280,9 @@ def test_task_summary_includes_title():
 
 
 def test_first_person_progress_text_normalizes_third_person():
-    assert ui_server._first_person_progress_text("The agent is gathering evidence.") == "I am gathering evidence."
-    assert ui_server._first_person_progress_text("Agents are executing the approved plan.") == "I am executing the approved plan."
+    assert ui_server._first_person_progress_text("The agent is gathering evidence.") == "Gathering evidence."
+    assert ui_server._first_person_progress_text("Agents are executing the approved plan.") == "Executing the approved plan."
     assert (
         ui_server._first_person_progress_text("Task is not at checkpoint; feedback queued for next adaptive gate.")
-        == "I am not at checkpoint; feedback queued for next adaptive gate."
+        == "Not at checkpoint; feedback queued for next adaptive gate."
     )

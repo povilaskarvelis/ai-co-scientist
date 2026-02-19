@@ -69,10 +69,10 @@ def extract_decomposition_subtasks(text: str) -> list[str]:
 
 
 def default_hitl_subtasks(task: WorkflowTask) -> list[str]:
-    # Build fallback subtasks from the current dynamic plan state instead of intent hardcoding.
-    steps = [step for step in task.steps if step.status != "completed" and step.subgoal_id != "sg_final_report"]
+    # Build fallback subtasks from remaining plan steps.
+    steps = [step for step in task.steps if step.status != "completed"]
     if not steps:
-        steps = [step for step in task.steps if step.subgoal_id != "sg_final_report"]
+        steps = list(task.steps)
 
     subtasks: list[str] = []
     for step in steps:

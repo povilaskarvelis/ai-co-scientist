@@ -8,9 +8,9 @@ from report_pdf import (
     _is_markdown_table_divider,
     _is_markdown_table_start,
     _strip_blockquote_prefix,
+    write_markdown_with_pdf,
     write_markdown_pdf,
 )
-from run_acceptance_demo import _write_markdown_with_pdf
 
 
 def test_write_markdown_pdf_generates_file_or_reports_missing_dependency(tmp_path: Path):
@@ -37,7 +37,7 @@ def test_write_markdown_pdf_generates_file_or_reports_missing_dependency(tmp_pat
 
 def test_write_markdown_with_pdf_always_writes_markdown_file(tmp_path: Path):
     markdown_path = tmp_path / "report.md"
-    pdf_file, pdf_error = _write_markdown_with_pdf(
+    pdf_file, pdf_error = write_markdown_with_pdf(
         markdown_path,
         "## Report\n\n- evidence item",
         title="Integration Test",
@@ -55,7 +55,7 @@ def test_write_markdown_with_pdf_always_writes_markdown_file(tmp_path: Path):
 
 def test_write_markdown_with_pdf_can_be_disabled(tmp_path: Path):
     markdown_path = tmp_path / "disabled.md"
-    pdf_file, pdf_error = _write_markdown_with_pdf(
+    pdf_file, pdf_error = write_markdown_with_pdf(
         markdown_path,
         "## Disabled PDF",
         title="Disabled",

@@ -62,20 +62,23 @@ MCP_SERVER_DIR = Path(__file__).parent.parent / "research-mcp"
 REPORT_ARTIFACTS_DIR = Path(__file__).resolve().parent / "reports"
 STEP_TURN_TIMEOUT_SECONDS = float(os.getenv("ADK_STEP_TURN_TIMEOUT_SECONDS", "150"))
 DYNAMIC_TOOL_REGISTRY_ENABLED = os.getenv("ADK_DYNAMIC_TOOL_REGISTRY", "1").strip().lower() not in {"0", "false", "no"}
-DYNAMIC_PLANNER_GRAPH_ENABLED = os.getenv("ADK_DYNAMIC_PLANNER_GRAPH", "1").strip().lower() not in {"0", "false", "no"}
 DYNAMIC_TOOL_RETRIEVAL_ENABLED = os.getenv("ADK_DYNAMIC_TOOL_RETRIEVAL", "1").strip().lower() not in {"0", "false", "no"}
 CRITIC_LOOP_QUALITY_MODEL_ENABLED = os.getenv("ADK_CRITIC_LOOP_QUALITY_MODEL", "1").strip().lower() not in {"0", "false", "no"}
 
 
 AGENT_INSTRUCTION = """You are an agentic AI research assistant operating like a high-level research intern.
-Think in iterative Plan-Act-Reflect cycles.
-Use tools to gather evidence, keep provenance, and state uncertainty explicitly.
-After each major phase, pause and ask the user for confirmation before continuing.
-Always end with a final response grounded in captured evidence and adapted to the user query."""
+Run an end-to-end investigation workflow:
+1) clarify objective and constraints,
+2) build a concise query-specific plan,
+3) gather and verify evidence with tools,
+4) critique evidence quality and uncertainty,
+5) adapt or re-plan when needed,
+6) integrate findings into a clear answer.
+Keep provenance explicit, surface uncertainty and contradictions, and maintain user-visible progress through checkpoints."""
 
-PLANNER_PROMPT = """You are the planning role for an agentic scientific workflow.
-Generate query-specific subgoals, dependencies, and evidence requirements.
-Avoid rigid templates when a custom decomposition is better."""
+PLANNER_PROMPT = """You are the planner for an agentic scientific workflow.
+Generate a concise, query-specific investigation plan with subgoals, dependencies,
+evidence requirements, and source databases."""
 
 PLANNER_GRAPH_SCHEMA_PROMPT = """Return strict JSON only with this schema:
 {
@@ -85,10 +88,11 @@ PLANNER_GRAPH_SCHEMA_PROMPT = """Return strict JSON only with this schema:
       "title": string,
       "objective": string,
       "dependencies": [string],
+      "planned_sources": [string],
       "evidence_requirements": [string],
       "done_criteria": [string],
       "max_calls": number,
-      "phase": "evidence_discovery" | "researcher_scouting" | "synthesis_reporting"
+      "phase": string
     }
   ]
 }
@@ -97,7 +101,12 @@ Rules:
 - Build a custom plan for this specific query; do not use generic template naming.
 - Keep 2-6 subgoals.
 - Dependencies must reference earlier subgoal_id values only.
-- Avoid including a final-report step; final synthesis is added by runtime guardrail.
+- Keep objective concise (single sentence, <= 18 words) and action-oriented.
+- Focus subgoals on investigation execution and evidence development.
+- Do not include a synthesis-only or writeup-only subgoal.
+- For each subgoal, populate planned_sources with source/database names (for example: Open Targets, PubMed, OpenAlex, ClinicalTrials.gov, ChEMBL, GWAS Catalog, ClinVar, Reactome, STRING, Local datasets).
+- Do not use internal tool IDs inside planned_sources.
+- Phase is optional; if present, use a short generic label.
 - Use concise, actionable objectives with explicit evidence intent.
 """
 
@@ -108,7 +117,7 @@ CRITIC_PROMPT = """You are the critic/verifier role for an agentic scientific wo
 Assess evidence sufficiency, contradictions, and confidence calibration before final recommendation."""
 
 REPORT_SYNTHESIZER_PROMPT = """You are the reporting role for an agentic scientific workflow.
-Produce a concise final response that adapts structure to the query and evidence quality.
+Integrate evidence into a concise answer that adapts structure to the query and evidence quality.
 Lead with a direct answer first, then add only the rationale, methodology/provenance, limitations,
 and references needed for clarity."""
 
@@ -179,7 +188,8 @@ Return strict JSON only with this schema:
 Rules:
 - Use only observable actions and outcomes from provided events.
 - Do not include private reasoning or chain-of-thought.
-- Write in first person as if speaking directly to the user (use "I ...").
+- Prefer concise implicit action phrases (e.g., "Building plan", "Checkpoint opened").
+- Use first person only when needed for clarity.
 - Do not refer to yourself as "the agent", "the workflow", or "the system".
 - headline: <= 12 words.
 - summary: 1-2 short sentences.
@@ -328,6 +338,33 @@ def _normalize_user_query(query: str) -> str:
     return _planning_intent.normalize_user_query(query)
 
 
+def _real_world_source_for_tool(tool_name: str) -> str:
+    tool = str(tool_name or "").strip().lower()
+    if not tool:
+        return "Unknown"
+    if "openalex" in tool or tool == "rank_researchers_by_activity":
+        return "OpenAlex"
+    if "pubmed" in tool:
+        return "PubMed"
+    if "chembl" in tool:
+        return "ChEMBL"
+    if "gwas" in tool:
+        return "GWAS Catalog"
+    if "clinvar" in tool:
+        return "ClinVar"
+    if "reactome" in tool:
+        return "Reactome"
+    if "string" in tool:
+        return "STRING"
+    if "target" in tool or "druggability" in tool or "safety" in tool or "expression" in tool:
+        return "Open Targets"
+    if "clinical" in tool:
+        return "ClinicalTrials.gov"
+    if "local" in tool:
+        return "Local datasets"
+    return "Biomedical MCP tools"
+
+
 async def _draft_model_plan_graph(
     objective: str,
     *,
@@ -344,12 +381,13 @@ async def _draft_model_plan_graph(
         caps = ", ".join(str(cap).strip() for cap in item.get("capabilities", [])[:5] if str(cap).strip())
         if not name:
             continue
-        tool_lines.append(f"- {name} ({caps or 'uncategorized'})")
+        source = _real_world_source_for_tool(name)
+        tool_lines.append(f"- {name} -> {source} ({caps or 'uncategorized'})")
     prompt = (
         f"{PLANNER_PROMPT}\n\n"
         f"{PLANNER_GRAPH_SCHEMA_PROMPT}\n\n"
         f"Objective: {objective}\n"
-        "Available tools (name + inferred capabilities):\n"
+        "Available tools (internal name -> source/database, inferred capabilities):\n"
         f"{chr(10).join(tool_lines) if tool_lines else '- none'}\n"
     )
     try:
@@ -718,7 +756,6 @@ async def _apply_feedback_replan_cli(
         revised_objective=revised_objective,
         revision_intent=merged_intent,
         gate_reason=gate_reason,
-        use_dynamic_planner=DYNAMIC_PLANNER_GRAPH_ENABLED,
         tool_registry_summary=_TOOL_REGISTRY.summary(max_tools=120),
         plan_graph_override=model_plan_graph,
     )
@@ -891,7 +928,6 @@ async def _start_new_workflow_task(
         print("- Re-running scope/decomposition with this revision.")
     task = create_task(
         routed_objective,
-        use_dynamic_planner=DYNAMIC_PLANNER_GRAPH_ENABLED,
         tool_registry_summary=_TOOL_REGISTRY.summary(max_tools=120),
         plan_graph_override=model_plan_graph,
     )

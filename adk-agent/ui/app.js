@@ -364,12 +364,12 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
 
   const summaryByStatus = {
     queued: "Preparing research workflow.",
-    running: "I am executing the approved plan.",
-    in_progress: "I am executing the approved plan.",
-    awaiting_hitl: "I am waiting at a checkpoint for your input.",
-    completed: "I completed this research run.",
-    failed: "I hit an error while running this workflow.",
-    needs_clarification: "I need clarification to proceed.",
+    running: "Executing the approved plan.",
+    in_progress: "Executing the approved plan.",
+    awaiting_hitl: "Waiting at a checkpoint for your input.",
+    completed: "Research run completed.",
+    failed: "Run ended with an error.",
+    needs_clarification: "Clarification required to proceed.",
   };
 
   const title = String(latestSummary?.headline || "").trim() || latestLine || "Research log";
@@ -379,7 +379,7 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
   if (completed.length) preview = `Completed: ${completed.slice(0, 4).join(" • ")}`;
   else if (next.length) preview = `Next: ${next.slice(0, 3).join(" • ")}`;
   else if (latestLine) preview = latestLine;
-  else if (normalizedStatus === "completed") preview = "I finished execution. Expand to inspect details.";
+  else if (normalizedStatus === "completed") preview = "Execution finished. Expand to inspect details.";
   else preview = "Click for activity details";
 
   const details = ["### Workflow"];

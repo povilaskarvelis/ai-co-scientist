@@ -103,7 +103,7 @@ def _extract_primary_query(objective: str) -> str:
     return lines[0] if lines else text
 
 
-# Planning/revision compatibility exports now delegate to co_scientist.planning.workflow_planning.
+# Planning and revision helpers delegate to co_scientist.planning.workflow_planning.
 VALID_REQUEST_TYPES = _planning.VALID_REQUEST_TYPES
 VALID_INTENT_TAGS = _planning.VALID_INTENT_TAGS
 CAPABILITY_PATTERNS = _planning.CAPABILITY_PATTERNS
@@ -349,7 +349,7 @@ def _default_decomposition(task: WorkflowTask) -> list[str]:
         subtasks.append(
             f"Execute the '{title}' stage and capture traceable citations plus unresolved gaps."
         )
-    subtasks.append("Synthesize evidence into a recommendation with limitations and next actions.")
+    subtasks.append("Integrate evidence and unresolved uncertainty into a clear conclusion.")
     return subtasks
 
 
@@ -1196,7 +1196,7 @@ def render_final_report(task: WorkflowTask, quality_report: dict | None = None) 
     return text
 
 
-def _final_response_principles(objective: str) -> list[str]:
+def _integration_principles(objective: str) -> list[str]:
     del objective
     return [
         "Adapt structure to the query type and evidence quality.",
@@ -1241,9 +1241,9 @@ def step_prompt(task: WorkflowTask, step: WorkflowStep) -> str:
             "- Carry forward revision directives as execution constraints for this step.\n"
         )
     if task.steps and step.step_id == task.steps[-1].step_id:
-        final_principles_block = "\n".join(f"- {item}" for item in _final_response_principles(task.objective))
+        final_principles_block = "\n".join(f"- {item}" for item in _integration_principles(task.objective))
         step_freshness_guardrail += (
-            "\nFinal response principles:\n"
+            "\nIntegration principles:\n"
             f"{final_principles_block}\n"
             "- Choose structure adaptively rather than following a fixed template.\n"
             "- Mention tools in narrative using real-world names (for example, PubMed or OpenAlex), not internal tool identifiers.\n"

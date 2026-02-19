@@ -11,4 +11,3 @@ venv/
 # Workflow runtime state
 state/
 reports/
-acceptance/results/

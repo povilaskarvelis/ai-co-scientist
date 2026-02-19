@@ -1,7 +1,5 @@
 """
 Planning and revision logic extracted from workflow.py.
-
-This module is intentionally behavior-compatible with legacy workflow exports.
 """
 from __future__ import annotations
 
@@ -29,10 +27,9 @@ CAPABILITY_PATTERNS: list[tuple[str, str]] = []
 def build_success_criteria(objective: str) -> list[str]:
     del objective
     return [
-        "Plan contains executable steps aligned to the request and available evidence pathways.",
-        "Each major claim is tied to at least one source or tool output.",
-        "At least one uncertainty or limitation is stated explicitly.",
-        "Findings summarize key signals, limitations, and open questions.",
+        "Steps align to the objective and evidence path.",
+        "Major claims are tied to sources or tool output.",
+        "Uncertainty and limits are explicit.",
     ]
 
 
@@ -43,46 +40,32 @@ def _infer_capability_needs(objective: str) -> list[str]:
 def _build_scope_step() -> WorkflowStep:
     return WorkflowStep(
         step_id="step_1",
-        title="Scope and execution framing",
+        title="Scope",
         instruction=(
-            "Extract concrete entities, constraints, and success criteria from the request. "
-            "Define only the structure needed to guide effective evidence gathering."
+            "Set scope, constraints, and evidence strategy. "
+            "Name source databases inline in each step."
         ),
         rationale="Explicit scoping reduces retrieval drift and improves traceable synthesis quality.",
     )
 
 
-FINAL_REPORT_PRINCIPLES: tuple[str, ...] = (
-    "Adapt structure to the query type and evidence quality.",
-    "Lead with a concise and direct answer first, and then elaborate on the rationale and methodology in separate sections.",
-    "Methodology should include a provenance summary detailing the search strategy and tools utilized to reach the conclusion.",
-    "Literature supporting the answer should be cited and listed as full references at the end, while tools should be mentioned in the text using real-world names.",
-    "Use only the sections, bullets, or tables that improve clarity for the specific query.",
-    "Ground major claims in executed evidence and cite source IDs or references where possible.",
-)
-
-
-def _build_final_stage_done_criteria() -> list[str]:
+def _build_integration_done_criteria() -> list[str]:
     return [
-        "response directly addresses the user objective",
-        "major claims are grounded with evidence references",
-        "uncertainty and key limitations are explicit",
-        "structure choices improve clarity for the specific objective",
+        "evidence from completed steps is integrated coherently",
+        "key uncertainty and limitations are explicit",
+        "major claims include citations where available",
     ]
 
 
 def _build_final_stage() -> WorkflowStep:
-    final_instruction = (
-        "Produce a concise final response guided by these principles: "
-        + " ".join(FINAL_REPORT_PRINCIPLES)
-    )
-
     return WorkflowStep(
         step_id="",
-        title="Final synthesis",
-        instruction=final_instruction,
-        rationale="Convert multi-stage evidence into an auditable output.",
-        done_criteria=_build_final_stage_done_criteria(),
+        title="Integration",
+        instruction=(
+            "Integrate evidence, resolve contradictions, and state key uncertainty with citations."
+        ),
+        rationale="Close the investigation loop with an auditable synthesis.",
+        done_criteria=_build_integration_done_criteria(),
     )
 
 
@@ -134,6 +117,61 @@ def _split_objective_subgoals(objective: str) -> list[str]:
     return unique[:6]
 
 
+_REPORTING_NODE_TERMS: tuple[str, ...] = (
+    "final answer",
+    "final response",
+    "final report",
+    "writeup",
+    "write-up",
+    "synthesis",
+    "synthesise",
+    "synthesize",
+    "format response",
+)
+
+_EVIDENCE_NODE_TERMS: tuple[str, ...] = (
+    "search",
+    "retrieve",
+    "collect",
+    "query",
+    "screen",
+    "extract",
+    "validate",
+    "compare",
+    "evaluate",
+    "analyze",
+    "evidence",
+    "literature",
+    "database",
+    "source",
+)
+
+
+def _is_synthesis_only_node(title: str, objective: str) -> bool:
+    text = f"{title} {objective}".strip().lower()
+    if not text:
+        return False
+    if not any(term in text for term in _REPORTING_NODE_TERMS):
+        return False
+    return not any(term in text for term in _EVIDENCE_NODE_TERMS)
+
+
+def _condense_objective_text(text: str, *, max_chars: int = 180, max_words: int | None = None) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not value:
+        return ""
+    value = re.sub(r"^(?:for this step|in this step|next|then)\s*,?\s*", "", value, flags=re.IGNORECASE)
+    first_sentence = re.split(r"(?<=[.!?])\s+|;\s+", value, maxsplit=1)[0].strip()
+    value = first_sentence or value
+    if isinstance(max_words, int) and max_words > 0:
+        words = value.split()
+        if len(words) > max_words:
+            value = f"{' '.join(words[:max_words]).rstrip(' ,;:')}..."
+    if len(value) <= max_chars:
+        return value
+    return f"{value[: max_chars - 3].rstrip(' ,;:')}..."
+
+
 def build_dynamic_plan_graph(
     objective: str,
     *,
@@ -147,6 +185,9 @@ def build_dynamic_plan_graph(
         goal_texts = [objective.strip() or "Investigate evidence relevant to the objective."]
 
     for idx, clause in enumerate(goal_texts, start=1):
+        clause = _condense_objective_text(clause, max_words=18)
+        if not clause:
+            continue
         clause_caps = sorted(set(_infer_capability_needs(clause)))
         subgoal_id = f"sg_dynamic_{idx}"
         deps = [f"sg_dynamic_{idx - 1}"] if idx > 1 else []
@@ -174,6 +215,98 @@ def _infer_phase_for_node_text(text: str) -> str:
     return "evidence_discovery"
 
 
+def _normalize_planned_sources(raw_value) -> list[str]:
+    if isinstance(raw_value, str):
+        raw_items = [item.strip() for item in re.split(r"[,\n;|]+", raw_value) if item.strip()]
+    elif isinstance(raw_value, list):
+        raw_items = [str(item).strip() for item in raw_value if str(item).strip()]
+    else:
+        raw_items = []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        value = re.sub(r"\s+", " ", item).strip(" .")
+        if not value:
+            continue
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(value)
+        if len(cleaned) >= 8:
+            break
+    return cleaned
+
+
+def _real_world_source_for_tool(tool_name: str) -> str | None:
+    tool = str(tool_name or "").strip().lower()
+    if not tool:
+        return None
+    if "openalex" in tool or tool == "rank_researchers_by_activity":
+        return "OpenAlex"
+    if "pubmed" in tool:
+        return "PubMed"
+    if "chembl" in tool:
+        return "ChEMBL"
+    if "gwas" in tool:
+        return "GWAS Catalog"
+    if "clinvar" in tool:
+        return "ClinVar"
+    if "reactome" in tool:
+        return "Reactome"
+    if "string" in tool:
+        return "STRING"
+    if "target" in tool or "druggability" in tool or "safety" in tool or "expression" in tool:
+        return "Open Targets"
+    if "clinical" in tool:
+        return "ClinicalTrials.gov"
+    if "local" in tool:
+        return "Local datasets"
+    return None
+
+
+def _real_world_sources_for_tools(tool_names: list[str]) -> list[str]:
+    sources: list[str] = []
+    seen: set[str] = set()
+    for name in tool_names:
+        source = _real_world_source_for_tool(name)
+        if not source:
+            continue
+        key = source.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        sources.append(source)
+    return sources
+
+
+def _join_natural(values: list[str]) -> str:
+    items = [str(item).strip() for item in values if str(item).strip()]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return f"{', '.join(items[:-1])}, and {items[-1]}"
+
+
+def _instruction_with_sources(instruction: str, sources: list[str]) -> str:
+    base = str(instruction or "").strip()
+    if not base:
+        return base
+    if not sources:
+        return base
+    if base.lower().startswith("using "):
+        return base
+    lead = _join_natural(sources)
+    if not lead:
+        return base
+    if len(base) > 1 and base[0].isupper() and base[1].islower():
+        base = base[0].lower() + base[1:]
+    return f"Using {lead}, {base}"
+
+
 def normalize_plan_graph(
     plan_graph: list[dict] | None,
     *,
@@ -193,8 +326,13 @@ def normalize_plan_graph(
             candidate_id = f"{candidate_id}_{idx}"
         seen_ids.add(candidate_id)
 
-        title = str(raw.get("title", "")).strip()
-        node_objective = str(raw.get("objective") or raw.get("instruction") or title).strip()
+        title = _condense_objective_text(str(raw.get("title", "")).strip(), max_chars=72, max_words=8).rstrip(".")
+        node_objective = _condense_objective_text(
+            str(raw.get("objective") or raw.get("instruction") or title).strip(),
+            max_words=18,
+        )
+        if _is_synthesis_only_node(title, node_objective):
+            continue
         if len(node_objective) < 8:
             continue
 
@@ -232,9 +370,10 @@ def normalize_plan_graph(
         max_calls = min(max(max_calls, 1), 8)
 
         raw_phase = str(raw.get("phase", "")).strip().lower()
-        phase = raw_phase if raw_phase in {"evidence_discovery", "researcher_scouting", "synthesis_reporting"} else ""
+        phase = raw_phase if raw_phase in {"evidence_discovery", "synthesis_reporting"} else ""
         if not phase:
             phase = _infer_phase_for_node_text(f"{title} {node_objective}")
+        planned_sources = _normalize_planned_sources(raw.get("planned_sources", []))
 
         normalized.append(
             {
@@ -242,6 +381,7 @@ def normalize_plan_graph(
                 "title": title,
                 "objective": node_objective,
                 "dependencies": deps,
+                "planned_sources": planned_sources[:6],
                 "evidence_requirements": sorted(node_caps)[:6],
                 "done_criteria": done_criteria[:6],
                 "max_calls": max_calls,
@@ -292,6 +432,10 @@ def build_dynamic_plan_steps(
         )
         node_title = str(node.get("title", "")).strip()
         instruction = str(node.get("objective", "")).strip() or "Collect the required evidence."
+        planned_sources = _normalize_planned_sources(node.get("planned_sources", []))
+        if not planned_sources:
+            planned_sources = _real_world_sources_for_tools(recommended_tools + fallback_tools)
+        instruction = _instruction_with_sources(instruction, planned_sources)
         step = WorkflowStep(
             step_id="",
             title=node_title or f"Dynamic subgoal: {subgoal_id}",
@@ -307,11 +451,14 @@ def build_dynamic_plan_steps(
         step.done_criteria = [str(item).strip() for item in node.get("done_criteria", []) if str(item).strip()]
         if str(node.get("phase", "")).strip():
             step.observations = list(step.observations) + [f"phase={str(node.get('phase')).strip()}"]
+        if planned_sources:
+            step.observations = list(step.observations) + [f"planned_sources={', '.join(planned_sources)}"]
         steps.append(step)
 
     final_stage = _build_final_stage()
-    final_stage.subgoal_id = "sg_final_report"
+    final_stage.subgoal_id = "sg_integration"
     final_stage.dependencies = [step.subgoal_id for step in steps if step.subgoal_id]
+    final_stage.observations = list(final_stage.observations) + ["phase=synthesis_reporting"]
     steps.append(final_stage)
     for idx, step in enumerate(steps, start=1):
         step.step_id = f"step_{idx}"
@@ -332,11 +479,9 @@ def build_plan_steps(
 def create_task(
     objective: str,
     *,
-    use_dynamic_planner: bool = True,
     tool_registry_summary: list[dict] | None = None,
     plan_graph_override: list[dict] | None = None,
 ) -> WorkflowTask:
-    del use_dynamic_planner
     task_id = f"task_{uuid.uuid4().hex[:8]}"
     task = WorkflowTask(
         task_id=task_id,
@@ -459,7 +604,7 @@ def _apply_revision_plan_overrides(steps: list[WorkflowStep], objective: str) ->
             )
         else:
             step.instruction += (
-                " Ensure the final synthesis explicitly reflects the latest revision directives and unresolved items."
+                " Ensure this integration step explicitly reflects the latest revision directives and unresolved items."
             )
     return steps
 
@@ -599,11 +744,9 @@ def replan_remaining_steps(
     revised_objective: str,
     revision_intent: RevisionIntent | None,
     gate_reason: str,
-    use_dynamic_planner: bool = False,
     tool_registry_summary: list[dict] | None = None,
     plan_graph_override: list[dict] | None = None,
 ) -> tuple[PlanVersion, PlanDelta]:
-    del use_dynamic_planner
     base_from_step_index = max(0, task.current_step_index + 1)
     existing_remaining = [clone_step(step) for step in task.steps[base_from_step_index:]]
     previous = active_plan_version(task)
