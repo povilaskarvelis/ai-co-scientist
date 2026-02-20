@@ -696,7 +696,7 @@ def create_mcp_toolset(tool_filter: list[str] | None = None) -> McpToolset | Non
     )
 
 
-def create_native_workflow_agent(
+def create_workflow_agent(
     *,
     tool_filter: list[str] | None = None,
     model: str | None = None,
@@ -806,5 +806,5 @@ def create_native_workflow_agent(
 
 __all__ = [
     "create_mcp_toolset",
-    "create_native_workflow_agent",
+    "create_workflow_agent",
 ]

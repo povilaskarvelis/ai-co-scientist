@@ -207,7 +207,6 @@ cd adk-agent
 
 Notes:
 - External network tests were removed from the default suite to keep CI/dev runs deterministic and fast.
-- `test_workflow.py` currently references `create_workflow_agent`, while the workflow export is `create_native_workflow_agent`.
 - Generated artifacts in `adk-agent/reports/` are runtime outputs and can be safely deleted.
 
 ## Data Sources

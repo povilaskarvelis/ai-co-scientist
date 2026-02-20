@@ -24,7 +24,7 @@ from google.adk import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai.types import Content, FunctionResponse, Part
 
-from co_scientist.workflow import create_native_workflow_agent
+from co_scientist.workflow import create_workflow_agent
 
 
 load_dotenv()
@@ -311,7 +311,7 @@ async def run_native_interactive_async() -> None:
         print("3. Authenticate with `gcloud auth application-default login`")
         return
 
-    workflow_agent, mcp_tools = create_native_workflow_agent()
+    workflow_agent, mcp_tools = create_workflow_agent()
     session_service = InMemorySessionService()
     runner = Runner(
         agent=workflow_agent,
@@ -380,7 +380,7 @@ async def run_single_query_native_with_confirmation_async(
         raise RuntimeError(error_message)
 
     session_service = InMemorySessionService()
-    workflow_agent, mcp_tools = create_native_workflow_agent()
+    workflow_agent, mcp_tools = create_workflow_agent()
     runner = Runner(
         agent=workflow_agent,
         app_name="co_scientist_native_single_query",

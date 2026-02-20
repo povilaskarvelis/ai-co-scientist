@@ -8,13 +8,13 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-from .workflow import create_native_workflow_agent
+from .workflow import create_workflow_agent
 
 
 # ADK evaluation looks for either `agent` or `root_agent`.
-root_agent, _native_mcp_toolset = create_native_workflow_agent()
+root_agent, _native_mcp_toolset = create_workflow_agent()
 
 # Alias for ADK evaluation framework
 agent = root_agent
 
-__all__ = ["agent", "root_agent", "create_native_workflow_agent"]
+__all__ = ["agent", "root_agent", "create_workflow_agent"]
