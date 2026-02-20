@@ -6,8 +6,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from typing import Protocol
 
-from .tool_registry import ToolRegistry, infer_capabilities_from_text
+from .capability_inference import infer_capabilities_from_text
 from .event_orchestrator import (
     EVENT_EVIDENCE_BATCH_READY,
     append_event,
@@ -124,6 +125,21 @@ TYPED_PAYLOAD_REQUIREMENTS = {
         ],
     },
 }
+
+
+class ToolCatalog(Protocol):
+    def names(self) -> list[str]: ...
+
+    def rank_tools(
+        self,
+        *,
+        query: str,
+        capability_hints: set[str] | None = None,
+        candidates: list[str] | None = None,
+        k: int = 8,
+    ) -> list[str]: ...
+
+    def compact_descriptions(self, tool_names: list[str], *, max_chars: int = 180) -> list[str]: ...
 
 
 def _payload_requirement_for_tool(tool_name: str) -> dict | None:
@@ -382,7 +398,7 @@ def validate_mcp_response_contract(response_payload) -> dict:
     }
 
 
-def build_step_allowed_tools(task, step_idx: int, tool_registry: ToolRegistry | None = None) -> list[str]:
+def build_step_allowed_tools(task, step_idx: int, tool_registry: ToolCatalog | None = None) -> list[str]:
     step = task.steps[step_idx]
     shortlist = sorted(set(step.recommended_tools + step.fallback_tools))
     hints = set(getattr(step, "evidence_requirements", []) or [])
@@ -424,7 +440,7 @@ def should_escalate_allowlist(step, trace_entries: list[dict], output: str) -> b
 
 
 def build_escalated_allowed_tools(
-    task, step_idx: int, tool_registry: ToolRegistry | None = None
+    task, step_idx: int, tool_registry: ToolCatalog | None = None
 ) -> list[str]:
     base = set(build_step_allowed_tools(task, step_idx, tool_registry=tool_registry))
     escalated = sorted(base)

@@ -7,7 +7,7 @@ import re
 import uuid
 
 from co_scientist.runtime.event_orchestrator import ensure_phase_state
-from co_scientist.runtime.tool_registry import infer_capabilities_from_text
+from co_scientist.runtime.capability_inference import infer_capabilities_from_text
 from co_scientist.domain.models import (
     PlanDelta,
     PlanVersion,
@@ -46,26 +46,6 @@ def _build_scope_step() -> WorkflowStep:
             "Name source databases inline in each step."
         ),
         rationale="Explicit scoping reduces retrieval drift and improves traceable synthesis quality.",
-    )
-
-
-def _build_integration_done_criteria() -> list[str]:
-    return [
-        "evidence from completed steps is integrated coherently",
-        "key uncertainty and limitations are explicit",
-        "major claims include citations where available",
-    ]
-
-
-def _build_final_stage() -> WorkflowStep:
-    return WorkflowStep(
-        step_id="",
-        title="Integration",
-        instruction=(
-            "Integrate evidence, resolve contradictions, and state key uncertainty with citations."
-        ),
-        rationale="Close the investigation loop with an auditable synthesis.",
-        done_criteria=_build_integration_done_criteria(),
     )
 
 
@@ -123,9 +103,14 @@ _REPORTING_NODE_TERMS: tuple[str, ...] = (
     "final report",
     "writeup",
     "write-up",
+    "integration",
+    "integrate",
     "synthesis",
     "synthesise",
     "synthesize",
+    "resolve contradictions",
+    "state uncertainty",
+    "summarize findings",
     "format response",
 )
 
@@ -140,10 +125,8 @@ _EVIDENCE_NODE_TERMS: tuple[str, ...] = (
     "compare",
     "evaluate",
     "analyze",
-    "evidence",
     "literature",
     "database",
-    "source",
 )
 
 
@@ -455,11 +438,6 @@ def build_dynamic_plan_steps(
             step.observations = list(step.observations) + [f"planned_sources={', '.join(planned_sources)}"]
         steps.append(step)
 
-    final_stage = _build_final_stage()
-    final_stage.subgoal_id = "sg_integration"
-    final_stage.dependencies = [step.subgoal_id for step in steps if step.subgoal_id]
-    final_stage.observations = list(final_stage.observations) + ["phase=synthesis_reporting"]
-    steps.append(final_stage)
     for idx, step in enumerate(steps, start=1):
         step.step_id = f"step_{idx}"
     return _apply_revision_plan_overrides(steps, objective), plan_graph
@@ -473,7 +451,7 @@ def build_plan_steps(
     )
     if dynamic_steps:
         return dynamic_steps
-    return [_build_scope_step(), _build_final_stage()]
+    return [_build_scope_step()]
 
 
 def create_task(
@@ -604,7 +582,7 @@ def _apply_revision_plan_overrides(steps: list[WorkflowStep], objective: str) ->
             )
         else:
             step.instruction += (
-                " Ensure this integration step explicitly reflects the latest revision directives and unresolved items."
+                " Ensure this step explicitly reflects the latest revision directives and unresolved items."
             )
     return steps
 

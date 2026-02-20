@@ -30,7 +30,7 @@ from .quality_gates import (
     render_quality_gate_message,
     should_open_checkpoint,
 )
-from .tool_registry import ToolDescriptor, ToolRegistry, infer_capabilities_from_text
+from .capability_inference import infer_capabilities_from_text
 from .event_orchestrator import (
     EVENT_CHECKPOINT_APPROVED,
     EVENT_CHECKPOINT_OPENED,
@@ -77,8 +77,6 @@ __all__ = [
     "print_checkpoint_plan",
     "render_quality_gate_message",
     "should_open_checkpoint",
-    "ToolDescriptor",
-    "ToolRegistry",
     "infer_capabilities_from_text",
     "EVENT_CHECKPOINT_APPROVED",
     "EVENT_CHECKPOINT_OPENED",

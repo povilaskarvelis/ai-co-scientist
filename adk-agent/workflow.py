@@ -1250,12 +1250,12 @@ def step_prompt(task: WorkflowTask, step: WorkflowStep) -> str:
             "- Keep the narrative concise and avoid repeating full evidence lists already stated in prior steps.\n"
         )
     role_directive = "executor"
-    if step.step_id == "step_1" or step.subgoal_id == "sg_scope":
+    if task.steps and step.step_id == task.steps[-1].step_id:
+        role_directive = "report_synthesizer"
+    elif step.step_id == "step_1" or step.subgoal_id == "sg_scope":
         role_directive = "planner"
     elif step.subgoal_id == "sg_critique":
         role_directive = "critic"
-    elif task.steps and step.step_id == task.steps[-1].step_id:
-        role_directive = "report_synthesizer"
 
     tool_shortlist_context = ""
     if step.allowed_tools:
