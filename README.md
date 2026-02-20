@@ -38,33 +38,33 @@ The flow below highlights where LLM reasoning is required versus deterministic r
 
 ```mermaid
 flowchart TD
-    A[User submits a research question] --> B{{Model checks if the question is ambiguous or malformed (clarifier)}}
-    B --> C1{Is clarification needed before running tools?}
-    C1 -->|Yes| C2[Pause and ask the user a short clarification question (HITL clarification gate)]
-    C2 --> C3[Attach the user's clarification to the objective (objective merge)]
+    A["User submits a research question<br/>files: adk-agent/agent.py, adk-agent/ui_server.py"] --> B{{"Clarifier checks for ambiguity or malformed query<br/>files: adk-agent/agent.py (CLARIFIER_INSTRUCTION), adk-agent/co_scientist/planning/intent.py"}}
+    B --> C1{"Clarification needed before running tools?<br/>files: adk-agent/agent.py, adk-agent/co_scientist/planning/intent.py"}
+    C1 -->|Yes| C2["Pause and ask a short clarification question<br/>files: adk-agent/agent.py, adk-agent/ui_server.py"]
+    C2 --> C3["Attach user clarification to objective<br/>files: adk-agent/agent.py, adk-agent/co_scientist/planning/intent.py"]
     C1 -->|No| C
     C3 --> C
-    C{{Hybrid router sets request type, intent tags, and normalized objective (heuristics + LLM)}}
-    C --> D{{Planner drafts a query-specific subgoal graph from objective + available tools (dynamic planner)}}
-    D --> E[Convert subgoals into executable workflow steps and save active plan metadata (WorkflowTask + PlanVersion)]
-    E --> E1[Run the first planning/scope step (step_1 decomposition)]
-    E1 --> F[Open the initial execution checkpoint before tool-heavy steps (pre_evidence_execution)]
-    F --> G{User action at checkpoint}
-    G -->|Start/Continue| H[Run the next planned step and persist task state]
-    G -->|Revise once| I{{Parse user feedback into structured revision intent, then replan remaining steps (replan)}}
+    C{{"Route request + normalize objective<br/>files: adk-agent/co_scientist/planning/intent.py, adk-agent/co_scientist/planning/workflow_planning.py"}}
+    C --> D{{"Planner drafts query-specific subgoal graph<br/>files: adk-agent/agent.py (PLANNER_PROMPT), adk-agent/co_scientist/planning/workflow_planning.py"}}
+    D --> E["Convert subgoals to executable steps + save plan metadata<br/>files: adk-agent/co_scientist/planning/workflow_planning.py, adk-agent/workflow.py, adk-agent/task_state_store.py"]
+    E --> E1["Run first scope step (step_1)<br/>files: adk-agent/co_scientist/runtime/execution.py, adk-agent/workflow.py (step_prompt role=planner)"]
+    E1 --> F["Open initial execution checkpoint (pre_evidence_execution)<br/>files: adk-agent/agent.py, adk-agent/co_scientist/runtime/quality_gates.py, adk-agent/co_scientist/runtime/event_orchestrator.py"]
+    F --> G{"User action at checkpoint<br/>files: adk-agent/agent.py, adk-agent/ui_server.py"}
+    G -->|Start or Continue| H["Run next planned step + persist state<br/>files: adk-agent/agent.py, adk-agent/co_scientist/runtime/execution.py, adk-agent/task_state_store.py"]
+    G -->|Revise once| I{{"Parse feedback intent + replan remaining steps<br/>files: adk-agent/agent.py (REVISION_FEEDBACK_PARSER_INSTRUCTION), adk-agent/co_scientist/planning/revision.py, adk-agent/co_scientist/planning/workflow_planning.py"}}
     I --> F
-    G -->|Stop (CLI)| Z[Mark task as blocked/paused until resumed]
+    G -->|Stop CLI| Z["Mark task blocked/paused until resumed<br/>files: adk-agent/agent.py, adk-agent/task_state_store.py"]
 
-    H --> J{{Model executes the current step prompt and chooses from allowed tools (executor)}}
-    J --> K[Run MCP tools, capture tool traces, and validate tool response contracts]
-    K --> L[Recompute quality gates (coverage, citations, unresolved gaps, confidence)]
-    L --> M{Open another checkpoint now? (phase boundary or pre-evidence gate)}
+    H --> J{{"Model executes current step prompt + chooses allowed tools<br/>files: adk-agent/workflow.py (step_prompt), adk-agent/agent.py (EXECUTOR_PROMPT + AGENT_INSTRUCTION), adk-agent/co_scientist/__init__.py (ADK AGENT_INSTRUCTION)"}}
+    J --> K["Run MCP tools + capture traces + validate response contracts<br/>files: adk-agent/co_scientist/runtime/execution.py, research-mcp/server.js"]
+    K --> L["Recompute quality gates (coverage, citations, gaps, confidence)<br/>files: adk-agent/co_scientist/runtime/quality_gates.py"]
+    L --> M{"Open another checkpoint now?<br/>files: adk-agent/co_scientist/runtime/quality_gates.py, adk-agent/co_scientist/runtime/event_orchestrator.py"}
     M -->|Yes| F
-    M -->|No| N{Are there remaining steps?}
+    M -->|No| N{"Are there remaining steps?<br/>files: adk-agent/agent.py"}
     N -->|Yes| H
-    N -->|No| O{{Model writes the final recommendation/report step (synthesis)}}
-    O --> P[Persist final report markdown and make PDF export available (report artifacts)]
-    P --> Q[Render the same report content in UI and CLI]
+    N -->|No| O{{"Model writes final recommendation/report (synthesis)<br/>files: adk-agent/agent.py (REPORT_SYNTHESIZER_PROMPT), adk-agent/workflow.py"}}
+    O --> P["Persist final report markdown + expose PDF export<br/>files: adk-agent/co_scientist/presentation/cli_output.py, adk-agent/ui_server.py, adk-agent/report_pdf.py"]
+    P --> Q["Render same report in UI and CLI<br/>files: adk-agent/ui_server.py, adk-agent/agent.py, adk-agent/co_scientist/presentation/cli_output.py"]
 
     classDef llm fill:#eef2f7,stroke:#5f6b7a,stroke-width:1.5px,color:#1f2933;
     classDef guard fill:#f3f4f6,stroke:#6b7280,stroke-width:1.5px,color:#1f2933;
