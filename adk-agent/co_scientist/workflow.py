@@ -1,43 +1,52 @@
 """
 ADK-native orchestration graph for the Co-Scientist agent.
 
-This module defines a workflow-agent tree (Sequential + Loop + role LLM agents)
-so orchestration is handled by ADK instead of custom Python control loops.
+This workflow keeps planning internal to the model and does not expose
+or require human confirmation of execution plans.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
-import json
 import os
 from pathlib import Path
 import re
 from typing import Any
 
-from google.adk.agents.callback_context import CallbackContext
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 from google.genai import types
 from google.adk.tools import McpToolset, ToolContext, exit_loop
 from google.adk.tools.mcp_tool.mcp_toolset import StdioConnectionParams
 from mcp.client.stdio import StdioServerParameters
-from pydantic import BaseModel, Field
 
 
 MCP_SERVER_DIR = Path(__file__).resolve().parents[2] / "research-mcp"
 DEFAULT_MODEL = os.getenv("ADK_NATIVE_MODEL", "gemini-2.5-flash")
-DEFAULT_PLAN_MAX_ITERS = max(
-    1,
-    int(os.getenv("ADK_NATIVE_PLAN_MAX_ITERS", "1") or "1"),
-)
 DEFAULT_EVIDENCE_MAX_ITERS = max(
     1,
     int(os.getenv("ADK_NATIVE_EVIDENCE_MAX_ITERS", "3") or "3"),
 )
-REQUIRE_EXPLICIT_CONFIRMATION_DECISION = str(
-    os.getenv("ADK_NATIVE_REQUIRE_CONFIRMATION_DECISION", "1")
+HAS_BIGQUERY_RUNTIME_HINT = any(
+    str(os.getenv(name, "")).strip()
+    for name in ("BQ_PROJECT_ID", "BQ_DATASET_ALLOWLIST", "GOOGLE_CLOUD_PROJECT")
+)
+DEFAULT_PREFER_BIGQUERY = (
+    str(os.getenv("ADK_NATIVE_PREFER_BIGQUERY", "1")).strip().lower() not in {"0", "false", "no"}
+    and HAS_BIGQUERY_RUNTIME_HINT
+)
+REQUIRE_EXPLICIT_EVIDENCE_CHECKPOINT_DECISION = str(
+    os.getenv("ADK_NATIVE_REQUIRE_EVIDENCE_CHECKPOINT_DECISION", "1")
 ).strip().lower() not in {"0", "false", "no"}
-REQUEST_CONFIRMATION_FUNCTION_NAME = "adk_request_confirmation"
+BQ_PRIORITY_TOOLS = [
+    "list_bigquery_tables",
+    "run_bigquery_select_query",
+]
 
 KNOWN_MCP_TOOLS = [
+    "list_bigquery_tables",
+    "run_bigquery_select_query",
+    "benchmark_dataset_overview",
+    "sample_pubmedqa_examples",
+    "sample_bioasq_examples",
+    "check_gpqa_access",
     "search_diseases",
     "expand_disease_context",
     "search_targets",
@@ -74,90 +83,53 @@ KNOWN_MCP_TOOLS = [
 ]
 
 
-class PlanDraft(BaseModel):
-    objective: str = Field(description="Normalized research objective for execution.")
-    steps: list[str] = Field(
-        default_factory=list,
-        description="Ordered execution steps the workflow should follow.",
-    )
-    planned_tools: list[str] = Field(
-        default_factory=list,
-        description="Exact MCP tool names expected to be used in evidence execution.",
-    )
-    evidence_sources: list[str] = Field(
-        default_factory=list,
-        description="External source families expected in evidence collection.",
-    )
-    stop_conditions: list[str] = Field(
-        default_factory=list,
-        description="Concrete conditions for when evidence collection is sufficient.",
-    )
-
-
-CLARIFIER_INSTRUCTION = """
-You are a biomedical scope clarifier.
-Goal: identify ambiguity, malformed identifiers, or missing constraints before planning.
-
-Output 3 short bullets:
-- normalized objective
-- ambiguity flags (or "none")
-- critical constraints (or "none")
-
-Keep this concise and operational. Do not call tools.
-"""
-
-
 PLANNER_INSTRUCTION_TEMPLATE = """
-You are the workflow planner for biomedical investigation.
-Use the clarifier summary: {clarifier_summary}
-Optional revision feedback from the human reviewer: {plan_revision_feedback?}
+You are the internal planner for biomedical investigation.
 
 Available MCP tools:
 __TOOL_CATALOG__
 
-Return ONLY JSON matching the output schema.
-
 Rules:
-- Build a practical, objective-specific plan with concrete steps.
-- `planned_tools` MUST use exact names from the available tool list when possible.
-- Include only tools needed for the proposed steps.
-- If revision feedback is present, incorporate it explicitly into updated steps.
-- Keep each list concise (typically <= 8 items).
+- Build a concrete execution plan before any evidence collection begins.
+- Break the objective into ordered, atomic subtasks.
+- Each subtask must have:
+  - a short goal,
+  - the intended evidence source/tool family,
+  - a clear completion condition.
+- Prioritize high-signal subtasks that reduce uncertainty first.
+__BQ_POLICY__
+- Do not call tools.
+
+Output format:
+Objective: <one sentence>
+Subtasks:
+1) <subtask>
+2) <subtask>
+3) <subtask>
+Stop criteria:
+- <criterion>
+- <criterion>
 """
 
 
-PLAN_REVIEWER_INSTRUCTION = """
-You are the plan approval gatekeeper.
+EVIDENCE_EXECUTOR_INSTRUCTION_TEMPLATE = """
+You execute biomedical evidence collection and validation.
+Follow the planner's subtask breakdown from earlier in this turn before taking actions.
 
-Inputs:
-- Clarifier summary: {clarifier_summary}
-- Current plan JSON: {plan_draft_json}
-
-Actions:
-1) Call `request_plan_confirmation` exactly once with `plan_draft_json`.
-2) Read the tool result status and return it.
-
-Output:
-- Return a short status line only (PLAN_APPROVED, PLAN_REVISION_REQUESTED, or PLAN_AWAITING_CONFIRMATION).
-"""
-
-
-EVIDENCE_EXECUTOR_INSTRUCTION = """
-You execute evidence collection and validation.
-Use this approved plan context: {plan_summary?}
-Approved tools list: {approved_tools?}
+Available MCP tools:
+__TOOL_CATALOG__
 
 Rules:
-- Use MCP tools only when directly required by the approved plan.
+- Execute one subtask at a time and reassess after each subtask.
+- Continue to the next subtask only after summarizing what was learned from the current one.
 - Prioritize high-signal evidence before broad expansion.
+- Use MCP tools only when they directly improve evidence quality.
+__BQ_POLICY__
 - Surface contradictions and unresolved gaps explicitly.
 - Include source identifiers when available (PMID, DOI, NCT, OpenAlex IDs).
 
 Return only:
-1) evidence gathered (bullet list),
-2) unresolved gaps (bullet list),
-3) what to probe next if gaps remain (bullet list).
-"""
+Short updates on your progress and evidence gathered. """
 
 
 EVIDENCE_CRITIC_INSTRUCTION = """
@@ -181,10 +153,7 @@ Be strict about citation-backed claims and unresolved contradictions.
 
 SYNTHESIZER_INSTRUCTION = """
 You are the final biomedical report synthesizer.
-Use these internal summaries:
-- Clarifier: {clarifier_summary}
-- Planner: {plan_summary?}
-- Critic: {evidence_critic_decision}
+Use the conversation evidence gathered in prior workflow steps.
 
 Write a concise final answer:
 1) Direct answer up front.
@@ -193,6 +162,26 @@ Write a concise final answer:
 4) Practical next actions.
 
 Do not invent unsupported claims.
+"""
+
+
+EVIDENCE_HITL_GATE_INSTRUCTION = """
+You are the evidence continuation checkpoint in the refinement loop.
+
+Rules:
+- Inspect the latest critic output.
+- If the critic indicates `NEEDS_MORE_EVIDENCE`, call `request_evidence_continuation` exactly once
+  with concrete missing evidence and next actions.
+- If the critic does not indicate `NEEDS_MORE_EVIDENCE`, do not call tools and return `CHECKPOINT_NOT_REQUIRED`.
+- After the tool result:
+  - if status is `approved`, return `CHECKPOINT_APPROVED`.
+  - if status is `declined`, return `CHECKPOINT_DECLINED`.
+  - if status is `pending_human_confirmation`, return `CHECKPOINT_AWAITING_CONFIRMATION`.
+
+When calling `request_evidence_continuation`, provide:
+- `missing_evidence`: short list of specific missing evidence items.
+- `proposed_next_actions`: short list of concrete actions to run next.
+- `rationale`: one concise sentence.
 """
 
 
@@ -213,114 +202,6 @@ def _dedupe_str_list(values: list[Any], *, limit: int = 20) -> list[str]:
     return cleaned
 
 
-def _parse_plan_draft_json(
-    plan_draft_json: Any,
-    *,
-    allowed_tool_names: set[str],
-) -> dict[str, Any]:
-    parsed: dict[str, Any] = {}
-    if isinstance(plan_draft_json, dict):
-        parsed = plan_draft_json
-    elif isinstance(plan_draft_json, BaseModel):
-        payload = plan_draft_json.model_dump(mode="json")
-        if isinstance(payload, dict):
-            parsed = payload
-    else:
-        raw = str(plan_draft_json or "").strip()
-        if raw:
-            try:
-                payload = json.loads(raw)
-                if isinstance(payload, dict):
-                    parsed = payload
-            except json.JSONDecodeError:
-                parsed = {}
-
-    objective = str(parsed.get("objective", "")).strip() or "Investigate the user objective with traceable evidence."
-    steps = _dedupe_str_list(parsed.get("steps", []) if isinstance(parsed.get("steps"), list) else [], limit=10)
-    planned_tools = _dedupe_str_list(
-        parsed.get("planned_tools", []) if isinstance(parsed.get("planned_tools"), list) else [],
-        limit=16,
-    )
-    if allowed_tool_names:
-        planned_tools = [tool for tool in planned_tools if tool in allowed_tool_names]
-        allowed_order = [name for name in KNOWN_MCP_TOOLS if name in allowed_tool_names]
-        allowed_order.extend(sorted(name for name in allowed_tool_names if name not in set(allowed_order)))
-        preferred_fallback = [
-            "search_pubmed",
-            "search_pubmed_advanced",
-            "search_clinical_trials",
-            "search_disease_targets",
-            "search_targets",
-            "search_diseases",
-        ]
-        min_tools = min(2, len(allowed_tool_names))
-        for candidate in preferred_fallback + allowed_order:
-            if len(planned_tools) >= min_tools:
-                break
-            if candidate in allowed_tool_names and candidate not in planned_tools:
-                planned_tools.append(candidate)
-    evidence_sources = _dedupe_str_list(
-        parsed.get("evidence_sources", []) if isinstance(parsed.get("evidence_sources"), list) else [],
-        limit=10,
-    )
-    stop_conditions = _dedupe_str_list(
-        parsed.get("stop_conditions", []) if isinstance(parsed.get("stop_conditions"), list) else [],
-        limit=10,
-    )
-
-    if not steps:
-        steps = [
-            "Resolve objective scope and evidence constraints.",
-            "Collect high-signal evidence with approved MCP tools.",
-            "Synthesize findings with explicit uncertainty and next actions.",
-        ]
-    if not stop_conditions:
-        stop_conditions = [
-            "Core claims are grounded with citations or identifiers.",
-            "Major contradictions are addressed or clearly called out.",
-        ]
-    return {
-        "objective": objective,
-        "steps": steps,
-        "planned_tools": planned_tools,
-        "evidence_sources": evidence_sources,
-        "stop_conditions": stop_conditions,
-    }
-
-
-def _render_plan_summary(plan: dict[str, Any]) -> str:
-    lines = [f"Objective: {plan.get('objective', '').strip()}"]
-    steps = [str(item).strip() for item in plan.get("steps", []) if str(item).strip()]
-    if steps:
-        lines.append("Steps:")
-        lines.extend([f"- {item}" for item in steps[:10]])
-    tools = [str(item).strip() for item in plan.get("planned_tools", []) if str(item).strip()]
-    if tools:
-        lines.append("Planned tools:")
-        lines.extend([f"- {name}" for name in tools[:16]])
-    sources = [str(item).strip() for item in plan.get("evidence_sources", []) if str(item).strip()]
-    if sources:
-        lines.append("Evidence sources:")
-        lines.extend([f"- {item}" for item in sources[:10]])
-    stops = [str(item).strip() for item in plan.get("stop_conditions", []) if str(item).strip()]
-    if stops:
-        lines.append("Stop conditions:")
-        lines.extend([f"- {item}" for item in stops[:10]])
-    return "\n".join(lines).strip()
-
-
-def _record_plan_review(tool_context: ToolContext, entry: dict[str, Any]) -> None:
-    history = tool_context.state.get("plan_review_history", [])
-    if not isinstance(history, list):
-        history = []
-    normalized_entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        **entry,
-    }
-    history.append(normalized_entry)
-    tool_context.state["plan_review_history"] = history[-20:]
-
-
 def _extract_user_turn_text(tool_context: ToolContext) -> str:
     user_content = getattr(tool_context, "user_content", None)
     parts = getattr(user_content, "parts", None) if user_content is not None else None
@@ -334,346 +215,160 @@ def _extract_user_turn_text(tool_context: ToolContext) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _parse_manual_plan_decision(tool_context: ToolContext) -> tuple[str, str]:
+def _parse_manual_evidence_checkpoint_decision(tool_context: ToolContext) -> tuple[str, str]:
     turn_text = _extract_user_turn_text(tool_context)
     lowered = turn_text.lower().strip()
-    if lowered in {"approve", "approved", "yes", "y", "/approve"}:
+    if lowered in {"approve", "approved", "yes", "y", "/approve", "continue", "/continue"}:
         return "approve", ""
-    if lowered.startswith("revise:"):
+    if lowered.startswith("stop:"):
         feedback = turn_text.split(":", 1)[1].strip()
-        if feedback:
-            return "revise", feedback
-    if lowered in {"revise", "reject", "rejected", "no", "n", "/revise"}:
-        return "revise", ""
+        return "stop", feedback
+    if lowered.startswith("decline:"):
+        feedback = turn_text.split(":", 1)[1].strip()
+        return "stop", feedback
+    if lowered in {"stop", "decline", "declined", "no", "n", "/stop", "/decline"}:
+        return "stop", ""
     return "", ""
 
 
-def _prepare_plan_gate_for_new_query(callback_context: CallbackContext):
-    content = callback_context.user_content
-    parts = getattr(content, "parts", None) if content is not None else None
-    if not parts:
-        return None
-
-    is_confirmation_resume = False
-    text_chunks: list[str] = []
-    for part in parts:
-        function_response = getattr(part, "function_response", None)
-        if function_response is not None:
-            name = str(getattr(function_response, "name", "")).strip()
-            if name == REQUEST_CONFIRMATION_FUNCTION_NAME:
-                is_confirmation_resume = True
-        text = str(getattr(part, "text", "") or "").strip()
-        if text:
-            text_chunks.append(text)
-
-    turn_text = re.sub(r"\s+", " ", " ".join(text_chunks)).strip()
-    lowered = turn_text.lower()
-    is_manual_decision = (
-        lowered in {"approve", "approved", "yes", "y", "/approve", "revise", "reject", "rejected", "no", "n", "/revise"}
-        or lowered.startswith("revise:")
-    )
-    if is_confirmation_resume or is_manual_decision:
-        return None
-
-    invocation_id = str(getattr(callback_context, "invocation_id", "") or "").strip()
-    last_reset_invocation = str(callback_context.state.get("plan_gate_last_reset_invocation", "") or "").strip()
-    if invocation_id and invocation_id == last_reset_invocation:
-        return None
-
-    callback_context.state["plan_approval_status"] = "pending_human_confirmation"
-    callback_context.state["approved_tools"] = []
-    callback_context.state["pending_plan_confirmation_payload"] = {}
-    callback_context.state["plan_summary"] = ""
-    callback_context.state["approved_plan_summary"] = ""
-    callback_context.state["plan_revision_feedback"] = ""
-    if invocation_id:
-        callback_context.state["plan_gate_last_reset_invocation"] = invocation_id
-    return None
-
-
-def _make_request_plan_confirmation_tool(*, allowed_tool_names: list[str]):
-    allowed_names = {name for name in _dedupe_str_list(allowed_tool_names, limit=120)}
-
-    def request_plan_confirmation(plan_draft_json: Any, tool_context: ToolContext) -> dict[str, Any]:
-        """Request human confirmation for the generated execution plan."""
-        plan = _parse_plan_draft_json(
-            plan_draft_json,
-            allowed_tool_names=allowed_names,
+def _build_evidence_executor_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
+    tool_catalog = "\n".join(f"- {name}" for name in tool_hints[:80]) or "- No tools available."
+    if prefer_bigquery:
+        bq_policy = (
+            "- BigQuery-first policy:\n"
+            "  - For structured/tabular analysis, start with `list_bigquery_tables` and `run_bigquery_select_query`.\n"
+            "  - Use non-BigQuery tools for enrichment, freshness gaps, or unavailable data."
         )
-        rendered_summary = _render_plan_summary(plan)
-        approval_payload = {
-            "schema": "execution_plan_confirmation.v1",
-            "objective": plan["objective"],
-            "steps": plan["steps"],
-            "proposed_tools": plan["planned_tools"],
-            "evidence_sources": plan["evidence_sources"],
-            "stop_conditions": plan["stop_conditions"],
+    else:
+        bq_policy = "- BigQuery-first policy is disabled for this run."
+
+    return (
+        EVIDENCE_EXECUTOR_INSTRUCTION_TEMPLATE
+        .replace("__TOOL_CATALOG__", tool_catalog)
+        .replace("__BQ_POLICY__", bq_policy)
+    )
+
+
+def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
+    tool_catalog = "\n".join(f"- {name}" for name in tool_hints[:80]) or "- No tools available."
+    if prefer_bigquery:
+        bq_policy = (
+            "- BigQuery-first policy:\n"
+            "  - Prefer `list_bigquery_tables` and `run_bigquery_select_query` for structured/tabular subtasks.\n"
+            "  - Use non-BigQuery tools for enrichment, freshness gaps, or unavailable data."
+        )
+    else:
+        bq_policy = "- BigQuery-first policy is disabled for this run."
+
+    return (
+        PLANNER_INSTRUCTION_TEMPLATE
+        .replace("__TOOL_CATALOG__", tool_catalog)
+        .replace("__BQ_POLICY__", bq_policy)
+    )
+
+
+def _make_request_evidence_continuation_tool():
+    def request_evidence_continuation(
+        missing_evidence: list[str] | None = None,
+        proposed_next_actions: list[str] | None = None,
+        rationale: str | None = None,
+        tool_context: ToolContext | None = None,
+    ) -> dict[str, Any]:
+        """Request a human checkpoint before collecting more evidence."""
+        if tool_context is None:
+            return {
+                "status": "declined",
+                "feedback": "Missing tool context for checkpoint.",
+            }
+
+        missing_items = _dedupe_str_list(missing_evidence or [], limit=8)
+        next_actions = _dedupe_str_list(proposed_next_actions or [], limit=8)
+        rationale_text = re.sub(r"\s+", " ", str(rationale or "").strip())
+
+        payload = {
+            "schema": "evidence_continuation_checkpoint.v1",
+            "missing_evidence": missing_items,
+            "proposed_next_actions": next_actions,
+            "rationale": rationale_text,
             "response_contract": {
-                "decision": "approve | revise",
-                "feedback": "Required when decision is revise.",
+                "decision": "approve | stop",
+                "feedback": "Optional short feedback.",
             },
         }
-        pending_payload_state = tool_context.state.get("pending_plan_confirmation_payload", {})
-        if not tool_context.tool_confirmation:
-            manual_decision, manual_feedback = _parse_manual_plan_decision(tool_context)
-            if (
-                manual_decision
-                and isinstance(pending_payload_state, dict)
-                and bool(pending_payload_state)
-            ):
-                pending_plan_input = {
-                    "objective": pending_payload_state.get("objective", ""),
-                    "steps": pending_payload_state.get("steps", []),
-                    "planned_tools": pending_payload_state.get("proposed_tools", []),
-                    "evidence_sources": pending_payload_state.get("evidence_sources", []),
-                    "stop_conditions": pending_payload_state.get("stop_conditions", []),
-                }
-                plan = _parse_plan_draft_json(
-                    pending_plan_input,
-                    allowed_tool_names=allowed_names,
-                )
-                rendered_summary = _render_plan_summary(plan)
-                approval_payload = {
-                    "schema": "execution_plan_confirmation.v1",
-                    "objective": plan["objective"],
-                    "steps": plan["steps"],
-                    "proposed_tools": plan["planned_tools"],
-                    "evidence_sources": plan["evidence_sources"],
-                    "stop_conditions": plan["stop_conditions"],
-                    "response_contract": {
-                        "decision": "approve | revise",
-                        "feedback": "Required when decision is revise.",
-                    },
-                }
-            if manual_decision == "approve":
-                approved_tools = _dedupe_str_list(plan.get("planned_tools", []), limit=24)
-                tool_context.state["plan_approval_status"] = "approved"
-                tool_context.state["approved_tools"] = approved_tools
-                tool_context.state["plan_revision_feedback"] = ""
-                tool_context.state["plan_summary"] = rendered_summary
-                tool_context.state["approved_plan_summary"] = rendered_summary
-                tool_context.state["pending_plan_confirmation_payload"] = {}
-                _record_plan_review(
-                    tool_context,
-                    {
-                        "decision": "approved_manual_turn",
-                        "feedback": "",
-                        "approved_tools": approved_tools,
-                    },
-                )
-                return {
-                    "status": "approved",
-                    "approved_tools": approved_tools,
-                    "plan_summary": rendered_summary,
-                }
-            if manual_decision == "revise":
-                revision_feedback = manual_feedback or "Revise the plan before evidence tool execution."
-                tool_context.state["plan_approval_status"] = "revision_requested"
-                tool_context.state["plan_revision_feedback"] = revision_feedback
-                tool_context.state["approved_tools"] = []
-                tool_context.state["pending_plan_confirmation_payload"] = {}
-                _record_plan_review(
-                    tool_context,
-                    {
-                        "decision": "revision_requested_manual_turn",
-                        "feedback": revision_feedback,
-                        "approved_tools": [],
-                    },
-                )
-                return {
-                    "status": "revision_requested",
-                    "feedback": revision_feedback,
-                    "plan_summary": rendered_summary,
-                }
 
-            tool_context.request_confirmation(
-                hint=(
-                    "Review the proposed execution plan and tool list. "
-                    "Approve to continue, or revise with feedback. "
-                    "Fallback: send a normal user turn with `approve` or `revise: <feedback>`."
-                ),
-                payload=approval_payload,
-            )
-            tool_context.actions.skip_summarization = True
-            tool_context.state["plan_approval_status"] = "pending_human_confirmation"
-            tool_context.state["plan_summary"] = rendered_summary
-            tool_context.state["pending_plan_confirmation_payload"] = approval_payload
-            return {
-                "status": "pending_human_confirmation",
-                "plan_summary": rendered_summary,
-            }
-
+        pending_key = "evidence_checkpoint_pending"
         confirmation = tool_context.tool_confirmation
-        payload = confirmation.payload if isinstance(confirmation.payload, dict) else {}
-        decision = str(payload.get("decision", "")).strip().lower()
-        feedback = str(payload.get("feedback", "")).strip()
-        if REQUIRE_EXPLICIT_CONFIRMATION_DECISION and bool(confirmation.confirmed) and not decision:
+        if not confirmation:
+            has_pending_checkpoint = bool(tool_context.state.get(pending_key, False))
+            if has_pending_checkpoint:
+                manual_decision, manual_feedback = _parse_manual_evidence_checkpoint_decision(tool_context)
+                if manual_decision == "approve":
+                    tool_context.state[pending_key] = False
+                    return {
+                        "status": "approved",
+                        "feedback": manual_feedback,
+                    }
+                if manual_decision == "stop":
+                    tool_context.state[pending_key] = False
+                    exit_loop(tool_context=tool_context)
+                    return {
+                        "status": "declined",
+                        "feedback": manual_feedback or "User chose to stop additional evidence collection.",
+                    }
+
             tool_context.request_confirmation(
                 hint=(
-                    "Explicit decision is required. Confirm with `decision=approve` "
-                    "or request revision with `decision=revise` and feedback. "
-                    "Fallback: send `approve` or `revise: <feedback>` as a normal user turn."
+                    "Additional evidence collection is proposed. "
+                    "Approve to continue, or stop and synthesize from current evidence. "
+                    "If your UI cannot send payload choices, reply in chat with `approve` or `stop`."
                 ),
-                payload=approval_payload,
+                payload=payload,
             )
             tool_context.actions.skip_summarization = True
-            tool_context.state["plan_approval_status"] = "pending_human_confirmation"
-            tool_context.state["approved_tools"] = []
-            tool_context.state["plan_summary"] = rendered_summary
-            tool_context.state["pending_plan_confirmation_payload"] = approval_payload
-            _record_plan_review(
-                tool_context,
-                {
-                    "decision": "confirmation_missing_decision",
-                    "feedback": "",
-                    "approved_tools": [],
-                },
+            tool_context.state[pending_key] = True
+            return {"status": "pending_human_confirmation"}
+
+        response_payload = confirmation.payload if isinstance(confirmation.payload, dict) else {}
+        decision = str(response_payload.get("decision", "")).strip().lower()
+        feedback = str(response_payload.get("feedback", "")).strip()
+        if REQUIRE_EXPLICIT_EVIDENCE_CHECKPOINT_DECISION and not decision:
+            tool_context.request_confirmation(
+                hint=(
+                    "Explicit decision is required: `approve` to continue evidence collection "
+                    "or `stop` to synthesize from current evidence."
+                ),
+                payload=payload,
             )
+            tool_context.actions.skip_summarization = True
+            tool_context.state[pending_key] = True
             return {
                 "status": "pending_human_confirmation",
-                "plan_summary": rendered_summary,
                 "message": "Confirmation did not include an explicit decision.",
             }
-
+        tool_context.state[pending_key] = False
         if not decision:
-            decision = "approve" if bool(confirmation.confirmed) else "revise"
+            decision = "stop"
+
         is_approved = bool(confirmation.confirmed) and decision in {
             "approve",
             "approved",
-            "accept",
-            "accepted",
+            "continue",
             "yes",
+            "y",
         }
-
         if is_approved:
-            approved_tools = _dedupe_str_list(plan.get("planned_tools", []), limit=24)
-            tool_context.state["plan_approval_status"] = "approved"
-            tool_context.state["approved_tools"] = approved_tools
-            tool_context.state["plan_revision_feedback"] = ""
-            tool_context.state["plan_summary"] = rendered_summary
-            tool_context.state["approved_plan_summary"] = rendered_summary
-            tool_context.state["pending_plan_confirmation_payload"] = {}
-            _record_plan_review(
-                tool_context,
-                {
-                    "decision": "approved",
-                    "feedback": "",
-                    "approved_tools": approved_tools,
-                },
-            )
             return {
                 "status": "approved",
-                "approved_tools": approved_tools,
-                "plan_summary": rendered_summary,
+                "feedback": feedback,
             }
 
-        revision_feedback = feedback or "Revise the plan before evidence tool execution."
-        tool_context.state["plan_approval_status"] = "revision_requested"
-        tool_context.state["plan_revision_feedback"] = revision_feedback
-        tool_context.state["approved_tools"] = []
-        tool_context.state["pending_plan_confirmation_payload"] = {}
-        _record_plan_review(
-            tool_context,
-            {
-                "decision": "revision_requested",
-                "feedback": revision_feedback,
-                "approved_tools": [],
-            },
-        )
+        exit_loop(tool_context=tool_context)
         return {
-            "status": "revision_requested",
-            "feedback": revision_feedback,
-            "plan_summary": rendered_summary,
+            "status": "declined",
+            "feedback": feedback or "User chose to stop additional evidence collection.",
         }
 
-    return request_plan_confirmation
-
-
-def _build_planner_instruction(tool_hints: list[str]) -> str:
-    tool_catalog = "\n".join(f"- {name}" for name in tool_hints[:80]) or "- No tools available."
-    return PLANNER_INSTRUCTION_TEMPLATE.replace("__TOOL_CATALOG__", tool_catalog)
-
-
-def _guard_evidence_tool_execution(tool, args: dict[str, Any], tool_context: ToolContext) -> dict | None:
-    del args
-    approval_status = str(tool_context.state.get("plan_approval_status", "")).strip().lower()
-    if approval_status != "approved":
-        tool_context.actions.skip_summarization = True
-        return {
-            "status": "blocked",
-            "reason": "plan_not_approved",
-            "message": "Evidence tools are blocked until the human approves the execution plan.",
-        }
-
-    approved_tools = _dedupe_str_list(tool_context.state.get("approved_tools", []), limit=40)
-    if not approved_tools:
-        tool_context.actions.skip_summarization = True
-        return {
-            "status": "blocked",
-            "reason": "no_tools_approved",
-            "message": "No tools were approved in the execution plan.",
-        }
-
-    if str(getattr(tool, "name", "")).strip() not in set(approved_tools):
-        tool_context.actions.skip_summarization = True
-        return {
-            "status": "blocked",
-            "reason": "tool_not_approved",
-            "tool": str(getattr(tool, "name", "")).strip(),
-            "approved_tools": approved_tools,
-        }
-    return None
-
-
-def _render_pending_approval_message(state: dict[str, Any]) -> str:
-    payload = state.get("pending_plan_confirmation_payload", {})
-    if not isinstance(payload, dict):
-        payload = {}
-    if not payload:
-        fallback_plan = _parse_plan_draft_json(
-            state.get("plan_draft_json", ""),
-            allowed_tool_names=set(KNOWN_MCP_TOOLS),
-        )
-        payload = {
-            "objective": fallback_plan.get("objective", ""),
-            "steps": fallback_plan.get("steps", []),
-            "proposed_tools": fallback_plan.get("planned_tools", []),
-        }
-
-    lines = [
-        "Plan approval is required before evidence tools can run.",
-        "Review and confirm the proposed plan in your client.",
-    ]
-    objective = str(payload.get("objective", "")).strip()
-    if objective:
-        lines.append(f"\nObjective: {objective}")
-    steps = [str(item).strip() for item in payload.get("steps", []) if str(item).strip()]
-    if steps:
-        lines.append("\nProposed steps:")
-        lines.extend([f"{idx}. {step}" for idx, step in enumerate(steps[:8], start=1)])
-    tools = [str(item).strip() for item in payload.get("proposed_tools", []) if str(item).strip()]
-    if tools:
-        lines.append("\nProposed tools:")
-        lines.extend([f"- {name}" for name in tools[:16]])
-
-    lines.append(
-        "\nIf your UI does not support confirmation popups yet, reply in chat "
-        "with `approve` or `revise: <feedback>`. You can also continue in CLI "
-        "(`python agent.py`) for interactive confirmation prompts."
-    )
-    return "\n".join(lines).strip()
-
-
-def _block_until_plan_approved(callback_context: CallbackContext):
-    status = str(callback_context.state.get("plan_approval_status", "")).strip().lower()
-    if status == "approved":
-        return None
-
-    message = _render_pending_approval_message(callback_context.state)
-    return types.Content(
-        role="model",
-        parts=[types.Part(text=message)],
-    )
+    return request_evidence_continuation
 
 
 def create_mcp_toolset(tool_filter: list[str] | None = None) -> McpToolset | None:
@@ -702,104 +397,88 @@ def create_workflow_agent(
     model: str | None = None,
     max_plan_iterations: int | None = None,
     max_evidence_iterations: int | None = None,
+    prefer_bigquery: bool | None = None,
 ) -> tuple[SequentialAgent, McpToolset | None]:
     """Create an ADK-native workflow graph and return (root_agent, mcp_toolset)."""
+    del max_plan_iterations
+
     runtime_model = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    plan_max_iters = (
-        max(1, int(max_plan_iterations))
-        if max_plan_iterations is not None
-        else DEFAULT_PLAN_MAX_ITERS
-    )
     evidence_max_iters = (
         max(1, int(max_evidence_iterations))
         if max_evidence_iterations is not None
         else DEFAULT_EVIDENCE_MAX_ITERS
     )
+    use_bigquery_priority = DEFAULT_PREFER_BIGQUERY if prefer_bigquery is None else bool(prefer_bigquery)
 
     mcp_toolset = create_mcp_toolset(tool_filter=tool_filter)
     executor_tools = [mcp_toolset] if mcp_toolset is not None else []
-    planner_tool_hints = _dedupe_str_list(tool_filter if tool_filter else KNOWN_MCP_TOOLS, limit=120)
-    request_plan_confirmation = _make_request_plan_confirmation_tool(
-        allowed_tool_names=planner_tool_hints,
-    )
+    base_tool_hints = _dedupe_str_list(tool_filter if tool_filter else KNOWN_MCP_TOOLS, limit=120)
+    if use_bigquery_priority:
+        base_hint_set = set(base_tool_hints)
+        prioritized_hints = [name for name in BQ_PRIORITY_TOOLS if name in base_hint_set]
+        prioritized_set = set(prioritized_hints)
+        prioritized_hints.extend([name for name in base_tool_hints if name not in prioritized_set])
+        executor_tool_hints = prioritized_hints
+    else:
+        executor_tool_hints = base_tool_hints
 
-    clarifier = LlmAgent(
-        name="clarifier",
-        model=runtime_model,
-        instruction=CLARIFIER_INSTRUCTION,
-        tools=[],
-        include_contents="none",
-        output_key="clarifier_summary",
-    )
+    request_evidence_continuation = _make_request_evidence_continuation_tool()
     planner = LlmAgent(
         name="planner",
         model=runtime_model,
-        instruction=_build_planner_instruction(planner_tool_hints),
-        tools=[],
-        before_agent_callback=_prepare_plan_gate_for_new_query,
-        include_contents="none",
-        output_schema=PlanDraft,
-        output_key="plan_draft_json",
-    )
-    plan_reviewer = LlmAgent(
-        name="plan_reviewer",
-        model=runtime_model,
-        instruction=PLAN_REVIEWER_INSTRUCTION,
-        tools=[request_plan_confirmation],
-        generate_content_config=types.GenerateContentConfig(
-            tool_config=types.ToolConfig(
-                function_calling_config=types.FunctionCallingConfig(
-                    mode=types.FunctionCallingConfigMode.ANY,
-                    allowed_function_names=["request_plan_confirmation"],
-                )
-            )
+        instruction=_build_planner_instruction(
+            executor_tool_hints,
+            prefer_bigquery=use_bigquery_priority,
         ),
-        include_contents="none",
-        output_key="plan_review_status",
-    )
-    plan_approval_loop = LoopAgent(
-        name="plan_approval_loop",
-        description="Iterate planning until a human approves the execution plan.",
-        sub_agents=[planner, plan_reviewer],
-        max_iterations=plan_max_iters,
+        tools=[],
+        disallow_transfer_to_parent=True,
     )
     evidence_executor = LlmAgent(
         name="evidence_executor",
         model=runtime_model,
-        instruction=EVIDENCE_EXECUTOR_INSTRUCTION,
+        instruction=_build_evidence_executor_instruction(
+            executor_tool_hints,
+            prefer_bigquery=use_bigquery_priority,
+        ),
         tools=executor_tools,
-        before_agent_callback=_block_until_plan_approved,
-        before_tool_callback=_guard_evidence_tool_execution,
-        output_key="evidence_iteration_summary",
     )
     evidence_critic = LlmAgent(
         name="evidence_critic",
         model=runtime_model,
         instruction=EVIDENCE_CRITIC_INSTRUCTION,
         tools=[exit_loop],
-        include_contents="none",
-        output_key="evidence_critic_decision",
+    )
+    evidence_hitl_gate = LlmAgent(
+        name="evidence_hitl_gate",
+        model=runtime_model,
+        instruction=EVIDENCE_HITL_GATE_INSTRUCTION,
+        tools=[request_evidence_continuation],
+        generate_content_config=types.GenerateContentConfig(
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(
+                    mode=types.FunctionCallingConfigMode.ANY,
+                    allowed_function_names=["request_evidence_continuation"],
+                )
+            )
+        ),
     )
     evidence_loop = LoopAgent(
         name="evidence_refinement_loop",
         description="Collect evidence and iterate until critic exits the loop.",
-        sub_agents=[evidence_executor, evidence_critic],
+        sub_agents=[evidence_executor, evidence_critic, evidence_hitl_gate],
         max_iterations=evidence_max_iters,
-        before_agent_callback=_block_until_plan_approved,
     )
     report_synthesizer = LlmAgent(
         name="report_synthesizer",
         model=runtime_model,
         instruction=SYNTHESIZER_INSTRUCTION,
         tools=[],
-        before_agent_callback=_block_until_plan_approved,
-        output_key="final_report",
     )
 
     root = SequentialAgent(
         name="co_scientist_workflow",
-        description="ADK-native biomedical workflow: clarify, plan+approve, refine evidence, synthesize.",
-        sub_agents=[clarifier, plan_approval_loop, evidence_loop, report_synthesizer],
+        description="ADK-native biomedical workflow: planner, evidence refinement, synthesis.",
+        sub_agents=[planner, evidence_loop, report_synthesizer],
     )
     return root, mcp_toolset
 

@@ -8,6 +8,7 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@google-cloud/bigquery": "^7.9.4",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "zod": "^3.23.0"
   }

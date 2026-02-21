@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { BigQuery } from "@google-cloud/bigquery";
 import { z } from "zod";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -28,9 +29,23 @@ const CHEMBL_API = "https://www.ebi.ac.uk/chembl/api/data";
 const OLS_API = "https://www.ebi.ac.uk/ols4";
 const EUROPE_PMC_API = "https://www.ebi.ac.uk/europepmc/webservices/rest";
 const OPENFDA_API = "https://api.fda.gov";
+const HF_DATASETS_SERVER_API = "https://datasets-server.huggingface.co";
+const HF_DATASET_PUBMEDQA = String(process.env.HF_DATASET_PUBMEDQA || "qiaojin/PubMedQA").trim();
+const HF_DATASET_BIOASQ = String(process.env.HF_DATASET_BIOASQ || "kroshan/BioASQ").trim();
+const HF_DATASET_GPQA = String(process.env.HF_DATASET_GPQA || "Idavidrein/gpqa").trim();
+const HF_TOKEN = String(process.env.HF_TOKEN || process.env.HUGGINGFACE_TOKEN || "").trim();
 const DATA_DIR = path.resolve(__dirname, "data");
 const OPENALEX_MAILTO = process.env.OPENALEX_MAILTO || process.env.CONTACT_EMAIL || "";
+const BQ_PROJECT_ID = String(process.env.BQ_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || "").trim();
+const BQ_LOCATION = String(process.env.BQ_LOCATION || process.env.GOOGLE_CLOUD_LOCATION || "US").trim() || "US";
+const BQ_DATASET_ALLOWLIST = String(process.env.BQ_DATASET_ALLOWLIST || "").trim();
+const BQ_DEFAULT_MAX_ROWS = 200;
+const BQ_HARD_MAX_ROWS = 1000;
+const BQ_DEFAULT_MAX_BYTES_BILLED = 5_000_000_000;
+const BQ_QUERY_TIMEOUT_MS = 30_000;
+const FORBIDDEN_SQL_KEYWORDS = /\b(insert|update|delete|merge|drop|create|alter|truncate|grant|revoke|call|export|load|copy)\b/i;
 let gwasCooldownUntilMs = 0;
+let bigQueryClient = null;
 
 function normalizeWhitespace(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -267,6 +282,100 @@ function buildEuropePmcUrl(pathname, params = new URLSearchParams()) {
 function buildOpenFdaUrl(pathname, params = new URLSearchParams()) {
   const query = params.toString();
   return query ? `${OPENFDA_API}${pathname}?${query}` : `${OPENFDA_API}${pathname}`;
+}
+
+function buildHfDatasetsServerUrl(pathname, params = new URLSearchParams()) {
+  const query = params.toString();
+  return query ? `${HF_DATASETS_SERVER_API}${pathname}?${query}` : `${HF_DATASETS_SERVER_API}${pathname}`;
+}
+
+function buildHfHubDatasetUrl(dataset) {
+  const normalized = normalizeWhitespace(dataset || "");
+  if (!normalized) return "https://huggingface.co/datasets";
+  const safePath = normalized
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+  return `https://huggingface.co/datasets/${safePath}`;
+}
+
+function getHfAuthHeaders() {
+  if (!HF_TOKEN) return {};
+  return { Authorization: `Bearer ${HF_TOKEN}` };
+}
+
+async function fetchHfDatasetSplits(dataset) {
+  const url = buildHfDatasetsServerUrl(
+    "/splits",
+    new URLSearchParams({
+      dataset,
+    })
+  );
+  return fetchJsonWithRetry(url, {
+    headers: getHfAuthHeaders(),
+    retries: 1,
+    timeoutMs: 12000,
+  });
+}
+
+async function fetchHfDatasetRows({ dataset, config, split, offset = 0, length = 3 }) {
+  const safeOffset = Math.max(0, Math.trunc(Number(offset) || 0));
+  const safeLength = Math.max(1, Math.min(100, Math.trunc(Number(length) || 3)));
+  const url = buildHfDatasetsServerUrl(
+    "/rows",
+    new URLSearchParams({
+      dataset,
+      config,
+      split,
+      offset: String(safeOffset),
+      length: String(safeLength),
+    })
+  );
+  return fetchJsonWithRetry(url, {
+    headers: getHfAuthHeaders(),
+    retries: 1,
+    timeoutMs: 15000,
+  });
+}
+
+function pickHfDefaultSplit(splitsResponse, fallbackConfig = "default", fallbackSplit = "train") {
+  const splits = Array.isArray(splitsResponse?.splits) ? splitsResponse.splits : [];
+  if (splits.length === 0) {
+    return {
+      config: fallbackConfig,
+      split: fallbackSplit,
+    };
+  }
+  const preferredTrain = splits.find(
+    (row) => normalizeWhitespace(row?.split || "").toLowerCase() === "train"
+  );
+  const selected = preferredTrain || splits[0];
+  return {
+    config: normalizeWhitespace(selected?.config || fallbackConfig) || fallbackConfig,
+    split: normalizeWhitespace(selected?.split || fallbackSplit) || fallbackSplit,
+  };
+}
+
+function extractPubMedQaContextSnippet(contextPayload, maxContexts = 2) {
+  const contexts = Array.isArray(contextPayload?.contexts) ? contextPayload.contexts : [];
+  if (contexts.length === 0) return "";
+  return contexts
+    .slice(0, maxContexts)
+    .map((value) => compactErrorMessage(normalizeWhitespace(value), 320))
+    .filter(Boolean)
+    .join(" | ");
+}
+
+function parseBioAsqPackedText(text) {
+  const raw = String(text || "");
+  const answerMatch = raw.match(/<answer>\s*([\s\S]*?)\s*<context>/i);
+  const contextMatch = raw.match(/<context>\s*([\s\S]*)/i);
+  const answer = normalizeWhitespace(answerMatch?.[1] || "");
+  const context = normalizeWhitespace(contextMatch?.[1] || raw);
+  return {
+    answer,
+    context,
+  };
 }
 
 function extractUniProtProteinName(entry) {
@@ -559,6 +668,159 @@ function resolveDataPath(filename) {
     throw new Error("Invalid filename. Only files in ./data are allowed.");
   }
   return resolved;
+}
+
+function parseBigQueryDatasetAllowlist(rawValue, defaultProjectId = "") {
+  const values = String(rawValue || "")
+    .split(",")
+    .map((value) => normalizeWhitespace(value))
+    .filter(Boolean);
+  const allowlist = [];
+  const seen = new Set();
+
+  for (const value of values) {
+    const stripped = value.replace(/`/g, "");
+    const parts = stripped
+      .split(".")
+      .map((part) => normalizeWhitespace(part))
+      .filter(Boolean);
+    let projectId = "";
+    let datasetId = "";
+    if (parts.length === 1) {
+      projectId = defaultProjectId;
+      datasetId = parts[0];
+    } else if (parts.length >= 2) {
+      projectId = parts[0];
+      datasetId = parts[1];
+    }
+    if (!projectId || !datasetId) continue;
+    const key = `${projectId}.${datasetId}`;
+    const normalizedKey = key.toLowerCase();
+    if (seen.has(normalizedKey)) continue;
+    seen.add(normalizedKey);
+    allowlist.push(key);
+  }
+  return allowlist;
+}
+
+const BQ_ALLOWED_DATASETS = parseBigQueryDatasetAllowlist(BQ_DATASET_ALLOWLIST, BQ_PROJECT_ID);
+const BQ_ALLOWED_DATASET_SET = new Set(BQ_ALLOWED_DATASETS.map((value) => value.toLowerCase()));
+
+function getBigQueryClient() {
+  if (bigQueryClient) return bigQueryClient;
+  const options = {};
+  if (BQ_PROJECT_ID) {
+    options.projectId = BQ_PROJECT_ID;
+  }
+  bigQueryClient = new BigQuery(options);
+  return bigQueryClient;
+}
+
+function getBigQueryMaxBytesBilled() {
+  const parsed = Number(String(process.env.BQ_MAX_BYTES_BILLED || "").trim());
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return Math.max(10_000_000, Math.trunc(parsed));
+  }
+  return BQ_DEFAULT_MAX_BYTES_BILLED;
+}
+
+function normalizeBigQuerySql(sql) {
+  let remaining = String(sql || "");
+  while (true) {
+    remaining = remaining.replace(/^\s+/, "");
+    if (remaining.startsWith("--")) {
+      const newline = remaining.indexOf("\n");
+      if (newline === -1) return "";
+      remaining = remaining.slice(newline + 1);
+      continue;
+    }
+    if (remaining.startsWith("/*")) {
+      const closing = remaining.indexOf("*/");
+      if (closing === -1) return "";
+      remaining = remaining.slice(closing + 2);
+      continue;
+    }
+    break;
+  }
+  return remaining.replace(/;+\s*$/, "").trim();
+}
+
+function validateBigQuerySelectSql(sql) {
+  const normalizedSql = normalizeBigQuerySql(sql);
+  if (!normalizedSql) {
+    return { ok: false, error: "Query is empty after normalization." };
+  }
+  const lowered = normalizedSql.toLowerCase();
+  if (!(lowered.startsWith("select") || lowered.startsWith("with"))) {
+    return { ok: false, error: "Only SELECT or WITH queries are allowed." };
+  }
+  if (FORBIDDEN_SQL_KEYWORDS.test(lowered)) {
+    return { ok: false, error: "Query includes a forbidden SQL keyword." };
+  }
+  return { ok: true, normalizedSql };
+}
+
+function extractReferencedBigQueryDatasets(sql) {
+  const identifiers = [...String(sql || "").matchAll(/`([^`]+)`/g)]
+    .map((match) => normalizeWhitespace(match?.[1] || ""))
+    .filter(Boolean);
+  const datasets = [];
+  const seen = new Set();
+  for (const identifier of identifiers) {
+    const parts = identifier
+      .split(".")
+      .map((part) => normalizeWhitespace(part))
+      .filter(Boolean);
+    let key = "";
+    if (parts.length >= 3) {
+      key = `${parts[0]}.${parts[1]}`;
+    } else if (parts.length === 2 && BQ_PROJECT_ID) {
+      key = `${BQ_PROJECT_ID}.${parts[0]}`;
+    } else if (parts.length === 1 && BQ_PROJECT_ID) {
+      key = `${BQ_PROJECT_ID}.${parts[0]}`;
+    }
+    if (!key) continue;
+    const normalizedKey = key.toLowerCase();
+    if (seen.has(normalizedKey)) continue;
+    seen.add(normalizedKey);
+    datasets.push(key);
+  }
+  return datasets;
+}
+
+function isAllowedBigQueryDataset(datasetKey) {
+  if (BQ_ALLOWED_DATASET_SET.size === 0) return true;
+  return BQ_ALLOWED_DATASET_SET.has(String(datasetKey || "").toLowerCase());
+}
+
+function normalizeBigQueryDatasetKey(rawValue) {
+  const value = normalizeWhitespace(rawValue || "").replace(/`/g, "");
+  if (!value) return "";
+  const parts = value
+    .split(".")
+    .map((part) => normalizeWhitespace(part))
+    .filter(Boolean);
+  if (parts.length === 1) {
+    return BQ_PROJECT_ID ? `${BQ_PROJECT_ID}.${parts[0]}` : "";
+  }
+  if (parts.length >= 2) {
+    return `${parts[0]}.${parts[1]}`;
+  }
+  return "";
+}
+
+function formatBigQueryBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let unitIndex = 0;
+  let size = bytes;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  const decimals = size >= 10 || unitIndex === 0 ? 0 : 1;
+  return `${size.toFixed(decimals)} ${units[unitIndex]}`;
 }
 
 function incrementCount(counter, key) {
@@ -2425,7 +2687,585 @@ server.registerTool(
 );
 
 // ============================================
-// TOOL 5: Search for diseases in Open Targets
+// TOOL 5: List BigQuery tables (read-only metadata)
+// ============================================
+server.registerTool(
+  "list_bigquery_tables",
+  {
+    description:
+      "Lists tables for a BigQuery dataset. Dataset allowlist can be enforced via BQ_DATASET_ALLOWLIST.",
+    inputSchema: {
+      dataset: z
+        .string()
+        .optional()
+        .describe("Dataset as `project.dataset` or `dataset`. If omitted, uses first allowlisted dataset."),
+      limit: z.number().optional().default(50).describe("Maximum number of tables to return (1-200)."),
+    },
+  },
+  async ({ dataset = "", limit = 50 }) => {
+    const boundedLimit = Math.max(1, Math.min(200, Math.round(Number(limit) || 50)));
+    const normalizedDataset = normalizeBigQueryDatasetKey(dataset);
+    const selectedDataset = normalizedDataset || BQ_ALLOWED_DATASETS[0] || "";
+
+    if (!selectedDataset) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "No dataset specified and no allowlist configured. Set BQ_DATASET_ALLOWLIST (for example, `project.dataset`) or pass `dataset`.",
+          },
+        ],
+      };
+    }
+    if (!isAllowedBigQueryDataset(selectedDataset)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Dataset ${selectedDataset} is not in the BQ_DATASET_ALLOWLIST.`,
+          },
+        ],
+      };
+    }
+
+    const [projectId, datasetId] = selectedDataset.split(".");
+    if (!projectId || !datasetId) {
+      return {
+        content: [{ type: "text", text: `Invalid dataset reference: ${selectedDataset}` }],
+      };
+    }
+
+    try {
+      const client = getBigQueryClient();
+      const datasetRef = client.dataset(datasetId, { projectId });
+      const [tables] = await datasetRef.getTables({ maxResults: boundedLimit, autoPaginate: false });
+      if (!tables || tables.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: renderStructuredResponse({
+                summary: `No tables found for ${selectedDataset}.`,
+                keyFields: [`Dataset: ${selectedDataset}`],
+                sources: [`bigquery://${selectedDataset}`],
+                limitations: [
+                  "Dataset may be empty, inaccessible, or filtered by IAM.",
+                ],
+              }),
+            },
+          ],
+        };
+      }
+
+      const tableList = tables
+        .slice(0, boundedLimit)
+        .map((table, idx) => `${idx + 1}. ${table.id}`)
+        .join("\n");
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${renderStructuredResponse({
+              summary: `Retrieved ${Math.min(tables.length, boundedLimit)} table(s) from ${selectedDataset}.`,
+              keyFields: [
+                `Dataset: ${selectedDataset}`,
+                `Requested limit: ${boundedLimit}`,
+                `Allowlist enforced: ${BQ_ALLOWED_DATASET_SET.size > 0 ? "yes" : "no"}`,
+              ],
+              sources: [`bigquery://${selectedDataset}`],
+              limitations: [
+                "Only metadata is returned. Query table contents via run_bigquery_select_query.",
+              ],
+            })}\n\nTables:\n${tableList}`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error in list_bigquery_tables: ${error.message}` }],
+      };
+    }
+  }
+);
+
+// ============================================
+// TOOL 6: Run guarded BigQuery SELECT query
+// ============================================
+server.registerTool(
+  "run_bigquery_select_query",
+  {
+    description:
+      "Runs a read-only BigQuery SELECT/WITH query with row and bytes guardrails.",
+    inputSchema: {
+      query: z
+        .string()
+        .describe("BigQuery Standard SQL query. Must be read-only (SELECT/WITH)."),
+      maxRows: z.number().optional().default(100).describe("Max rows to return (1-1000)."),
+      dryRun: z.boolean().optional().default(false).describe("If true, validates and estimates bytes without executing."),
+    },
+  },
+  async ({ query, maxRows = 100, dryRun = false }) => {
+    const validation = validateBigQuerySelectSql(query);
+    if (!validation.ok) {
+      return {
+        content: [{ type: "text", text: `Invalid query: ${validation.error}` }],
+      };
+    }
+    const normalizedSql = validation.normalizedSql;
+    const referencedDatasets = extractReferencedBigQueryDatasets(normalizedSql);
+    if (referencedDatasets.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Query must reference at least one table with backticks (for example `project.dataset.table`) so dataset guardrails can be enforced.",
+          },
+        ],
+      };
+    }
+
+    const disallowedDatasets = referencedDatasets.filter((datasetKey) => !isAllowedBigQueryDataset(datasetKey));
+    if (disallowedDatasets.length > 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Query references dataset(s) outside BQ_DATASET_ALLOWLIST: ${disallowedDatasets.join(", ")}`,
+          },
+        ],
+      };
+    }
+
+    const boundedRows = Math.max(1, Math.min(BQ_HARD_MAX_ROWS, Math.round(Number(maxRows) || 100)));
+    const maximumBytesBilled = getBigQueryMaxBytesBilled();
+    const jobOptions = {
+      query: normalizedSql,
+      useLegacySql: false,
+      location: BQ_LOCATION,
+      maximumBytesBilled: String(maximumBytesBilled),
+      jobTimeoutMs: BQ_QUERY_TIMEOUT_MS,
+      dryRun: Boolean(dryRun),
+    };
+
+    try {
+      const client = getBigQueryClient();
+      const [job] = await client.createQueryJob(jobOptions);
+      const [metadata] = await job.getMetadata();
+      const stats = metadata?.statistics?.query || {};
+      const totalBytesProcessed = Number(stats?.totalBytesProcessed || 0);
+      const totalBytesBilled = Number(stats?.totalBytesBilled || 0);
+      const cacheHit = Boolean(stats?.cacheHit);
+
+      if (Boolean(dryRun)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: renderStructuredResponse({
+                summary: "BigQuery dry run completed successfully.",
+                keyFields: [
+                  `Datasets referenced: ${referencedDatasets.join(", ")}`,
+                  `Bytes processed estimate: ${formatBigQueryBytes(totalBytesProcessed)} (${totalBytesProcessed})`,
+                  `Max bytes billed guardrail: ${formatBigQueryBytes(maximumBytesBilled)} (${maximumBytesBilled})`,
+                  `Location: ${BQ_LOCATION}`,
+                ],
+                sources: referencedDatasets.map((datasetKey) => `bigquery://${datasetKey}`),
+                limitations: [
+                  "Dry run validates syntax and estimates bytes, but does not return rows.",
+                ],
+              }),
+            },
+          ],
+        };
+      }
+
+      const [rows] = await job.getQueryResults({ maxResults: boundedRows, autoPaginate: false });
+      const previewLines = (rows || [])
+        .slice(0, boundedRows)
+        .map((row, idx) => `${idx + 1}. ${JSON.stringify(row)}`);
+      const previewTextRaw = previewLines.join("\n");
+      const previewText =
+        previewTextRaw.length > 7000 ? `${previewTextRaw.slice(0, 7000)}\n... (truncated)` : previewTextRaw;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${renderStructuredResponse({
+              summary: `BigQuery query completed with ${rows?.length || 0} row(s) returned.`,
+              keyFields: [
+                `Datasets referenced: ${referencedDatasets.join(", ")}`,
+                `Rows returned: ${rows?.length || 0}`,
+                `Row cap: ${boundedRows}`,
+                `Bytes processed: ${formatBigQueryBytes(totalBytesProcessed)} (${totalBytesProcessed})`,
+                `Bytes billed: ${formatBigQueryBytes(totalBytesBilled)} (${totalBytesBilled})`,
+                `Cache hit: ${cacheHit ? "yes" : "no"}`,
+                `Location: ${BQ_LOCATION}`,
+                `Job ID: ${job?.id || "unknown"}`,
+              ],
+              sources: referencedDatasets.map((datasetKey) => `bigquery://${datasetKey}`),
+              limitations: [
+                "Only the first page of results is returned.",
+                `Rows are capped at ${boundedRows} to control costs and context size.`,
+              ],
+            })}\n\nRow Preview:\n${previewText || "(no rows returned)"}`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error in run_bigquery_select_query: ${error.message}` }],
+      };
+    }
+  }
+);
+
+// ============================================
+// TOOL 7: Benchmark dataset overview (GPQA, PubMedQA, BioASQ)
+// ============================================
+server.registerTool(
+  "benchmark_dataset_overview",
+  {
+    description:
+      "Provides a practical overview of GPQA, PubMedQA, and BioASQ benchmark datasets, with optional live accessibility checks.",
+    inputSchema: {
+      checkAccess: z.boolean().optional().default(true).describe("If true, checks dataset split access via Hugging Face datasets-server."),
+    },
+  },
+  async ({ checkAccess = true }) => {
+    const catalog = [
+      {
+        name: "GPQA",
+        dataset: HF_DATASET_GPQA,
+        bestFor: "Hard graduate-level scientific reasoning and multi-step tool planning stress tests.",
+      },
+      {
+        name: "PubMedQA",
+        dataset: HF_DATASET_PUBMEDQA,
+        bestFor: "Biomedical yes/no/maybe QA with evidence-grounded abstract context.",
+      },
+      {
+        name: "BioASQ",
+        dataset: HF_DATASET_BIOASQ,
+        bestFor: "Biomedical retrieval + synthesis evaluation with realistic QA-style prompts.",
+      },
+    ];
+
+    const keyFields = catalog.map(
+      (entry) => `${entry.name}: ${entry.dataset} (${entry.bestFor})`
+    );
+    const limitations = [
+      "Dataset schemas can vary by source/config and may change over time.",
+      "Some datasets (for example GPQA) may be gated and require Hugging Face terms acceptance and/or token auth.",
+    ];
+
+    if (checkAccess) {
+      for (const entry of catalog) {
+        try {
+          const splitPayload = await fetchHfDatasetSplits(entry.dataset);
+          const splits = Array.isArray(splitPayload?.splits) ? splitPayload.splits : [];
+          if (splits.length === 0) {
+            keyFields.push(`${entry.name} access: reachable but no splits reported.`);
+          } else {
+            const splitPreview = splits
+              .slice(0, 4)
+              .map((row) => `${row.config}/${row.split}`)
+              .join(", ");
+            keyFields.push(`${entry.name} access: OK (${splits.length} split entries, e.g. ${splitPreview}).`);
+          }
+        } catch (error) {
+          keyFields.push(`${entry.name} access: unavailable (${compactErrorMessage(error?.message || "unknown error", 180)}).`);
+        }
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: renderStructuredResponse({
+            summary: "Benchmark dataset catalog for local non-BigQuery exploration is ready.",
+            keyFields,
+            sources: catalog.map((entry) => buildHfHubDatasetUrl(entry.dataset)),
+            limitations,
+          }),
+        },
+      ],
+    };
+  }
+);
+
+// ============================================
+// TOOL 8: Sample PubMedQA examples
+// ============================================
+server.registerTool(
+  "sample_pubmedqa_examples",
+  {
+    description:
+      "Fetches sample rows from PubMedQA via Hugging Face datasets-server for local benchmark exploration.",
+    inputSchema: {
+      config: z.string().optional().default("pqa_labeled").describe("PubMedQA config (e.g., pqa_labeled, pqa_artificial, pqa_unlabeled)."),
+      split: z.string().optional().default("train").describe("Dataset split name."),
+      offset: z.number().optional().default(0).describe("Row offset."),
+      limit: z.number().optional().default(3).describe("Rows to return (1-10)."),
+      decision: z
+        .string()
+        .optional()
+        .default("")
+        .describe("Optional filter for final decision (yes/no/maybe)."),
+    },
+  },
+  async ({ config = "pqa_labeled", split = "train", offset = 0, limit = 3, decision = "" }) => {
+    const boundedLimit = Math.max(1, Math.min(10, Math.round(Number(limit) || 3)));
+    const normalizedDecision = normalizeWhitespace(decision).toLowerCase();
+    const splitPayload = await fetchHfDatasetSplits(HF_DATASET_PUBMEDQA);
+    const availableSplits = Array.isArray(splitPayload?.splits) ? splitPayload.splits : [];
+    const availableConfigs = dedupeArray(
+      availableSplits
+        .map((row) => normalizeWhitespace(row?.config || ""))
+        .filter(Boolean)
+    );
+    const selectedConfig = availableConfigs.includes(config) ? config : availableConfigs[0] || config;
+    const matchingSplit = availableSplits.find(
+      (row) =>
+        normalizeWhitespace(row?.config || "") === selectedConfig &&
+        normalizeWhitespace(row?.split || "") === normalizeWhitespace(split)
+    );
+    const selectedSplit = matchingSplit ? normalizeWhitespace(matchingSplit.split) : normalizeWhitespace(split || "train");
+    const fetchLength = Math.max(boundedLimit, Math.min(100, boundedLimit * 4));
+
+    const rowPayload = await fetchHfDatasetRows({
+      dataset: HF_DATASET_PUBMEDQA,
+      config: selectedConfig,
+      split: selectedSplit,
+      offset,
+      length: fetchLength,
+    });
+    const rawRows = Array.isArray(rowPayload?.rows) ? rowPayload.rows : [];
+    let rows = rawRows.map((item) => item?.row || {}).filter((row) => row && typeof row === "object");
+    if (normalizedDecision) {
+      rows = rows.filter(
+        (row) => normalizeWhitespace(row?.final_decision || "").toLowerCase() === normalizedDecision
+      );
+    }
+    const selectedRows = rows.slice(0, boundedLimit);
+    if (selectedRows.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: "No PubMedQA rows matched the current filter.",
+              keyFields: [
+                `Dataset: ${HF_DATASET_PUBMEDQA}`,
+                `Config: ${selectedConfig}`,
+                `Split: ${selectedSplit}`,
+                `Decision filter: ${normalizedDecision || "none"}`,
+              ],
+              sources: [buildHfHubDatasetUrl(HF_DATASET_PUBMEDQA)],
+              limitations: [
+                "Try a different decision filter or offset.",
+              ],
+            }),
+          },
+        ],
+      };
+    }
+
+    const exampleLines = selectedRows.map((row, idx) => {
+      const question = compactErrorMessage(normalizeWhitespace(row?.question || ""), 220) || "(missing question)";
+      const decisionLabel = normalizeWhitespace(row?.final_decision || "unknown");
+      const contextSnippet = compactErrorMessage(extractPubMedQaContextSnippet(row?.context, 1), 320) || "(no context)";
+      const longAnswer = compactErrorMessage(normalizeWhitespace(row?.long_answer || ""), 220) || "(no long answer)";
+      return [
+        `${idx + 1}. Decision: ${decisionLabel}`,
+        `   Question: ${question}`,
+        `   Context: ${contextSnippet}`,
+        `   Long answer: ${longAnswer}`,
+      ].join("\n");
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `${renderStructuredResponse({
+            summary: `Retrieved ${selectedRows.length} PubMedQA example(s).`,
+            keyFields: [
+              `Dataset: ${HF_DATASET_PUBMEDQA}`,
+              `Config: ${selectedConfig}`,
+              `Split: ${selectedSplit}`,
+              `Decision filter: ${normalizedDecision || "none"}`,
+            ],
+            sources: [buildHfHubDatasetUrl(HF_DATASET_PUBMEDQA)],
+            limitations: [
+              "Rows are sampled by offset from datasets-server and may not be shuffled.",
+            ],
+          })}\n\nExamples:\n${exampleLines.join("\n\n")}`,
+        },
+      ],
+    };
+  }
+);
+
+// ============================================
+// TOOL 9: Sample BioASQ examples
+// ============================================
+server.registerTool(
+  "sample_bioasq_examples",
+  {
+    description:
+      "Fetches sample rows from a BioASQ mirror dataset via Hugging Face datasets-server for local benchmark exploration.",
+    inputSchema: {
+      split: z.string().optional().default("train").describe("Dataset split name."),
+      offset: z.number().optional().default(0).describe("Row offset."),
+      limit: z.number().optional().default(3).describe("Rows to return (1-10)."),
+    },
+  },
+  async ({ split = "train", offset = 0, limit = 3 }) => {
+    const boundedLimit = Math.max(1, Math.min(10, Math.round(Number(limit) || 3)));
+    const splitPayload = await fetchHfDatasetSplits(HF_DATASET_BIOASQ);
+    const defaultSplitInfo = pickHfDefaultSplit(splitPayload, "default", "train");
+    const selectedSplit = normalizeWhitespace(split || defaultSplitInfo.split) || defaultSplitInfo.split;
+    const selectedConfig = defaultSplitInfo.config;
+
+    const rowPayload = await fetchHfDatasetRows({
+      dataset: HF_DATASET_BIOASQ,
+      config: selectedConfig,
+      split: selectedSplit,
+      offset,
+      length: boundedLimit,
+    });
+    const rawRows = Array.isArray(rowPayload?.rows) ? rowPayload.rows : [];
+    const selectedRows = rawRows
+      .map((item) => item?.row || {})
+      .filter((row) => row && typeof row === "object")
+      .slice(0, boundedLimit);
+
+    if (selectedRows.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: "No BioASQ rows were returned.",
+              keyFields: [
+                `Dataset: ${HF_DATASET_BIOASQ}`,
+                `Config: ${selectedConfig}`,
+                `Split: ${selectedSplit}`,
+              ],
+              sources: [buildHfHubDatasetUrl(HF_DATASET_BIOASQ)],
+              limitations: [
+                "Try a different split or offset.",
+              ],
+            }),
+          },
+        ],
+      };
+    }
+
+    const exampleLines = selectedRows.map((row, idx) => {
+      const question = compactErrorMessage(normalizeWhitespace(row?.question || ""), 220) || "(missing question)";
+      const parsed = parseBioAsqPackedText(row?.text || "");
+      const answer = compactErrorMessage(parsed.answer || "unknown", 120);
+      const context = compactErrorMessage(parsed.context || "", 320) || "(no context)";
+      return [
+        `${idx + 1}.`,
+        `   Question: ${question}`,
+        `   Answer: ${answer}`,
+        `   Context: ${context}`,
+      ].join("\n");
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `${renderStructuredResponse({
+            summary: `Retrieved ${selectedRows.length} BioASQ example(s).`,
+            keyFields: [
+              `Dataset: ${HF_DATASET_BIOASQ}`,
+              `Config: ${selectedConfig}`,
+              `Split: ${selectedSplit}`,
+            ],
+            sources: [buildHfHubDatasetUrl(HF_DATASET_BIOASQ)],
+            limitations: [
+              "This mirror may not match the exact yearly competition release structure.",
+            ],
+          })}\n\nExamples:\n${exampleLines.join("\n\n")}`,
+        },
+      ],
+    };
+  }
+);
+
+// ============================================
+// TOOL 10: Check GPQA accessibility
+// ============================================
+server.registerTool(
+  "check_gpqa_access",
+  {
+    description:
+      "Checks GPQA dataset accessibility and reports next steps for gated access (without exposing benchmark question content).",
+  },
+  async () => {
+    try {
+      const splitPayload = await fetchHfDatasetSplits(HF_DATASET_GPQA);
+      const splits = Array.isArray(splitPayload?.splits) ? splitPayload.splits : [];
+      const splitSummary = splits.length > 0
+        ? splits.slice(0, 6).map((row) => `${row.config}/${row.split}`).join(", ")
+        : "No splits reported";
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: "GPQA endpoint is reachable.",
+              keyFields: [
+                `Dataset: ${HF_DATASET_GPQA}`,
+                `Split summary: ${splitSummary}`,
+                "Question-content display is intentionally restricted in this tool to reduce benchmark leakage risk.",
+              ],
+              sources: [buildHfHubDatasetUrl(HF_DATASET_GPQA)],
+              limitations: [
+                "Even with access, avoid publishing raw benchmark questions to preserve evaluation integrity.",
+              ],
+            }),
+          },
+        ],
+      };
+    } catch (error) {
+      const message = compactErrorMessage(error?.message || "unknown error", 220);
+      const authHint = HF_TOKEN
+        ? "HF token is present, but dataset may still require explicit gating approval on the Hugging Face dataset page."
+        : "No HF token detected. Set HF_TOKEN (or HUGGINGFACE_TOKEN) after accepting dataset terms on Hugging Face.";
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: "GPQA dataset access is currently unavailable.",
+              keyFields: [
+                `Dataset: ${HF_DATASET_GPQA}`,
+                `Error: ${message}`,
+                authHint,
+              ],
+              sources: [buildHfHubDatasetUrl(HF_DATASET_GPQA)],
+              limitations: [
+                "GPQA is commonly gated; local tool access depends on Hugging Face permissions.",
+              ],
+            }),
+          },
+        ],
+      };
+    }
+  }
+);
+
+// ============================================
+// TOOL 11: Search for diseases in Open Targets
 // ============================================
 server.registerTool(
   "search_diseases",

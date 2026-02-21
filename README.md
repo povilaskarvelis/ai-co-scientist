@@ -87,6 +87,12 @@ pip install -r requirements.txt
 # 5a. Local mode auth (AI Studio API key)
 cp .env.local.example .env
 # then edit .env and set GOOGLE_API_KEY
+# optional for BigQuery tools (ADC):
+# gcloud auth application-default login
+# optional for gated Hugging Face datasets (e.g., GPQA):
+# set HF_TOKEN in .env
+# optional dataset source overrides:
+# HF_DATASET_PUBMEDQA, HF_DATASET_BIOASQ, HF_DATASET_GPQA
 
 # 5b. Vertex mode auth (project-backed)
 cp .env.vertex.example .env
@@ -128,6 +134,9 @@ python agent.py --query "Evaluate LRRK2 as a drug target in Parkinson disease"
 - HTTP API entrypoint for deployment: `adk-agent/server.py`.
 - Cloud Run containerization files: `Dockerfile`, `.dockerignore`.
 - One-command deploy script: `scripts/deploy_cloud_run.sh`.
+- BigQuery MCP tools: `list_bigquery_tables`, `run_bigquery_select_query` (read-only with row/bytes guardrails).
+- BQ-first planning policy is on by default (`ADK_NATIVE_PREFER_BIGQUERY=1`), configurable per environment.
+- Benchmark dataset tools (non-BQ): `benchmark_dataset_overview`, `sample_pubmedqa_examples`, `sample_bioasq_examples`, `check_gpqa_access`.
 
 ### Cloud Run deployment (when your hackathon project opens)
 
@@ -194,6 +203,8 @@ bash scripts/deploy_cloud_run.sh
 | **Variants & Genomics** | `search_clinvar_variants`, `get_clinvar_variant_details`, `search_gwas_associations`, `get_gene_info` | NCBI ClinVar, GWAS Catalog, NCBI Gene |
 | **Pathway & Networks** | `search_reactome_pathways`, `get_string_interactions` | Reactome, STRING |
 | **Ontology Context** | `expand_disease_context` | OLS (EFO/MONDO) |
+| **BigQuery** | `list_bigquery_tables`, `run_bigquery_select_query` | BigQuery |
+| **Benchmarks (No BQ)** | `benchmark_dataset_overview`, `sample_pubmedqa_examples`, `sample_bioasq_examples`, `check_gpqa_access` | Hugging Face datasets-server |
 | **Local Data** | `list_local_datasets`, `read_local_dataset` | Local filesystem |
 
 ## Testing

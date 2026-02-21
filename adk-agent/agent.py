@@ -118,10 +118,27 @@ def _extract_original_tool_name(function_call) -> str:
     return name or "unknown_tool"
 
 
-def _render_plan_confirmation(payload: dict) -> str:
+def _render_confirmation_payload(payload: dict) -> str:
     if not payload:
-        return "No plan payload was provided."
+        return "No confirmation payload was provided."
+    schema = str(payload.get("schema", "")).strip().lower()
     lines: list[str] = []
+    if schema == "evidence_continuation_checkpoint.v1":
+        missing_evidence = [str(item).strip() for item in payload.get("missing_evidence", []) if str(item).strip()]
+        if missing_evidence:
+            lines.append("Missing evidence:")
+            lines.extend([f"- {item}" for item in missing_evidence[:12]])
+        next_actions = [str(item).strip() for item in payload.get("proposed_next_actions", []) if str(item).strip()]
+        if next_actions:
+            lines.append("Proposed next actions:")
+            lines.extend([f"- {item}" for item in next_actions[:12]])
+        rationale = str(payload.get("rationale", "")).strip()
+        if rationale:
+            lines.append(f"Rationale: {rationale}")
+        if not lines:
+            return json.dumps(payload, indent=2, ensure_ascii=True)
+        return "\n".join(lines)
+
     objective = str(payload.get("objective", "")).strip()
     if objective:
         lines.append(f"Objective: {objective}")
@@ -149,6 +166,8 @@ def _render_plan_confirmation(payload: dict) -> str:
 async def _prompt_for_confirmation(function_call) -> dict:
     hint, payload = _extract_confirmation_payload(function_call)
     original_tool_name = _extract_original_tool_name(function_call)
+    schema = str(payload.get("schema", "")).strip().lower()
+    is_evidence_checkpoint = schema == "evidence_continuation_checkpoint.v1"
 
     print("\n" + "=" * 60)
     print("Human Confirmation Required")
@@ -156,11 +175,15 @@ async def _prompt_for_confirmation(function_call) -> dict:
     print(f"Pending tool call: {original_tool_name}")
     if hint:
         print(f"Hint: {hint}")
-    print("\nProposed execution plan:")
-    print(_render_plan_confirmation(payload))
+    print("\nConfirmation payload:")
+    print(_render_confirmation_payload(payload))
     print("\nRespond with:")
     print("- approve")
-    print("- revise: <feedback>")
+    if is_evidence_checkpoint:
+        print("- stop")
+        print("- stop: <feedback>")
+    else:
+        print("- revise: <feedback>")
 
     while True:
         raw = await asyncio.get_event_loop().run_in_executor(
@@ -172,6 +195,23 @@ async def _prompt_for_confirmation(function_call) -> dict:
             return {
                 "confirmed": True,
                 "payload": {"decision": "approve"},
+            }
+        if is_evidence_checkpoint and lowered.startswith("stop:"):
+            feedback = raw.split(":", 1)[1].strip()
+            return {
+                "confirmed": True,
+                "payload": {"decision": "stop", "feedback": feedback},
+            }
+        if is_evidence_checkpoint and lowered in {"stop", "s", "reject", "rejected", "no", "n", "revise", "r"}:
+            return {
+                "confirmed": True,
+                "payload": {"decision": "stop"},
+            }
+        if is_evidence_checkpoint and lowered.startswith("revise:"):
+            feedback = raw.split(":", 1)[1].strip()
+            return {
+                "confirmed": True,
+                "payload": {"decision": "stop", "feedback": feedback},
             }
         if lowered.startswith("revise:"):
             feedback = raw.split(":", 1)[1].strip()
@@ -195,7 +235,10 @@ async def _prompt_for_confirmation(function_call) -> dict:
                 "confirmed": True,
                 "payload": {"decision": "revise", "feedback": feedback},
             }
-        print("Invalid response. Use 'approve' or 'revise: <feedback>'.")
+        if is_evidence_checkpoint:
+            print("Invalid response. Use 'approve' or 'stop'.")
+        else:
+            print("Invalid response. Use 'approve' or 'revise: <feedback>'.")
 
 
 async def _run_native_workflow_turn(
@@ -255,10 +298,21 @@ async def _run_native_workflow_turn(
 
         if request_confirmation_call is not None:
             if confirmation_handler is None:
-                confirmation_response = {
-                    "confirmed": True,
-                    "payload": {"decision": "approve"},
-                }
+                _, payload = _extract_confirmation_payload(request_confirmation_call)
+                schema = str(payload.get("schema", "")).strip().lower() if isinstance(payload, dict) else ""
+                if schema == "evidence_continuation_checkpoint.v1":
+                    confirmation_response = {
+                        "confirmed": True,
+                        "payload": {
+                            "decision": "approve",
+                            "feedback": "No confirmation handler configured; continuing additional evidence collection.",
+                        },
+                    }
+                else:
+                    confirmation_response = {
+                        "confirmed": True,
+                        "payload": {"decision": "approve"},
+                    }
             else:
                 confirmation_response = await confirmation_handler(request_confirmation_call)
 
