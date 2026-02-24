@@ -20,42 +20,75 @@ The AI Co-Scientist helps researchers:
 ```mermaid
 flowchart TB
     U["User (ADK Web or CLI)"] --> R["ADK Runner + Session State"]
-    R --> W["SequentialAgent workflow<br/>clarifier -> plan_approval_loop -> evidence_refinement_loop -> report_synthesizer"]
-    W --> C["ADK tool confirmation<br/>request_plan_confirmation"]
-    C --> U
-    W --> M["MCPToolset -> research-mcp/server.js"]
+    R --> W["SequentialAgent co_scientist_workflow<br/>planner → evidence_executor → report_synthesizer"]
+    W --> M["MCPToolset → research-mcp/server.js"]
+    M --> W
+    W --> U
 ```
 
-## Dynamic Workflow (Detailed)
+## Dynamic Workflow
 
 Source of truth: `adk-agent/co_scientist/workflow.py`.
 
 ```mermaid
 flowchart TD
-    U["User question"] --> C["clarifier (LlmAgent)<br/>normalize objective + constraints"]
-    C --> P["planner (LlmAgent)<br/>emit PlanDraft JSON (steps + planned_tools)"]
-    P --> R["plan_reviewer (LlmAgent)<br/>forced tool call: request_plan_confirmation"]
-    R --> H{"Human decision"}
-    H -->|revise| P
-    H -->|approve| E["evidence_refinement_loop (LoopAgent)"]
-    R -->|pending confirmation| B["Execution blocked until plan approval"]
-    B --> H
+    U["User question or command"] --> P["planner (LlmAgent)<br/>parse objective → emit plan JSON"]
 
-    E --> X["evidence_executor (LlmAgent)<br/>run approved MCP tools only"]
-    X --> Y{"evidence_critic (LlmAgent)<br/>sufficient evidence?"}
-    Y -->|no| X
-    Y -->|yes| S["report_synthesizer (LlmAgent)<br/>final structured answer"]
+    P --> AP{"Plan pending approval?"}
+    AP -->|yes| H["User reviews plan"]
+    H -->|approve / lgtm| EX
+    H -->|revise + feedback| P
+    AP -->|no / auto| EX
+
+    EX["evidence_executor (LlmAgent)<br/>execute plan steps via MCP tools"]
+    EX -->|all steps done| AUTO{"Auto-synthesize?"}
+    EX -->|partial / blocked| WAIT["User prompted:<br/>continue · finalize"]
+    WAIT -->|continue| EX
+    WAIT -->|finalize| SY
+
+    AUTO -->|yes| SY
+    AUTO -->|no| WAIT
+
+    SY["report_synthesizer (LlmAgent)<br/>final Markdown report with source citations"]
+    SY --> DONE["Report displayed to user"]
+    DONE -->|follow-up question| P
+
+    subgraph "History & Rollback"
+        CMD["history · rollback · switch N"]
+        CMD --> ARCH["Archive current → restore selected cycle"]
+        ARCH --> DONE2["Restored state displayed"]
+    end
+
+    U -.->|command| CMD
 
     classDef llm fill:#eef2f7,stroke:#5f6b7a,stroke-width:1.5px,color:#1f2933;
     classDef guard fill:#f3f4f6,stroke:#6b7280,stroke-width:1.5px,color:#1f2933;
-    class C,P,R,X,Y,S llm;
-    class H,B,E guard;
+    classDef cmd fill:#fef9c3,stroke:#ca8a04,stroke-width:1.5px,color:#1f2933;
+    class P,EX,SY llm;
+    class AP,AUTO,H,WAIT guard;
+    class CMD,ARCH,DONE2 cmd;
 ```
 
-Guardrails currently enforced in code:
-- `_prepare_plan_gate_for_new_query` resets approval state for each new query.
-- `_block_until_plan_approved` blocks evidence and synthesis until approval.
-- `_guard_evidence_tool_execution` blocks tools not present in `approved_tools`.
+## User Commands
+
+| Command | When | What it does |
+|---------|------|-------------|
+| `approve` / `yes` / `lgtm` / `go ahead` | Plan pending approval | Approve the plan and start execution |
+| *(any other text while plan is pending)* | Plan pending approval | Treat as revision feedback — planner regenerates |
+| `continue` / `next` / `go` | Execution paused | Resume executing remaining plan steps |
+| `finalize` / `summarize now` | Any time after execution | Skip remaining steps and generate final report |
+| `history` | Any time | List all archived + active research cycles |
+| `rollback` | Any time | Archive current cycle and restore the most recent prior cycle |
+| `switch N` | Any time | Archive current cycle and restore cycle number N |
+| *(new question)* | After a report | Archives current cycle, starts fresh planning |
+
+## Guardrails
+
+- **HITL plan gate** — `before_agent_callback` blocks executor and synthesizer until the plan is approved.
+- **Error callbacks** — `on_model_error_callback` and `on_tool_error_callback` surface rate-limit and tool failures to the user instead of silently crashing.
+- **Step renumbering** — follow-up plans with non-sequential IDs are canonically renumbered to `S1, S2, ...`.
+- **Source citations** — final reports cite human-readable database names (PubMed, ClinicalTrials.gov, etc.), never raw tool names or JSON URLs.
+- **Research history** — up to 10 prior research cycles are archived with full state; rollback restores any previous cycle.
 
 ## Quick Start
 
@@ -166,10 +199,10 @@ bash scripts/deploy_cloud_run.sh
 │   ├── agent.py            # ADK-native CLI wrapper (interactive/single query)
 │   ├── server.py           # FastAPI HTTP wrapper for Cloud Run
 │   ├── co_scientist/
-│   │   ├── __init__.py     # Exports root_agent used by `adk run co_scientist`
-│   │   └── workflow.py    # Canonical ADK workflow graph + HITL gate
+│   │   ├── __init__.py     # Exports root_agent for `adk run` / `adk web`
+│   │   └── workflow.py     # Workflow graph, HITL, history/rollback, callbacks
 │   ├── .adk/               # ADK local sessions/artifacts (created at runtime)
-│   └── test_*.py           # Lean core regression suite
+│   └── test_*.py           # Core regression suite
 │
 ├── research-mcp/           # Research Tools Server (Node.js)
 │   ├── server.js           # MCP tool server
