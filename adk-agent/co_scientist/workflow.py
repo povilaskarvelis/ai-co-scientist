@@ -238,7 +238,8 @@ Output requirements:
   {
     "schema": "step_execution_result.v1",
     "step_id": "S1",
-    "reasoning_trace": "<your reasoning: what you searched, why, what you observed, and your conclusion>",
+    "reasoning_trace": "REASON: <why you chose this approach>\\nACT: <what tool you called and with what parameters>\\nOBSERVE: <what the results showed>\\nCONCLUDE: <your conclusion and whether the step goal is met>",
+    "tools_called": ["tool_name_1", "tool_name_2"],
     "status": "completed" | "blocked",
     "step_progress_note": "<1-2 sentence progress update>",
     "result_summary": "<concise findings summary>",
@@ -246,7 +247,8 @@ Output requirements:
     "open_gaps": ["..."],
     "suggested_next_searches": ["..."]
   }
-- The reasoning_trace MUST describe your Reason-Act-Observe chain: what you searched, why you chose that approach, what the results showed, and how you reached your conclusion.
+- The reasoning_trace MUST use labeled phases (REASON, ACT, OBSERVE, CONCLUDE) to clearly show each step of the Reason-Act-Observe cycle. If you made multiple tool calls, include multiple ACT/OBSERVE pairs.
+- The tools_called list MUST contain the names of every MCP tool you invoked during this step.
 """
 
 
@@ -651,6 +653,8 @@ def _initialize_task_state_from_plan(plan: dict[str, Any], *, objective_text: st
             "open_gaps": [],
             "suggested_next_searches": [],
             "step_progress_note": "",
+            "reasoning_trace": "",
+            "tools_called": [],
         }
         for step in validated["steps"]
     ]
@@ -809,6 +813,81 @@ def _render_executor_progress_markdown(task_state: dict[str, Any], step_result: 
 
 
 
+_REACT_PHASE_LABELS = ("REASON", "ACT", "OBSERVE", "CONCLUDE")
+_REACT_PHASE_RE = re.compile(
+    r"(?:^|\n)\s*(?:\*\*)?(" + "|".join(_REACT_PHASE_LABELS) + r")(?:\*\*)?:\s*",
+    re.IGNORECASE,
+)
+
+
+def _parse_react_phases(trace: str) -> dict[str, str] | None:
+    """Parse a reasoning_trace string into labeled ReAct phases.
+
+    Returns a dict like {"REASON": "...", "ACT": "...", ...} if at least
+    REASON and one other phase are found, otherwise None (caller falls back
+    to rendering the trace as-is).
+    """
+    if not trace:
+        return None
+    splits = _REACT_PHASE_RE.split(trace)
+    if len(splits) < 3:
+        return None
+    phases: dict[str, str] = {}
+    i = 1
+    while i < len(splits) - 1:
+        label = splits[i].upper()
+        text = splits[i + 1].strip()
+        if label in phases:
+            phases[label] += " " + text
+        else:
+            phases[label] = text
+        i += 2
+    if "REASON" not in phases or len(phases) < 2:
+        return None
+    return phases
+
+
+def _render_react_trace_block(
+    reasoning_trace: str,
+    tools_called: list[str],
+) -> list[str]:
+    """Render the ReAct reasoning trace as a visually structured block."""
+    lines: list[str] = []
+    if not reasoning_trace and not tools_called:
+        return lines
+
+    lines.append("**ReAct Trace**")
+    lines.append("")
+
+    phases = _parse_react_phases(reasoning_trace)
+    if phases:
+        for label in _REACT_PHASE_LABELS:
+            text = phases.get(label, "").strip()
+            if not text:
+                continue
+            lines.append(f"> **{label.capitalize()}:** {text}")
+            lines.append(">")
+        if lines and lines[-1] == ">":
+            lines.pop()
+    elif reasoning_trace:
+        for trace_line in reasoning_trace.split("\n"):
+            lines.append(f"> {trace_line.strip()}")
+
+    if tools_called:
+        source_labels = []
+        for tool_name in tools_called:
+            source = TOOL_SOURCE_NAMES.get(tool_name, "")
+            if source and source not in source_labels:
+                source_labels.append(source)
+        tools_display = ", ".join(f"`{t}`" for t in tools_called)
+        lines.append("")
+        data_sources = f" ({', '.join(source_labels)})" if source_labels else ""
+        lines.append(f"**Tools used:** {tools_display}{data_sources}")
+
+    lines.append("")
+    return lines
+
+
 def _render_react_step_progress(task_state: dict[str, Any], result: dict[str, Any], reasoning_trace: str) -> str:
     """Render progress for a single ReAct step iteration."""
     step_id = str(result.get("step_id", "")).strip()
@@ -818,12 +897,16 @@ def _render_react_step_progress(task_state: dict[str, Any], result: dict[str, An
         step = {}
     status = str(result.get("status", step.get("status", ""))).strip()
     goal = str(step.get("goal", "")).strip()
+    tools_called = list(step.get("tools_called", []) or [])
 
     lines = [f"### {step_id} · `{status}`", ""]
     if goal:
         lines.extend([f"**Goal:** {goal}", ""])
-    if reasoning_trace:
-        lines.extend([f"**Reasoning:** {reasoning_trace}", ""])
+
+    react_block = _render_react_trace_block(reasoning_trace, tools_called)
+    if react_block:
+        lines.extend(react_block)
+
     progress_note = str(result.get("step_progress_note", "")).strip()
     if progress_note:
         lines.extend([progress_note, ""])
@@ -1072,6 +1155,11 @@ def _synth_context_instructions(task_state: dict[str, Any], callback_context: Ca
                 "source": _resolve_source_label(step.get("tool_hint", "")),
                 "status": step.get("status"),
                 "reasoning_trace": step.get("reasoning_trace", ""),
+                "tools_called": list(step.get("tools_called", []) or []),
+                "data_sources_queried": _dedupe_str_list(
+                    [TOOL_SOURCE_NAMES.get(t, t) for t in (step.get("tools_called") or [])],
+                    limit=10,
+                ),
                 "result_summary": step.get("result_summary", ""),
                 "evidence_ids": list(step.get("evidence_ids", []) or [])[:20],
                 "open_gaps": list(step.get("open_gaps", []) or [])[:10],
@@ -1149,6 +1237,7 @@ def _validate_step_execution_result(raw: dict[str, Any]) -> dict[str, Any]:
             "suggested_next_searches",
             limit=15,
         ),
+        "tools_called": _as_string_list(raw.get("tools_called"), "tools_called", limit=20),
     }
 
 
@@ -1171,6 +1260,7 @@ def _apply_step_execution_result_to_task_state(
     step["evidence_ids"] = validated["evidence_ids"]
     step["open_gaps"] = validated["open_gaps"]
     step["suggested_next_searches"] = validated["suggested_next_searches"]
+    step["tools_called"] = validated.get("tools_called", [])
 
     if validated["status"] == "completed":
         task_state["last_completed_step_id"] = validated["step_id"]

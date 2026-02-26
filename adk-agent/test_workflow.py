@@ -200,10 +200,81 @@ def test_react_step_rendering_includes_trace():
     rendered = workflow._render_react_step_progress(
         task_state, result, "Searched PubMed for LRRK2, found 5 relevant RCTs."
     )
-    assert "Reasoning:" in rendered
+    assert "ReAct Trace" in rendered
     assert "LRRK2" in rendered
     assert "PMID:111" in rendered
     assert "1/2 steps complete" in rendered
+
+
+def test_parse_react_phases_structured():
+    trace = (
+        "REASON: I need to find IPF publications.\n"
+        "ACT: Called search_pubmed with query 'IPF treatment'.\n"
+        "OBSERVE: Found 15 results including 3 RCTs.\n"
+        "CONCLUDE: Sufficient data for this step."
+    )
+    phases = workflow._parse_react_phases(trace)
+    assert phases is not None
+    assert "REASON" in phases
+    assert "ACT" in phases
+    assert "OBSERVE" in phases
+    assert "CONCLUDE" in phases
+    assert "IPF publications" in phases["REASON"]
+    assert "search_pubmed" in phases["ACT"]
+
+
+def test_parse_react_phases_returns_none_for_unstructured():
+    assert workflow._parse_react_phases("Just a flat reasoning string.") is None
+    assert workflow._parse_react_phases("") is None
+
+
+def test_render_react_trace_block_with_tools():
+    trace = (
+        "REASON: Need publication data.\n"
+        "ACT: Queried PubMed.\n"
+        "OBSERVE: Got 10 results.\n"
+        "CONCLUDE: Done."
+    )
+    lines = workflow._render_react_trace_block(trace, ["search_pubmed", "get_pubmed_abstract"])
+    text = "\n".join(lines)
+    assert "ReAct Trace" in text
+    assert "Reason:" in text
+    assert "Act:" in text
+    assert "Observe:" in text
+    assert "Conclude:" in text
+    assert "`search_pubmed`" in text
+    assert "PubMed" in text
+
+
+def test_render_react_step_progress_with_structured_trace():
+    task_state = {
+        "objective": "test",
+        "plan_status": "ready",
+        "current_step_id": "S2",
+        "steps": [
+            {
+                "id": "S1", "status": "completed", "goal": "Find papers",
+                "tools_called": ["search_pubmed"],
+            },
+            {"id": "S2", "status": "pending", "goal": "Check trials"},
+        ],
+    }
+    result = {
+        "step_id": "S1",
+        "status": "completed",
+        "step_progress_note": "Done.",
+        "result_summary": "Found 5 papers.",
+        "evidence_ids": ["PMID:111"],
+        "open_gaps": [],
+    }
+    trace = "REASON: Need IPF data.\nACT: Searched PubMed.\nOBSERVE: Found results.\nCONCLUDE: Step complete."
+    rendered = workflow._render_react_step_progress(task_state, result, trace)
+    assert "ReAct Trace" in rendered
+    assert "> **Reason:**" in rendered
+    assert "> **Act:**" in rendered
+    assert "> **Observe:**" in rendered
+    assert "> **Conclude:**" in rendered
+    assert "`search_pubmed`" in rendered
 
 
 def test_resolve_source_label():
