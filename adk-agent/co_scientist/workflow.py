@@ -57,6 +57,7 @@ STATE_PLANNER_RENDERED = "temp:co_scientist_planner_rendered"
 STATE_EXECUTOR_RENDERED = "temp:co_scientist_executor_rendered"
 STATE_EXECUTOR_ACTIVE_STEP_ID = "temp:co_scientist_executor_active_step_id"
 STATE_REACT_PARSE_RETRIES = "temp:co_scientist_react_parse_retries"
+STATE_EXECUTOR_LAST_PROSE = "temp:co_scientist_executor_last_prose"
 MAX_REACT_PARSE_RETRIES = 2
 STATE_EXECUTOR_PREV_STEP_STATUS = "temp:co_scientist_executor_prev_step_status"
 STATE_PLAN_PENDING_APPROVAL = "co_scientist_plan_pending_approval"
@@ -123,8 +124,26 @@ KNOWN_MCP_TOOLS = [
 ]
 
 TOOL_SOURCE_NAMES: dict[str, str] = {
+    # Generic BQ tool names (fallback when no dataset hint is available)
     "list_bigquery_tables": "BigQuery",
     "run_bigquery_select_query": "BigQuery",
+    # BigQuery dataset names — used as tool_hint by the planner for precise source attribution
+    "open_targets_platform": "Open Targets Platform",
+    "ebi_chembl": "ChEMBL",
+    "gnomad": "gnomAD",
+    "human_genome_variants": "Human Genome Variants",
+    "human_variant_annotation": "Ensembl Variant Annotations",
+    "deepmind_alphafold": "AlphaFold",
+    "immune_epitope_db": "IEDB",
+    "nlm_rxnorm": "RxNorm",
+    "fda_drug": "FDA Drug Labels",
+    "umiami_lincs": "LINCS L1000",
+    "ebi_surechembl": "SureChEMBL",
+    "pmc_open_access_commercial": "PubMed Central",
+    "breathe": "bioRxiv / arXiv",
+    "hackathon_data": "CIViC / ClinGen",
+    "civic": "CIViC",
+    "clingen": "ClinGen",
     "benchmark_dataset_overview": "Benchmark Datasets",
     "sample_pubmedqa_examples": "PubMedQA",
     "sample_bioasq_examples": "BioASQ",
@@ -192,7 +211,7 @@ Output requirements:
       {
         "id": "S1",
         "goal": "...",
-        "tool_hint": "<single best tool or tool family>",
+        "tool_hint": "<single best tool, tool family, or BigQuery dataset name (e.g. open_targets_platform, pmc_open_access_commercial, gnomad)>",
         "completion_condition": "..."
       }
     ]
@@ -410,6 +429,7 @@ def _clear_turn_temp_state(callback_context: CallbackContext) -> None:
     callback_context.state[STATE_EXECUTOR_BUFFER] = ""
     callback_context.state[STATE_SYNTH_BUFFER] = ""
     callback_context.state[STATE_PLANNER_RENDERED] = ""
+    callback_context.state[STATE_EXECUTOR_LAST_PROSE] = ""
     callback_context.state[STATE_EXECUTOR_RENDERED] = ""
     callback_context.state[STATE_EXECUTOR_ACTIVE_STEP_ID] = ""
     callback_context.state[STATE_EXECUTOR_PREV_STEP_STATUS] = ""
@@ -748,9 +768,12 @@ def _render_plan_markdown(task_state: dict[str, Any]) -> str:
         lines.append(f"**Objective:** {objective}")
         lines.append("")
     for step in task_state.get("steps", []):
+        tool_hint = step.get("tool_hint", "").strip()
+        source_label = _resolve_source_label(tool_hint)
+        source_display = source_label if source_label else tool_hint
         lines.append(
             f"1. **{step.get('id', 'S?')}**: {step.get('goal', '').strip()} "
-            f"(tool: `{step.get('tool_hint', '').strip()}`)"
+            f"*(source: {source_display})*"
         )
         lines.append(f"Completion: {step.get('completion_condition', '').strip()}")
     return "\n".join(lines).strip()
@@ -1597,11 +1620,23 @@ def _react_before_model_callback(*, callback_context: CallbackContext, llm_reque
     llm_request.config.response_mime_type = None
     instructions = _react_step_context_instructions(task_state, active_step)
     if retries > 0:
-        instructions.append(
-            "IMPORTANT: Your previous response was NOT valid JSON and could not be parsed. "
-            "You MUST return ONLY a raw JSON object matching `step_execution_result.v1`. "
-            "Do NOT wrap it in markdown fences. Do NOT return prose or markdown."
-        )
+        last_prose = str(callback_context.state.get(STATE_EXECUTOR_LAST_PROSE, "") or "").strip()
+        if last_prose:
+            instructions.append(
+                "CRITICAL — JSON FORMAT REQUIRED: Your previous response was plain prose, not JSON. "
+                "Your previous output was:\n"
+                f"---\n{last_prose}\n---\n"
+                "Do NOT make any more tool calls. Do NOT repeat the prose. "
+                "Using ONLY the findings above, output a single raw JSON object matching "
+                "`step_execution_result.v1`. The very first character of your response MUST be `{`."
+            )
+        else:
+            instructions.append(
+                "CRITICAL — JSON FORMAT REQUIRED: Your previous response could not be parsed as JSON. "
+                "You MUST return ONLY a raw JSON object matching `step_execution_result.v1`. "
+                "Do NOT make additional tool calls. Do NOT write prose or markdown. "
+                "The very first character of your response MUST be `{`."
+            )
     llm_request.append_instructions(instructions)
     return None
 
@@ -1660,11 +1695,46 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
             )
             return _replace_llm_response_text(llm_response, "")
 
+        callback_context.state[STATE_REACT_PARSE_RETRIES] = 0
+        last_prose = str(callback_context.state.get(STATE_EXECUTOR_LAST_PROSE, "") or "").strip()
+        callback_context.state[STATE_EXECUTOR_LAST_PROSE] = ""
+
+        # If the model returned actual prose (it gathered data but couldn't format JSON),
+        # salvage it as a completed step rather than blocking entirely.
+        if last_prose and task_state and active_step_id:
+            logger.warning(
+                "[react:after] %s for step %s — max retries exhausted but prose output found; "
+                "salvaging as completed step",
+                error_label, active_step_id,
+            )
+            try:
+                _, step = _find_step(task_state, active_step_id)
+                step["status"] = "completed"
+                step["result_summary"] = last_prose[:1500]
+                step["reasoning_trace"] = (
+                    f"Step completed via prose fallback after {MAX_REACT_PARSE_RETRIES + 1} "
+                    f"JSON formatting attempts. {error_label}: {error_msg}"
+                )
+                next_id = _next_pending_step_id(task_state)
+                task_state["current_step_id"] = next_id
+                new_plan_status = "completed" if next_id is None else "ready"
+                task_state["plan_status"] = new_plan_status
+                callback_context.state[STATE_WORKFLOW_TASK] = task_state
+                if new_plan_status == "completed":
+                    callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
+                rendered = (
+                    f"### {active_step_id} · completed _(via prose fallback)_\n\n"
+                    f"{last_prose[:800]}{'…' if len(last_prose) > 800 else ''}\n\n---"
+                )
+                _append_executor_rendered(callback_context, rendered)
+                return _replace_llm_response_text(llm_response, rendered)
+            except Exception:  # noqa: BLE001
+                pass
+
         logger.error(
             "[react:after] %s for step %s — max retries exhausted, marking blocked",
             error_label, active_step_id,
         )
-        callback_context.state[STATE_REACT_PARSE_RETRIES] = 0
         if task_state and active_step_id:
             try:
                 _, step = _find_step(task_state, active_step_id)
@@ -1673,8 +1743,11 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
                 step["reasoning_trace"] = f"Execution failed: {error_label}. {error_msg}"
                 next_id = _next_pending_step_id(task_state)
                 task_state["current_step_id"] = next_id
-                task_state["plan_status"] = "completed" if next_id is None else "blocked"
+                new_plan_status = "completed" if next_id is None else "blocked"
+                task_state["plan_status"] = new_plan_status
                 callback_context.state[STATE_WORKFLOW_TASK] = task_state
+                if new_plan_status == "completed":
+                    callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
             except Exception:  # noqa: BLE001
                 pass
         rendered = (
@@ -1687,6 +1760,9 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
 
     if parsed is None or task_state is None:
         logger.warning("[react:after] parse failed (parse_error=%s)", parse_error)
+        raw_combined = (str(callback_context.state.get(STATE_EXECUTOR_BUFFER, "") or "") + text).strip()
+        if raw_combined:
+            callback_context.state[STATE_EXECUTOR_LAST_PROSE] = raw_combined[:3000]
         return _handle_step_error("JSON parse error", parse_error or "Failed to parse step result JSON")
 
     reasoning_trace = str(parsed.pop("reasoning_trace", "") or "").strip()
@@ -1886,6 +1962,9 @@ def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) 
         bq_policy = (
             "- BigQuery-first policy:\n"
             f"{BQ_DATASET_CATALOG}"
+            "\n- tool_hint for BigQuery steps: use the specific dataset name (e.g. open_targets_platform,"
+            " pmc_open_access_commercial, gnomad, ebi_chembl, deepmind_alphafold, fda_drug, hackathon_data)"
+            " rather than run_bigquery_select_query, so the plan clearly shows which source is being accessed."
         )
     else:
         bq_policy = "- BigQuery-first policy is disabled for this run."
