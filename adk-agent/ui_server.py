@@ -301,7 +301,7 @@ def _steps_from_workflow_state(wf_state: dict | None) -> list[dict]:
         {
             "title": step.get("goal", f"Step {step.get('id', '?')}"),
             "instruction": (
-                f"Source: {_source_label(step.get('tool_hint', ''))}. "
+                f"Potential source: {_source_label(step.get('tool_hint', ''))}. "
                 f"Done when: {str(step.get('completion_condition', '')).strip()}"
             ),
             "status": step.get("status", "pending"),
@@ -346,9 +346,9 @@ def _normalize_steps_for_ui(steps: list[dict] | None) -> list[dict]:
                 completion = done_match.group(1).strip()
 
         if source and completion:
-            step["instruction"] = f"Source: {source}. Done when: {completion}"
+            step["instruction"] = f"Potential source: {source}. Done when: {completion}"
         elif source:
-            step["instruction"] = f"Source: {source}."
+            step["instruction"] = f"Potential source: {source}."
         elif completion:
             step["instruction"] = f"Done when: {completion}"
 

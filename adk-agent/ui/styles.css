@@ -658,6 +658,48 @@ body.expanded .messages {
   color: #ebf2ff;
 }
 
+.checkpoint-message .plan-steps {
+  margin: 0.7em 0 0.4em;
+  padding-left: 1.4em;
+  list-style: decimal;
+}
+
+.checkpoint-message .plan-steps > li {
+  margin: 0.85em 0;
+  padding-left: 0.2em;
+  line-height: 1.45;
+}
+
+.plan-step-title {
+  display: block;
+  font-weight: 600;
+  color: #e8f0fb;
+  font-size: 0.9rem;
+}
+
+.plan-step-details {
+  margin: 0.35em 0 0 0.15em !important;
+  padding-left: 0.75em !important;
+  list-style: none !important;
+  border-left: 2px solid #2d3d52;
+}
+
+.plan-step-details > li {
+  margin: 0.22em 0 !important;
+  font-size: 0.83rem;
+  color: #a8b8cc;
+  line-height: 1.4;
+}
+
+.plan-step-label {
+  font-weight: 500;
+  color: #6b8aaa;
+  margin-right: 0.35em;
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+}
+
 /* In activity logs, visually nest bullet details under numbered workflow steps. */
 .activity-details ol + ul {
   margin-left: 0.95rem;

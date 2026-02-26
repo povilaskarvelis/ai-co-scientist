@@ -92,43 +92,32 @@ FINAL_SYNTHESIS_SCHEMA = "final_synthesis.v1"
 WORKFLOW_TASK_SCHEMA = "workflow_task_state.v1"
 
 KNOWN_MCP_TOOLS = [
+    # BigQuery (primary data source — covers gene info, disease ontology,
+    # drug labels, literature, preprints, variant annotations, and more)
     "list_bigquery_tables",
     "run_bigquery_select_query",
-    "benchmark_dataset_overview",
-    "sample_pubmedqa_examples",
-    "sample_bioasq_examples",
-    "check_gpqa_access",
-    "search_diseases",
-    "expand_disease_context",
-    "search_targets",
-    "search_disease_targets",
-    "get_target_info",
-    "check_druggability",
-    "get_target_drugs",
-    "summarize_target_expression_context",
-    "summarize_target_competitive_landscape",
-    "summarize_target_safety_liabilities",
-    "compare_targets_multi_axis",
+    # Clinical trials (live registry, no BQ equivalent)
     "search_clinical_trials",
     "get_clinical_trial",
     "summarize_clinical_trials_landscape",
-    "search_pubmed",
-    "search_pubmed_advanced",
-    "get_pubmed_abstract",
-    "get_pubmed_paper_details",
-    "get_pubmed_author_profile",
+    # Post-marketing safety aggregations (richer event-level rollups than BQ)
+    "summarize_openfda_adverse_events",
+    # Researcher discovery (live index, no BQ equivalent)
     "search_openalex_works",
     "search_openalex_authors",
     "rank_researchers_by_activity",
     "get_researcher_contact_candidates",
-    "search_chembl_compounds_for_target",
-    "search_gwas_associations",
-    "infer_genetic_effect_direction",
-    "search_clinvar_variants",
-    "get_clinvar_variant_details",
+    # Protein profiles (detailed isoforms/PTMs beyond AlphaFold metadata)
+    "search_uniprot_proteins",
+    "get_uniprot_protein_profile",
+    # Pathway hierarchy (Reactome API returns full pathway trees)
     "search_reactome_pathways",
+    # Protein-protein interactions (no STRING data in BQ)
     "get_string_interactions",
-    "get_gene_info",
+    # Benchmarks
+    "benchmark_dataset_overview",
+    "check_gpqa_access",
+    # Local data
     "list_local_datasets",
     "read_local_dataset",
 ]
@@ -1791,14 +1780,96 @@ def _synth_after_model_callback(*, callback_context: CallbackContext, llm_respon
     return _replace_llm_response_text(llm_response, final_markdown)
 
 
+BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_tables` and `run_bigquery_select_query`):
+
+  === Drug targets, diseases & evidence ===
+  **bigquery-public-data.open_targets_platform** — Comprehensive drug target data:
+    - disease, target, interaction, expression: disease-target associations, tractability/druggability
+    - known_drug, drug_molecule, drug_mechanism_of_action, drug_warning: drugs and safety
+    - evidence_* tables (evidence_gwas_credible_sets, evidence_chembl, evidence_clingen, evidence_reactome,
+      evidence_eva, evidence_intogen, evidence_gene_burden, etc.): all evidence types
+    - openfda_significant_adverse_drug_reactions: post-marketing safety signals
+    - go, mouse_phenotype, literature: gene ontology, phenotypes, literature mining
+    - l2g_prediction, credible_set, colocalisation: genetic evidence and variant-to-gene mapping
+
+  === Chemistry & bioactivity ===
+  **bigquery-public-data.ebi_chembl** — Bioactive compounds, target bioactivity (IC50/Ki/EC50), assay data,
+    mechanism of action, drug indications. Tables: activities, compound_records, target_dictionary, etc.
+  **bigquery-public-data.ebi_surechembl** — Chemical structures extracted from patents. Tables: map, match.
+    Use for chemical IP landscape and freedom-to-operate analysis.
+
+  === Genomics & variants ===
+  **bigquery-public-data.gnomAD** — Population allele frequencies by chromosome (v2_1_1_exomes__chr*,
+    v2_1_1_genomes__chr*). Use for variant frequency lookups and gene constraint analysis.
+  **bigquery-public-data.human_genome_variants** — 1000 Genomes Phase 3 variants, Platinum Genomes,
+    Simons Genome Diversity Project. Tables: *_variants_*, *_sample_info, *_pedigree.
+  **bigquery-public-data.human_variant_annotation** — Ensembl variant annotations (1000 Genomes, ESP6500)
+    across hg19/hg38 builds (release 89 & 93). Functional consequence, SIFT, PolyPhen scores.
+
+  === Protein structure ===
+  **bigquery-public-data.deepmind_alphafold** — AlphaFold protein structure predictions. Tables: metadata
+    (UniProt accession, organism, confidence metrics, PDB/CIF URLs). Use to assess structural druggability
+    and binding-site availability for targets lacking experimental crystal structures.
+
+  === Immunology ===
+  **bigquery-public-data.immune_epitope_db** — IEDB: immune epitopes, B-cell assays, MHC ligand binding,
+    T-cell receptor data. Tables: epitope_full_v3, bcell_full_v3, mhc_ligand_full, receptor_full_v3, etc.
+    Use for immunotherapy target assessment and vaccine design.
+
+  === Drug nomenclature & regulatory ===
+  **bigquery-public-data.nlm_rxnorm** — RxNorm drug nomenclature, ingredient relationships, and
+    clinical drug pathways. Use for standardizing drug names across sources.
+  **bigquery-public-data.fda_drug** — FDA drug labels and enforcement actions. Tables: drug_label,
+    drug_enforcement. Structured alternative to openFDA API for label lookups.
+
+  === Perturbation biology ===
+  **bigquery-public-data.umiami_lincs** — LINCS L1000 perturbation signatures: cell lines, small molecules,
+    nucleic acid reagents, readouts, and perturbation signatures. Use for drug repurposing hypotheses
+    and mechanism-of-action characterization.
+
+  === Literature & preprints ===
+  **bigquery-public-data.pmc_open_access_commercial** — PubMed Central full-text articles with vector
+    embeddings. Tables: articles (pmid, pmc_id, title, author, article_text, pmc_link,
+    ml_generate_embedding_result), pmc_metadata. Use SEARCH() for keyword search, VECTOR_SEARCH()
+    for semantic similarity. Provides complete article text, not just abstracts.
+  **bigquery-public-data.breathe** — Full-text bioRxiv preprints, arxiv papers, and BioASQ QA data.
+    Tables: biorxiv, arxiv, bioasq. Complements PMC for preprint literature.
+
+  === Hackathon project data ===
+  **hackathon_data** (project dataset) — Contains:
+    - civic_* tables: Cancer variant clinical interpretations (assertions, evidence, variants, molecular profiles)
+    - clingen_* tables: Gene-disease validity, variant pathogenicity, dosage sensitivity, actionability
+
+  Start every structured data lookup with BigQuery. Use `list_bigquery_tables` to discover table schemas.
+  Write Standard SQL via `run_bigquery_select_query`. Fall back to non-BigQuery MCP tools only for:
+    - ClinicalTrials.gov (search_clinical_trials, get_clinical_trial, etc.)
+    - openFDA adverse event aggregations (summarize_openfda_adverse_events — richer rollups than fda_drug tables)
+    - OpenAlex researcher discovery (search_openalex_works, search_openalex_authors, etc.)
+    - UniProt protein profiles (detailed isoforms, PTMs beyond AlphaFold metadata)
+    - Reactome pathway hierarchies (search_reactome_pathways)
+    - STRING protein-protein interactions (get_string_interactions)
+  Do NOT use external APIs for: gene info (use open_targets_platform.target), disease ontology
+    (use open_targets_platform.disease), drug labels (use fda_drug.drug_label), literature search
+    (use pmc_open_access_commercial or breathe), preprints (use breathe.biorxiv/medrxiv),
+    variant annotations (use gnomAD, human_variant_annotation, human_genome_variants)."""
+
+
+BQ_EXECUTOR_POLICY = """- BigQuery-first policy: For any structured data lookup, prefer `list_bigquery_tables` \
+and `run_bigquery_select_query` over non-BQ tools. Available datasets include: \
+open_targets_platform (targets, diseases, drugs, evidence), ebi_chembl (bioactivity), \
+gnomAD (variant frequencies), human_genome_variants, human_variant_annotation (Ensembl), \
+deepmind_alphafold (protein structures), immune_epitope_db (IEDB), fda_drug (labels), \
+nlm_rxnorm (drug nomenclature), umiami_lincs (perturbation signatures), ebi_surechembl (patents), \
+pmc_open_access_commercial (PubMed Central full text), breathe (bioRxiv/arxiv/BioASQ), \
+and project hackathon_data (CIViC, ClinGen). Use `list_bigquery_tables` to discover schemas. \
+Fall back to non-BQ tools only for ClinicalTrials.gov, openFDA aggregations, OpenAlex, \
+UniProt, Reactome pathways, and STRING interactions."""
+
+
 def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
     tool_catalog = "\n".join(f"- {name}" for name in tool_hints[:80]) or "- No tools available."
     if prefer_bigquery:
-        bq_policy = (
-            "- BigQuery-first policy:\n"
-            "  - For structured/tabular analysis, start with `list_bigquery_tables` and `run_bigquery_select_query`.\n"
-            "  - Use non-BigQuery tools for enrichment, freshness gaps, or unavailable data."
-        )
+        bq_policy = BQ_EXECUTOR_POLICY
     else:
         bq_policy = "- BigQuery-first policy is disabled for this run."
 
@@ -1814,8 +1885,7 @@ def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) 
     if prefer_bigquery:
         bq_policy = (
             "- BigQuery-first policy:\n"
-            "  - Prefer `list_bigquery_tables` and `run_bigquery_select_query` for structured/tabular subtasks.\n"
-            "  - Use non-BigQuery tools for enrichment, freshness gaps, or unavailable data."
+            f"{BQ_DATASET_CATALOG}"
         )
     else:
         bq_policy = "- BigQuery-first policy is disabled for this run."

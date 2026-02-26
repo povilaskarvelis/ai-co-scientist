@@ -254,7 +254,7 @@ function latestCompletedTaskId(detail) {
   return "";
 }
 
-function planTextForIteration(iteration) {
+function planHtmlForIteration(iteration) {
   const activePlan = iteration?.active_plan_version;
   const task = iteration?.task || {};
   const steps = Array.isArray(activePlan?.steps)
@@ -262,25 +262,51 @@ function planTextForIteration(iteration) {
     : Array.isArray(task?.steps)
       ? task.steps
       : [];
-  if (!steps.length) return "Plan is not available yet.";
-  const lines = ["Here is the proposed plan:", ""];
+  if (!steps.length) return "<p>Plan is not available yet.</p>";
+
+  let html = "<p>Here is the proposed plan:</p><ol class=\"plan-steps\">";
   steps.forEach((step, idx) => {
-    const title = String(step?.title || `Step ${idx + 1}`).trim();
-    const instruction = String(step?.instruction || "").trim();
-    lines.push(`${idx + 1}. ${title}`);
-    if (instruction) lines.push(`- ${instruction}`);
+    const title = escapeHtml(String(step?.title || `Step ${idx + 1}`).trim());
+    let source = String(step?.source || "").trim();
+    let completion = String(step?.completion_condition || "").trim();
+
+    // Fall back to parsing the instruction string if structured fields are absent
+    if (!source || !completion) {
+      const instruction = String(step?.instruction || "").trim();
+      if (!source) {
+        const m = instruction.match(/(?:Potential source|Source):\s*([^.]+)/i);
+        if (m) source = m[1].trim();
+      }
+      if (!completion) {
+        const m = instruction.match(/Done when:\s*(.+)$/i);
+        if (m) completion = m[1].trim();
+      }
+    }
+
+    html += `<li><span class="plan-step-title">${title}</span>`;
+    if (source || completion) {
+      html += `<ul class="plan-step-details">`;
+      if (source) {
+        html += `<li><span class="plan-step-label">Potential source</span>${escapeHtml(source)}</li>`;
+      }
+      if (completion) {
+        html += `<li><span class="plan-step-label">Done when</span>${escapeHtml(completion)}</li>`;
+      }
+      html += `</ul>`;
+    }
+    html += `</li>`;
   });
-  return lines.join("\n");
+  html += `</ol>`;
+  return html;
 }
 
-function checkpointHtml(taskId, planText, showAction, buttonLabel) {
-  const body = markdownToHtml(planText || "");
+function checkpointHtml(taskId, planHtml, showAction, buttonLabel) {
   const action = showAction
     ? `<button class="primary-btn checkpoint-start-btn" data-action="checkpoint-start" data-task-id="${escapeHtml(taskId)}">${escapeHtml(buttonLabel || "Start research")}</button>`
     : "";
   return `
     <article class="message assistant checkpoint-message">
-      <div class="message-body markdown-body">${body}</div>
+      <div class="message-body markdown-body">${planHtml}</div>
       ${action}
     </article>
   `;
@@ -748,10 +774,10 @@ function renderMessages() {
       );
     }
 
-    const planText = planTextForIteration(iteration);
+    const planHtml = planHtmlForIteration(iteration);
     const awaiting = Boolean(task.awaiting_hitl);
     const buttonLabel = task.hitl_history && task.hitl_history.includes("continue") ? "Continue" : "Start research";
-    parts.push(checkpointHtml(task.task_id, planText, awaiting, buttonLabel));
+    parts.push(checkpointHtml(task.task_id, planHtml, awaiting, buttonLabel));
     if (activityCard && shouldPlaceAfterPlan) parts.push(activityCard);
 
     const reportCard = reportCardHtml(iteration);
