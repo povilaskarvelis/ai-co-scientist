@@ -367,6 +367,25 @@ body.expanded .workspace.report-open .report-panel {
   font-weight: 500;
   color: var(--muted);
   background: #0e0e0e;
+}
+
+.sidebar-footer {
+  padding: 12px 14px;
+  border-top: 1px solid var(--line);
+  margin-top: auto;
+}
+
+.sidebar-about-link {
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--muted);
+  text-decoration: none;
+  transition: color 0.15s;
+}
+
+.sidebar-about-link:hover {
+  color: var(--text);
   letter-spacing: 0.02em;
 }
 
@@ -509,13 +528,19 @@ body.expanded .messages {
   color: #dbe6f3;
   font: 500 0.76rem/1.45 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   white-space: normal;
-  max-height: 260px;
+  max-height: 420px;
   overflow: auto;
 }
 
 .activity-card.expanded .activity-preview {
   max-height: none;
   overflow: visible;
+}
+
+.activity-card.expanded .activity-details {
+  cursor: text;
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .message {
@@ -1063,5 +1088,160 @@ body.expanded .example-queries {
 
   .report-content {
     padding: 24px 22px 26px;
+  }
+}
+
+/* ── About page ─────────────────────────────────────────────────────────── */
+
+.about-body {
+  overflow: auto;
+}
+
+.about-page {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 40px 24px 60px;
+}
+
+.about-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 48px;
+}
+
+.about-back {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 0.85rem;
+  font-weight: 500;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 6px 12px;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.about-back:hover {
+  color: var(--text);
+  border-color: var(--text);
+}
+
+.about-brand {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.about-content h2 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin: 0 0 14px;
+  letter-spacing: -0.01em;
+}
+
+.about-intro {
+  margin-bottom: 48px;
+}
+
+.about-intro p {
+  font-size: 1rem;
+  line-height: 1.65;
+  color: #c8c8c8;
+  margin: 0 0 12px;
+}
+
+.about-intro em {
+  color: var(--text);
+  font-style: italic;
+}
+
+.about-sources-intro {
+  font-size: 0.92rem;
+  color: var(--muted);
+  margin: 0 0 32px;
+}
+
+.tier {
+  margin-bottom: 36px;
+}
+
+.tier h3 {
+  font-size: 1.1rem;
+  font-weight: 650;
+  margin: 0 0 4px;
+  color: var(--text);
+}
+
+.tier-desc {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin: 0 0 16px;
+}
+
+.source-list {
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.source-item {
+  background: #0e0e0e;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 18px;
+}
+
+.source-item dt {
+  font-size: 0.9rem;
+  font-weight: 600;
+  margin: 0 0 4px;
+  color: var(--text);
+}
+
+.source-item dt a {
+  color: var(--text);
+  text-decoration: none;
+  border-bottom: 1px solid rgba(255,255,255,0.2);
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.source-item dt a:hover {
+  color: var(--accent, #60a5fa);
+  border-bottom-color: var(--accent, #60a5fa);
+}
+
+.source-item dd {
+  margin: 0;
+  font-size: 0.84rem;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.about-footer {
+  margin-top: 48px;
+  padding-top: 24px;
+  border-top: 1px solid var(--line);
+}
+
+.about-footer p {
+  font-size: 0.82rem;
+  color: var(--muted);
+  margin: 0;
+}
+
+@media (max-width: 600px) {
+  .about-page {
+    padding: 24px 16px 40px;
+  }
+
+  .about-content h2 {
+    font-size: 1.25rem;
+  }
+
+  .tier h3 {
+    font-size: 1rem;
   }
 }

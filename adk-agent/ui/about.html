@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>About — AI Co-Scientist</title>
+    <link rel="stylesheet" href="/static/styles.css?v=20260226-32" />
+  </head>
+  <body class="about-body">
+    <div class="about-page">
+      <header class="about-header">
+        <a href="/" class="about-back">&larr; Back to Chat</a>
+        <h1 class="about-brand">AI Co-Scientist</h1>
+      </header>
+
+      <main class="about-content">
+        <section class="about-intro">
+          <h2>Why this tool exists</h2>
+          <p>
+            Biomedical knowledge is scattered across dozens of siloed databases,
+            each with its own query language, schema, and access patterns.
+            Answering a single research question — <em>"Is this gene a viable
+            drug target?"</em> — can require stitching together data from
+            genomics, proteomics, clinical trials, literature, drug safety
+            reports, and more.
+          </p>
+          <p>
+            AI Co-Scientist unifies <strong>26 data sources</strong> behind a
+            single conversational interface. Ask a question in plain language and
+            the agent plans a multi-step investigation, queries the right
+            databases, synthesizes the evidence, and delivers a cited research
+            report.
+          </p>
+        </section>
+
+        <section class="about-sources">
+          <h2>Data sources</h2>
+          <p class="about-sources-intro">
+            Organized from the broadest research questions to the most
+            specialized analyses.
+          </p>
+
+          <div class="tier">
+            <h3>Literature &amp; Clinical Evidence</h3>
+            <p class="tier-desc">Starting point for any biomedical question.</p>
+            <dl class="source-list">
+              <div class="source-item">
+                <dt><a href="https://pubmed.ncbi.nlm.nih.gov/" target="_blank" rel="noopener">PubMed</a></dt>
+                <dd>Over 38 million biomedical abstracts and citations from MEDLINE, life science journals, and online books. The primary literature search engine for biomedicine.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://openalex.org/" target="_blank" rel="noopener">OpenAlex</a></dt>
+                <dd>Broad scholarly knowledge graph covering 250M+ works including preprints, conference papers, and datasets. Useful for researcher discovery and citation analysis.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://clinicaltrials.gov/" target="_blank" rel="noopener">ClinicalTrials.gov</a></dt>
+                <dd>Registry of 500K+ clinical studies worldwide. Search active, recruiting, and completed trials by condition, intervention, or sponsor.</dd>
+              </div>
+            </dl>
+          </div>
+
+          <div class="tier">
+            <h3>Target-Disease Associations</h3>
+            <p class="tier-desc">Connecting genes and proteins to diseases with aggregated evidence.</p>
+            <dl class="source-list">
+              <div class="source-item">
+                <dt><a href="https://platform.opentargets.org/" target="_blank" rel="noopener">Open Targets Platform</a></dt>
+                <dd>Integrates genetics, genomics, transcriptomics, drugs, and literature into scored target-disease associations. The go-to resource for target validation.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.ebi.ac.uk/gwas/" target="_blank" rel="noopener">GWAS Catalog</a></dt>
+                <dd>Curated collection of published genome-wide association studies. Returns specific variants, p-values, odds ratios, and mapped genes for any trait or disease.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://civicdb.org/" target="_blank" rel="noopener">CIViC</a></dt>
+                <dd>Community-curated clinical interpretations of cancer variants. Expert-reviewed evidence linking specific mutations to diagnosis, prognosis, and treatment response.</dd>
+              </div>
+            </dl>
+          </div>
+
+          <div class="tier">
+            <h3>Drug Discovery &amp; Safety</h3>
+            <p class="tier-desc">The therapeutic landscape — from compounds to post-marketing surveillance.</p>
+            <dl class="source-list">
+              <div class="source-item">
+                <dt><a href="https://pubchem.ncbi.nlm.nih.gov/" target="_blank" rel="noopener">PubChem</a></dt>
+                <dd>Open chemistry database with 116M+ compounds. Molecular properties, SMILES structures, InChIKeys, drug-likeness descriptors (XLogP, H-bond donors/acceptors, polar surface area), synonyms, and compound descriptions.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.ebi.ac.uk/chembl/" target="_blank" rel="noopener">ChEMBL</a></dt>
+                <dd>Bioactivity database with 2M+ compounds, binding affinities, functional assays, and ADMET properties. Essential for understanding the pharmacological landscape around a target.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://dgidb.org/" target="_blank" rel="noopener">DGIdb</a></dt>
+                <dd>Drug-Gene Interaction Database aggregating 40+ sources. Returns druggability categories (kinase, clinically actionable, etc.) and known drug interactions for any gene.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://open.fda.gov/apis/drug/event/" target="_blank" rel="noopener">FDA FAERS</a></dt>
+                <dd>Post-marketing adverse event reports from the FDA. Analyze safety signals, compare adverse event profiles across drugs, and identify drug class effects.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.nlm.nih.gov/research/umls/rxnorm/" target="_blank" rel="noopener">RxNorm</a></dt>
+                <dd>Standardized drug nomenclature from the NLM. Maps between brand names, generics, ingredients, and clinical drug forms.</dd>
+              </div>
+            </dl>
+          </div>
+
+          <div class="tier">
+            <h3>Gene &amp; Protein Biology</h3>
+            <p class="tier-desc">Understanding molecular function, expression, and interactions.</p>
+            <dl class="source-list">
+              <div class="source-item">
+                <dt><a href="https://www.uniprot.org/" target="_blank" rel="noopener">UniProt</a></dt>
+                <dd>Comprehensive protein knowledgebase with sequences, domains, post-translational modifications, subcellular localization, and functional annotations for every known protein.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://gtexportal.org/" target="_blank" rel="noopener">GTEx</a></dt>
+                <dd>Tissue-level gene expression from the Genotype-Tissue Expression project. Median TPM values across 54 human tissues from 948 donors — critical for target safety assessment.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://reactome.org/" target="_blank" rel="noopener">Reactome</a></dt>
+                <dd>Curated biological pathways and reactions. Understand the signaling cascades, metabolic pathways, and cellular processes a gene participates in.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://string-db.org/" target="_blank" rel="noopener">STRING</a></dt>
+                <dd>Protein-protein interaction networks combining experimental data, text mining, and computational predictions. Identify interaction partners and functional modules.</dd>
+              </div>
+            </dl>
+          </div>
+
+          <div class="tier">
+            <h3>Protein Structure</h3>
+            <p class="tier-desc">3D structural insights — predicted and experimental.</p>
+            <dl class="source-list">
+              <div class="source-item">
+                <dt><a href="https://alphafold.ebi.ac.uk/" target="_blank" rel="noopener">AlphaFold</a></dt>
+                <dd>AI-predicted protein structures from DeepMind covering 200M+ proteins. Returns pLDDT confidence scores and downloadable PDB/CIF structure files.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.rcsb.org/" target="_blank" rel="noopener">RCSB PDB</a></dt>
+                <dd>Experimentally determined structures from X-ray crystallography, cryo-EM, and NMR. Search by gene or UniProt ID to find resolved structures with bound ligands.</dd>
+              </div>
+            </dl>
+          </div>
+
+          <div class="tier">
+            <h3>Genomic Variation</h3>
+            <p class="tier-desc">Population genetics and variant-level interpretation.</p>
+            <dl class="source-list">
+              <div class="source-item">
+                <dt><a href="https://gnomad.broadinstitute.org/" target="_blank" rel="noopener">gnomAD</a></dt>
+                <dd>Population variant frequencies from 76K+ genomes and 125K+ exomes. Essential for distinguishing rare pathogenic variants from common benign polymorphisms.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.internationalgenome.org/" target="_blank" rel="noopener">1000 Genomes</a></dt>
+                <dd>Reference catalog of human genetic variation across 26 populations. Foundation for understanding population-level diversity and ancestry-specific variants.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.ncbi.nlm.nih.gov/clinvar/" target="_blank" rel="noopener">ClinVar</a></dt>
+                <dd>Clinical significance classifications for human variants — pathogenic, benign, uncertain significance. Links variants to conditions with submitter-level evidence.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.ensembl.org/vep" target="_blank" rel="noopener">Ensembl VEP</a></dt>
+                <dd>Variant Effect Predictor returning functional consequence types, SIFT and PolyPhen deleteriousness scores, and AlphaMissense pathogenicity predictions.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://myvariant.info/" target="_blank" rel="noopener">MyVariant.info</a></dt>
+                <dd>Aggregated variant annotations pulling from ClinVar, CADD, dbSNP, gnomAD, and COSMIC in a single lookup. Quick comprehensive view of any variant.</dd>
+              </div>
+            </dl>
+          </div>
+
+          <div class="tier">
+            <h3>Specialized Domains</h3>
+            <p class="tier-desc">Advanced and niche applications.</p>
+            <dl class="source-list">
+              <div class="source-item">
+                <dt><a href="https://www.cbioportal.org/" target="_blank" rel="noopener">cBioPortal</a></dt>
+                <dd>Cancer genomics from the TCGA Pan-Cancer Atlas (32 tumor types, ~10K samples). Mutation frequencies, hotspot protein changes, and mutation type breakdowns by cancer.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.iedb.org/" target="_blank" rel="noopener">IEDB</a></dt>
+                <dd>Immune Epitope Database with experimentally characterized B-cell and T-cell epitopes, MHC binding data, and T-cell receptor sequences for immunology research.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://lincsproject.org/" target="_blank" rel="noopener">LINCS L1000</a></dt>
+                <dd>Library of Integrated Network-based Cellular Signatures. Gene expression profiles measured after chemical and genetic perturbations — for drug repurposing and mechanism of action studies.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.surechembl.org/" target="_blank" rel="noopener">SureChEMBL</a></dt>
+                <dd>Chemical structures automatically extracted from patent literature. Search the patent landscape for compounds related to your target or chemical series.</dd>
+              </div>
+            </dl>
+          </div>
+
+        </section>
+      </main>
+
+      <footer class="about-footer">
+        <p>All data is queried live from public APIs and open-access BigQuery datasets. No proprietary data is stored.</p>
+      </footer>
+    </div>
+  </body>
+</html>

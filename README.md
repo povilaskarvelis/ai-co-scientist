@@ -125,6 +125,16 @@ The reasoning trace captures the full decision chain per step and is stored alon
 | **Researcher Discovery** | `search_openalex_works`, `search_openalex_authors`, `rank_researchers_by_activity`, `get_researcher_contact_candidates` | OpenAlex |
 | **Protein Annotations** | `search_uniprot_proteins`, `get_uniprot_protein_profile` | UniProt REST |
 | **Pathways & Networks** | `search_reactome_pathways`, `get_string_interactions` | Reactome, STRING |
+| **Variant Predictions** | `annotate_variants_vep` | Ensembl VEP (SIFT, PolyPhen, AlphaMissense) |
+| **Variant Annotations** | `get_variant_annotations` | MyVariant.info (ClinVar, CADD, dbSNP, gnomAD, COSMIC) |
+| **Clinical Variants** | `search_civic_variants`, `search_civic_genes` | CIViC (cancer variant interpretations) |
+| **Protein Structures** | `get_alphafold_structure` | AlphaFold API (pLDDT confidence, PDB/CIF files) |
+| **GWAS Associations** | `search_gwas_associations` | EBI GWAS Catalog (trait-variant associations, p-values, odds ratios) |
+| **Drug-Gene Interactions** | `search_drug_gene_interactions` | DGIdb (druggability categories, approved/experimental drugs) |
+| **Tissue Expression** | `get_gene_tissue_expression` | GTEx v8 (median TPM across 54 human tissues) |
+| **Experimental Structures** | `search_protein_structures` | RCSB PDB (X-ray, cryo-EM structures, resolution, ligands) |
+| **Cancer Mutations** | `get_cancer_mutation_profile` | cBioPortal (TCGA Pan-Cancer mutation frequencies, hotspots) |
+| **Chemical Compounds** | `get_pubchem_compound` | PubChem (116M+ compounds, molecular properties, SMILES, drug-likeness) |
 | **Benchmarks** | `benchmark_dataset_overview`, `check_gpqa_access` | Hugging Face Datasets |
 
 ### BigQuery Datasets
@@ -137,14 +147,12 @@ All accessed via `list_bigquery_tables` and `run_bigquery_select_query` with rea
 | **ebi_chembl** | Bioactive compounds, target bioactivity (IC50/Ki/EC50), mechanism of action |
 | **gnomad** | Population variant frequencies across diverse ancestries |
 | **human_genome_variants** | 1000 Genomes Phase 3 variants, Platinum Genomes, Simons Diversity |
-| **human_variant_annotation** | Ensembl variant annotations, SIFT/PolyPhen scores (hg19/hg38) |
-| **deepmind_alphafold** | Predicted protein structures, pLDDT confidence, PDB/CIF URLs |
+| **human_variant_annotation** | ClinVar clinical significance classifications, variant-condition associations (hg19/hg38) |
 | **immune_epitope_db** | Immune epitopes, B-cell assays, MHC ligand binding, T-cell receptor data |
 | **nlm_rxnorm** | Drug nomenclature, ingredient relationships, clinical drug pathways |
 | **fda_drug** | FAERS adverse event reports, drug labels, NDC listings, enforcement actions |
 | **umiami_lincs** | L1000 perturbation signatures: cell lines, small molecules, readouts |
 | **ebi_surechembl** | Chemical structures extracted from patents |
-| **hackathon_data** | CIViC clinical variant interpretations, ClinGen gene-disease validity, GTEx tissue expression |
 
 ## User Commands
 

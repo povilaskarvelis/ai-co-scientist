@@ -7,6 +7,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -16,11 +17,12 @@ import os
 from pathlib import Path
 import re
 import threading
+import time
 import traceback
 import uuid
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from google.adk import Runner
@@ -39,6 +41,54 @@ from co_scientist.workflow import (
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+RATE_LIMIT_QUERIES = int(os.environ.get("RATE_LIMIT_QUERIES", "20"))
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "3600"))
+
+
+class RateLimiter:
+    """In-memory sliding-window rate limiter keyed by IP address."""
+
+    def __init__(self, max_requests: int, window_seconds: int) -> None:
+        self.max_requests = max_requests
+        self.window = window_seconds
+        self._hits: dict[str, list[float]] = defaultdict(list)
+
+    def check(self, key: str) -> tuple[bool, int]:
+        now = time.time()
+        hits = self._hits[key]
+        self._hits[key] = hits = [t for t in hits if now - t < self.window]
+        if len(hits) >= self.max_requests:
+            retry_after = int(self.window - (now - hits[0])) + 1
+            return False, retry_after
+        hits.append(now)
+        return True, 0
+
+    def remaining(self, key: str) -> int:
+        now = time.time()
+        hits = [t for t in self._hits.get(key, []) if now - t < self.window]
+        return max(0, self.max_requests - len(hits))
+
+
+query_limiter = RateLimiter(RATE_LIMIT_QUERIES, RATE_LIMIT_WINDOW)
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _enforce_rate_limit(request: Request) -> None:
+    ip = _client_ip(request)
+    allowed, retry_after = query_limiter.check(ip)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded. You can run {RATE_LIMIT_QUERIES} queries per hour. Try again in {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
 
 
 def _utc_now() -> str:
@@ -73,7 +123,7 @@ def _parse_step_event_text(text: str) -> dict:
     if m:
         info["tools"] = re.findall(r"`([^`]+)`", m.group(1))
     # Evidence IDs
-    evidence = re.findall(r"`((?:PMID|DOI|NCT|PMC)[:\s][^`]+)`", text)
+    evidence = re.findall(r"`((?:PMID|DOI|NCT|PMC|UniProt|PubChem|PDB|ChEMBL|Reactome)[:\s][^`]+|(?:GCST|CHEMBL|rs)\S[^`]*)`", text)
     if evidence:
         info["evidence"] = evidence[:10]
     # Progress: "_Progress: 2/5 steps complete..."
@@ -133,7 +183,7 @@ class TaskStore:
             encoding="utf-8",
         )
 
-    def save_task(self, task: dict) -> None:
+    def save_task(self, task: dict, *, owner_ip: str = "") -> None:
         task["updated_at"] = _utc_now()
         self._data["tasks"][task["task_id"]] = task
         conv_id = task.get("conversation_id", "")
@@ -142,6 +192,7 @@ class TaskStore:
                 "conversation_id": conv_id,
                 "title": task.get("title", ""),
                 "task_ids": [],
+                "owner_ip": owner_ip,
                 "created_at": task.get("created_at", _utc_now()),
                 "updated_at": _utc_now(),
             })
@@ -154,9 +205,11 @@ class TaskStore:
     def get_task(self, task_id: str) -> dict | None:
         return self._data["tasks"].get(task_id)
 
-    def list_conversations(self) -> list[dict]:
+    def list_conversations(self, *, owner_ip: str = "") -> list[dict]:
         result = []
         for conv in self._data["conversations"].values():
+            if owner_ip and conv.get("owner_ip", "") != owner_ip:
+                continue
             task_ids = conv.get("task_ids", [])
             tasks = [self._data["tasks"].get(tid) for tid in task_ids]
             tasks = [t for t in tasks if t]
@@ -170,6 +223,12 @@ class TaskStore:
             })
         result.sort(key=lambda c: c.get("updated_at", ""), reverse=True)
         return result
+
+    def conversation_owned_by(self, conversation_id: str, owner_ip: str) -> bool:
+        conv = self._data["conversations"].get(conversation_id)
+        if not conv:
+            return False
+        return conv.get("owner_ip", "") == owner_ip
 
     def get_conversation_tasks(self, conversation_id: str) -> list[dict]:
         conv = self._data["conversations"].get(conversation_id)
@@ -744,7 +803,7 @@ class UiRuntime:
                 run.progress_summaries.append(summary)
                 run.updated_at = _utc_now()
 
-    async def _save_task_with_progress(self, task: dict, run_id: str | None = None) -> None:
+    async def _save_task_with_progress(self, task: dict, run_id: str | None = None, *, owner_ip: str = "") -> None:
         """Save task to store, syncing progress data from the active run."""
         if run_id:
             async with self.runs_lock:
@@ -752,7 +811,7 @@ class UiRuntime:
                 if run:
                     task["progress_events"] = list(run.progress_events[-600:])
                     task["progress_summaries"] = list(run.progress_summaries[-80:])
-        self.store.save_task(task)  # internal helper; external callers use _save_task_with_progress
+        self.store.save_task(task, owner_ip=owner_ip)
 
     # -- Run management -------------------------------------------------------
 
@@ -829,6 +888,7 @@ class UiRuntime:
         *,
         conversation_id: str | None = None,
         parent_task_id: str | None = None,
+        owner_ip: str = "",
     ) -> RunRecord:
         run = await self._create_run("new_query", query=query)
         job = asyncio.create_task(
@@ -837,6 +897,7 @@ class UiRuntime:
                 query,
                 conversation_id=conversation_id,
                 parent_task_id=parent_task_id,
+                owner_ip=owner_ip,
             )
         )
         self._track_background_task(job)
@@ -861,6 +922,7 @@ class UiRuntime:
         *,
         conversation_id: str | None = None,
         parent_task_id: str | None = None,
+        owner_ip: str = "",
     ) -> None:
         await self._update_run(run_id, status="running")
         if not self.ready:
@@ -885,7 +947,7 @@ class UiRuntime:
                 parent_task_id=parent,
             )
             task["branch_label"] = branch_label
-            await self._save_task_with_progress(task, run_id)
+            await self._save_task_with_progress(task, run_id, owner_ip=owner_ip)
             await self._update_run(run_id, task_id=task_id, title=title)
 
             await self._append_progress_event(
@@ -1244,8 +1306,8 @@ class UiRuntime:
                     break
         return task
 
-    def list_conversations(self) -> list[dict]:
-        return self.store.list_conversations()
+    def list_conversations(self, *, owner_ip: str = "") -> list[dict]:
+        return self.store.list_conversations(owner_ip=owner_ip)
 
     async def get_conversation_detail(self, conversation_id: str) -> dict | None:
         tasks = self.store.get_conversation_tasks(conversation_id)
@@ -1389,6 +1451,11 @@ async def index() -> FileResponse:
     return FileResponse(UI_DIR / "index.html")
 
 
+@app.get("/about")
+async def about() -> FileResponse:
+    return FileResponse(UI_DIR / "about.html")
+
+
 @app.get("/api/health")
 async def health() -> dict:
     return {
@@ -1398,9 +1465,21 @@ async def health() -> dict:
     }
 
 
+@app.get("/api/rate-limit")
+async def rate_limit_status(request: Request) -> dict:
+    ip = _client_ip(request)
+    remaining = query_limiter.remaining(ip)
+    return {
+        "limit": RATE_LIMIT_QUERIES,
+        "remaining": remaining,
+        "window_seconds": RATE_LIMIT_WINDOW,
+    }
+
+
 @app.get("/api/tasks")
-async def list_tasks() -> dict:
-    convs = runtime.list_conversations()
+async def list_tasks(request: Request) -> dict:
+    ip = _client_ip(request)
+    convs = runtime.list_conversations(owner_ip=ip)
     all_tasks = []
     for c in convs:
         tasks = runtime.store.get_conversation_tasks(c["conversation_id"])
@@ -1410,12 +1489,16 @@ async def list_tasks() -> dict:
 
 
 @app.get("/api/conversations")
-async def list_conversations() -> dict:
-    return {"conversations": runtime.list_conversations()}
+async def list_conversations(request: Request) -> dict:
+    ip = _client_ip(request)
+    return {"conversations": runtime.list_conversations(owner_ip=ip)}
 
 
 @app.get("/api/conversations/{conversation_id}")
-async def conversation_detail(conversation_id: str) -> dict:
+async def conversation_detail(conversation_id: str, request: Request) -> dict:
+    ip = _client_ip(request)
+    if not runtime.store.conversation_owned_by(conversation_id, ip):
+        raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
     detail = await runtime.get_conversation_detail(conversation_id)
     if not detail:
         raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
@@ -1423,7 +1506,14 @@ async def conversation_detail(conversation_id: str) -> dict:
 
 
 @app.get("/api/tasks/{task_id}")
-async def task_detail(task_id: str) -> dict:
+async def task_detail(task_id: str, request: Request) -> dict:
+    task = runtime.store.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
+    ip = _client_ip(request)
+    conv_id = task.get("conversation_id", "")
+    if conv_id and not runtime.store.conversation_owned_by(conv_id, ip):
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
     detail = await runtime.get_task_detail(task_id)
     if not detail:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
@@ -1431,45 +1521,68 @@ async def task_detail(task_id: str) -> dict:
 
 
 @app.post("/api/query")
-async def start_query(payload: QueryRequest) -> dict:
+async def start_query(payload: QueryRequest, request: Request) -> dict:
     if not runtime.ready:
         raise HTTPException(status_code=503, detail=runtime.ready_error or "Runtime not ready.")
+    _enforce_rate_limit(request)
+    ip = _client_ip(request)
     run = await runtime.start_new_query(
         payload.query.strip(),
         conversation_id=payload.conversation_id.strip() if payload.conversation_id else None,
         parent_task_id=payload.parent_task_id.strip() if payload.parent_task_id else None,
+        owner_ip=ip,
     )
     return run.to_dict()
 
 
+def _check_task_ownership(task_id: str, request: Request) -> dict:
+    """Return the task dict if it exists and belongs to the caller, else 404."""
+    task = runtime.store.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
+    conv_id = task.get("conversation_id", "")
+    ip = _client_ip(request)
+    if conv_id and not runtime.store.conversation_owned_by(conv_id, ip):
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
+    return task
+
+
 @app.post("/api/tasks/{task_id}/start")
-async def start_task(task_id: str, payload: StartRequest | None = None) -> dict:
+async def start_task(task_id: str, request: Request, payload: StartRequest | None = None) -> dict:
     if not runtime.ready:
         raise HTTPException(status_code=503, detail=runtime.ready_error or "Runtime not ready.")
+    _enforce_rate_limit(request)
+    _check_task_ownership(task_id.strip(), request)
     run = await runtime.start_task(task_id.strip())
     return run.to_dict()
 
 
 @app.post("/api/tasks/{task_id}/continue")
-async def continue_task(task_id: str) -> dict:
+async def continue_task(task_id: str, request: Request) -> dict:
     if not runtime.ready:
         raise HTTPException(status_code=503, detail=runtime.ready_error or "Runtime not ready.")
+    _enforce_rate_limit(request)
+    _check_task_ownership(task_id.strip(), request)
     run = await runtime.start_task(task_id.strip())
     return run.to_dict()
 
 
 @app.post("/api/tasks/{task_id}/feedback")
-async def feedback_task(task_id: str, payload: FeedbackRequest) -> dict:
+async def feedback_task(task_id: str, request: Request, payload: FeedbackRequest) -> dict:
     if not runtime.ready:
         raise HTTPException(status_code=503, detail=runtime.ready_error or "Runtime not ready.")
+    _enforce_rate_limit(request)
+    _check_task_ownership(task_id.strip(), request)
     run = await runtime.feedback_task(task_id.strip(), payload.message.strip())
     return run.to_dict()
 
 
 @app.post("/api/tasks/{task_id}/revise")
-async def revise_task(task_id: str, payload: ReviseRequest) -> dict:
+async def revise_task(task_id: str, request: Request, payload: ReviseRequest) -> dict:
     if not runtime.ready:
         raise HTTPException(status_code=503, detail=runtime.ready_error or "Runtime not ready.")
+    _enforce_rate_limit(request)
+    _check_task_ownership(task_id.strip(), request)
     run = await runtime.feedback_task(task_id.strip(), payload.scope.strip())
     return run.to_dict()
 
@@ -1488,7 +1601,8 @@ async def get_run(run_id: str) -> dict:
 
 
 @app.get("/api/tasks/{task_id}/report.pdf")
-async def export_report_pdf(task_id: str) -> FileResponse:
+async def export_report_pdf(task_id: str, request: Request) -> FileResponse:
+    _check_task_ownership(task_id.strip(), request)
     task = runtime.store.get_task(task_id.strip())
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")

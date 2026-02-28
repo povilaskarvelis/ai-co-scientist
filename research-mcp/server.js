@@ -22,6 +22,18 @@ const CLINICAL_TRIALS_API = "https://clinicaltrials.gov/api/v2";
 const OPENALEX_API = "https://api.openalex.org";
 const REACTOME_API = "https://reactome.org/ContentService";
 const STRING_API = "https://string-db.org/api";
+const ENSEMBL_REST_API = "https://rest.ensembl.org";
+const CIVIC_GRAPHQL_API = "https://civicdb.org/api/graphql";
+const MYVARIANT_API = "https://myvariant.info/v1";
+const ALPHAFOLD_API = "https://alphafold.ebi.ac.uk/api";
+const GWAS_CATALOG_API = "https://www.ebi.ac.uk/gwas/rest/api/v2";
+const DGIDB_GRAPHQL_API = "https://dgidb.org/api/graphql";
+const GTEX_API = "https://gtexportal.org/api/v2";
+const RCSB_SEARCH_API = "https://search.rcsb.org/rcsbsearch/v2/query";
+const RCSB_DATA_API = "https://data.rcsb.org/rest/v1";
+const CBIOPORTAL_API = "https://www.cbioportal.org/api";
+const PUBCHEM_API = "https://pubchem.ncbi.nlm.nih.gov/rest/pug";
+const CHEMBL_API = "https://www.ebi.ac.uk/chembl/api/data";
 const HF_DATASETS_SERVER_API = "https://datasets-server.huggingface.co";
 const HF_DATASET_PUBMEDQA = String(process.env.HF_DATASET_PUBMEDQA || "qiaojin/PubMedQA").trim();
 const HF_DATASET_BIOASQ = String(process.env.HF_DATASET_BIOASQ || "kroshan/BioASQ").trim();
@@ -1185,7 +1197,7 @@ server.registerTool(
       dataset: z
         .string()
         .optional()
-        .describe("Dataset as `project.dataset` or just `dataset` (e.g. 'open_targets_platform', 'deepmind_alphafold'). Short names are resolved against the allowlist. If omitted, uses first allowlisted dataset."),
+        .describe("Dataset as `project.dataset` or just `dataset` (e.g. 'open_targets_platform', 'ebi_chembl'). Short names are resolved against the allowlist. If omitted, uses first allowlisted dataset."),
       table: z
         .string()
         .optional()
@@ -3046,6 +3058,1595 @@ server.registerTool(
       }
       return { content: [{ type: "text", text: `Error in get_uniprot_protein_profile: ${message}` }] };
     }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// Ensembl VEP — variant effect predictions (SIFT, PolyPhen, AlphaMissense)
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "annotate_variants_vep",
+  {
+    description:
+      "Predict functional effects of human variants using Ensembl VEP. Returns consequence type, SIFT, PolyPhen, " +
+      "and AlphaMissense predictions. Use for assessing pathogenicity of specific mutations.",
+    inputSchema: {
+      variants: z
+        .array(z.string())
+        .min(1)
+        .max(10)
+        .describe('HGVS notation variants, e.g. ["BRAF:p.Val600Glu", "chr7:g.140753336A>T"]. Max 10.'),
+      includeAlphaMissense: z.boolean().optional().default(true).describe("Include AlphaMissense predictions"),
+    },
+  },
+  async ({ variants, includeAlphaMissense = true }) => {
+    const cleaned = (variants || []).map((v) => normalizeWhitespace(v)).filter(Boolean).slice(0, 10);
+    if (cleaned.length === 0) {
+      return { content: [{ type: "text", text: "Provide at least one variant in HGVS notation." }] };
+    }
+
+    const body = { hgvs_notations: cleaned };
+    if (includeAlphaMissense) body.AlphaMissense = 1;
+
+    const url = `${ENSEMBL_REST_API}/vep/human/hgvs`;
+    const data = await fetchJsonWithRetry(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+      retries: 1,
+      timeoutMs: 20000,
+      maxBackoffMs: 3000,
+    });
+
+    const results = Array.isArray(data) ? data : [];
+    if (results.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: "No VEP results returned for the submitted variants.",
+              keyFields: cleaned.map((v) => `Input: ${v}`),
+              sources: [url],
+              limitations: ["Check HGVS notation format. Accepted examples: BRAF:p.Val600Glu, chr7:g.140753336A>T, 9:g.22125504G>C"],
+            }),
+          },
+        ],
+      };
+    }
+
+    const keyFields = results.map((entry) => {
+      const input = normalizeWhitespace(entry?.input || entry?.id || "");
+      const consequences = (entry?.most_severe_consequence || "").replace(/_/g, " ");
+      const transcripts = Array.isArray(entry?.transcript_consequences) ? entry.transcript_consequences : [];
+      const top = transcripts[0] || {};
+
+      const gene = normalizeWhitespace(top.gene_symbol || "");
+      const siftPred = normalizeWhitespace(top.sift_prediction || "");
+      const siftScore = top.sift_score != null ? Number(top.sift_score).toFixed(3) : "";
+      const sift = siftPred ? `${siftPred}${siftScore ? ` (${siftScore})` : ""}` : "N/A";
+
+      const ppPred = normalizeWhitespace(top.polyphen_prediction || "");
+      const ppScore = top.polyphen_score != null ? Number(top.polyphen_score).toFixed(3) : "";
+      const polyphen = ppPred ? `${ppPred}${ppScore ? ` (${ppScore})` : ""}` : "N/A";
+
+      let alphaMissense = "N/A";
+      if (top.am_class) {
+        const amScore = top.am_pathogenicity != null ? Number(top.am_pathogenicity).toFixed(3) : "";
+        alphaMissense = `${normalizeWhitespace(top.am_class)}${amScore ? ` (${amScore})` : ""}`;
+      }
+
+      const parts = [`Input: ${input}`];
+      if (gene) parts.push(`Gene: ${gene}`);
+      parts.push(`Consequence: ${consequences}`);
+      parts.push(`SIFT: ${sift}`);
+      parts.push(`PolyPhen: ${polyphen}`);
+      if (includeAlphaMissense) parts.push(`AlphaMissense: ${alphaMissense}`);
+      return parts.join(" | ");
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `VEP returned predictions for ${results.length} variant${results.length === 1 ? "" : "s"}.`,
+            keyFields,
+            sources: [url, "https://www.ensembl.org/info/docs/tools/vep/index.html"],
+            limitations: [
+              "SIFT/PolyPhen scores are only available for missense variants in protein-coding transcripts.",
+              "AlphaMissense coverage may not include all missense variants.",
+            ],
+          }),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// CIViC — clinical variant interpretations
+// ---------------------------------------------------------------------------
+
+async function fetchCivicGraphQL(query, variables = {}) {
+  return fetchJsonWithRetry(CIVIC_GRAPHQL_API, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ query, variables }),
+    retries: 1,
+    timeoutMs: 15000,
+    maxBackoffMs: 3000,
+  });
+}
+
+server.registerTool(
+  "search_civic_variants",
+  {
+    description:
+      "Search CIViC for clinical variant interpretations by gene name with optional variant filter. " +
+      "Returns evidence levels, clinical significance, associated therapies, and diseases. " +
+      "Use for understanding clinical actionability of cancer variants.",
+    inputSchema: {
+      gene: z.string().describe("Gene symbol (e.g. BRAF, EGFR, KRAS)"),
+      variantName: z.string().optional().describe("Optional variant name filter (e.g. V600E)"),
+      limit: z.number().optional().default(10).describe("Max variants to return (default 10, max 25)"),
+    },
+  },
+  async ({ gene, variantName, limit = 10 }) => {
+    const normalizedGene = normalizeWhitespace(gene || "").toUpperCase();
+    if (!normalizedGene) {
+      return { content: [{ type: "text", text: "Provide a gene symbol (e.g. BRAF)." }] };
+    }
+    const boundedLimit = Math.max(1, Math.min(25, Math.round(limit)));
+
+    const query = `
+      query SearchVariants($geneName: String!, $first: Int) {
+        variants(
+          geneNames: [$geneName]
+          first: $first
+          sortBy: { column: evidenceItemCount, direction: DESC }
+        ) {
+          totalCount
+          nodes {
+            id
+            name
+            feature {
+              name
+            }
+            molecularProfiles {
+              nodes {
+                id
+                name
+                evidenceCountByClinicalSignificance
+                evidenceItems(first: 5) {
+                  nodes {
+                    id
+                    status
+                    evidenceLevel
+                    evidenceDirection
+                    significance
+                    therapies { name }
+                    disease { name }
+                    source { citation }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const data = await fetchCivicGraphQL(query, { geneName: normalizedGene, first: boundedLimit });
+    const variants = data?.data?.variants?.nodes || [];
+    const totalCount = data?.data?.variants?.totalCount || 0;
+
+    const filtered = variantName
+      ? variants.filter((v) => normalizeWhitespace(v.name || "").toLowerCase().includes(normalizeWhitespace(variantName).toLowerCase()))
+      : variants;
+
+    if (filtered.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: variantName
+                ? `No CIViC entries for ${normalizedGene} ${variantName}.`
+                : `No CIViC entries for gene ${normalizedGene}.`,
+              keyFields: [`Gene: ${normalizedGene}`, `Total CIViC variants: ${totalCount}`],
+              sources: [`https://civicdb.org/genes/${normalizedGene}`],
+              limitations: ["CIViC focuses on cancer variants with clinical evidence; not all known variants are curated."],
+            }),
+          },
+        ],
+      };
+    }
+
+    const keyFields = filtered.map((v) => {
+      const vName = normalizeWhitespace(v.name || "");
+      const profiles = v.molecularProfiles?.nodes || [];
+      const evidenceItems = profiles.flatMap((p) => p.evidenceItems?.nodes || []);
+      const accepted = evidenceItems.filter((e) => normalizeWhitespace(e.status || "").toLowerCase() === "accepted");
+
+      const levels = accepted.map((e) => normalizeWhitespace(e.evidenceLevel || "")).filter(Boolean);
+      const levelSummary = levels.length > 0 ? [...new Set(levels)].join(", ") : "none";
+      const significances = [...new Set(accepted.map((e) => normalizeWhitespace(e.significance || "")).filter(Boolean))];
+      const diseases = [...new Set(accepted.map((e) => normalizeWhitespace(e.disease?.name || "")).filter(Boolean))].slice(0, 3);
+      const therapies = [...new Set(accepted.flatMap((e) => (e.therapies || []).map((t) => normalizeWhitespace(t.name || ""))).filter(Boolean))].slice(0, 3);
+
+      const parts = [`${normalizedGene} ${vName}`];
+      parts.push(`Evidence levels: ${levelSummary}`);
+      if (significances.length > 0) parts.push(`Significance: ${significances.join(", ")}`);
+      if (diseases.length > 0) parts.push(`Diseases: ${diseases.join(", ")}`);
+      if (therapies.length > 0) parts.push(`Therapies: ${therapies.join(", ")}`);
+      parts.push(`Evidence items: ${accepted.length} accepted`);
+      return parts.join(" | ");
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Found ${filtered.length} CIViC variant${filtered.length === 1 ? "" : "s"} for ${normalizedGene}${variantName ? ` (filtered: ${variantName})` : ""} (${totalCount} total in CIViC).`,
+            keyFields,
+            sources: [`https://civicdb.org/genes/${normalizedGene}`, CIVIC_GRAPHQL_API],
+            limitations: [
+              "CIViC is community-curated and focuses on cancer-relevant variants with clinical or therapeutic evidence.",
+              "Evidence levels: A (validated), B (clinical), C (case study), D (preclinical), E (inferential).",
+            ],
+          }),
+        },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "search_civic_genes",
+  {
+    description:
+      "Get a CIViC gene summary including description, associated variant count, diseases, and therapies. " +
+      "Use to understand the clinical significance landscape for a gene in oncology.",
+    inputSchema: {
+      name: z.string().describe("Gene symbol (e.g. BRAF, TP53, EGFR)"),
+    },
+  },
+  async ({ name }) => {
+    const normalizedName = normalizeWhitespace(name || "").toUpperCase();
+    if (!normalizedName) {
+      return { content: [{ type: "text", text: "Provide a gene symbol (e.g. BRAF)." }] };
+    }
+
+    const query = `
+      query GeneDetail($name: String!) {
+        genes(name: $name) {
+          nodes {
+            id
+            name
+            description
+            officialName
+            variants {
+              totalCount
+            }
+            therapies: variants(first: 50) {
+              nodes {
+                molecularProfiles {
+                  nodes {
+                    evidenceItems(first: 10) {
+                      nodes {
+                        status
+                        therapies { name }
+                        disease { name }
+                        evidenceLevel
+                        significance
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
+
+    const data = await fetchCivicGraphQL(query, { name: normalizedName });
+    const genes = data?.data?.genes?.nodes || [];
+
+    if (genes.length === 0) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `Gene ${normalizedName} not found in CIViC.`,
+              keyFields: [`Queried: ${normalizedName}`],
+              sources: [CIVIC_GRAPHQL_API],
+              limitations: ["CIViC covers genes with clinical/therapeutic evidence in oncology; not all genes are represented."],
+            }),
+          },
+        ],
+      };
+    }
+
+    const gene = genes[0];
+    const variantCount = gene.variants?.totalCount || 0;
+    const description = normalizeWhitespace(gene.description || "No description available.");
+
+    const allEvidence = (gene.therapies?.nodes || []).flatMap((v) =>
+      (v.molecularProfiles?.nodes || []).flatMap((p) =>
+        (p.evidenceItems?.nodes || []).filter((e) => normalizeWhitespace(e.status || "").toLowerCase() === "accepted")
+      )
+    );
+
+    const diseases = [...new Set(allEvidence.map((e) => normalizeWhitespace(e.disease?.name || "")).filter(Boolean))].slice(0, 8);
+    const therapies = [...new Set(allEvidence.flatMap((e) => (e.therapies || []).map((t) => normalizeWhitespace(t.name || ""))).filter(Boolean))].slice(0, 8);
+    const levels = allEvidence.map((e) => normalizeWhitespace(e.evidenceLevel || "")).filter(Boolean);
+    const levelCounts = {};
+    levels.forEach((l) => { levelCounts[l] = (levelCounts[l] || 0) + 1; });
+    const levelSummary = Object.entries(levelCounts).map(([k, v]) => `${k}:${v}`).join(", ") || "none";
+
+    const keyFields = [
+      `Gene: ${normalizedName} (${normalizeWhitespace(gene.officialName || "")})`,
+      `Description: ${description.slice(0, 300)}${description.length > 300 ? "..." : ""}`,
+      `CIViC variants: ${variantCount}`,
+      `Evidence items (accepted): ${allEvidence.length} (levels: ${levelSummary})`,
+      `Associated diseases: ${diseases.length > 0 ? diseases.join(", ") : "none listed"}`,
+      `Associated therapies: ${therapies.length > 0 ? therapies.join(", ") : "none listed"}`,
+    ];
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `CIViC gene profile for ${normalizedName} with ${variantCount} curated variants.`,
+            keyFields,
+            sources: [`https://civicdb.org/genes/${normalizedName}`, CIVIC_GRAPHQL_API],
+            limitations: [
+              "CIViC is oncology-focused; gene descriptions reflect cancer-relevance, not general function.",
+              "Therapy associations reflect curated clinical evidence, not approved indications.",
+            ],
+          }),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// MyVariant.info — aggregated variant annotations (ClinVar, dbSNP, CADD, etc.)
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "get_variant_annotations",
+  {
+    description:
+      "Get aggregated variant annotations from MyVariant.info, which combines 20+ sources including ClinVar, " +
+      "dbSNP, CADD, gnomAD, COSMIC, and more. Accepts HGVS notation or rsID. " +
+      "Use for comprehensive variant characterization in a single call.",
+    inputSchema: {
+      variantId: z
+        .string()
+        .describe('Variant identifier: rsID (e.g. "rs113488022") or HGVS genomic notation (e.g. "chr7:g.140753336A>T")'),
+      fields: z
+        .string()
+        .optional()
+        .describe("Comma-separated fields to return (e.g. clinvar,cadd,dbsnp,gnomad_exome). Default returns key fields."),
+    },
+  },
+  async ({ variantId, fields }) => {
+    const normalizedId = normalizeWhitespace(variantId || "");
+    if (!normalizedId) {
+      return { content: [{ type: "text", text: 'Provide a variant ID (rsID or HGVS notation, e.g. "rs113488022").' }] };
+    }
+
+    const defaultFields = "clinvar,cadd,dbsnp,gnomad_exome,gnomad_genome,cosmic,dbnsfp,snpeff";
+    const requestFields = normalizeWhitespace(fields || "") || defaultFields;
+
+    const isRsId = /^rs\d+$/i.test(normalizedId);
+    let url;
+    if (isRsId) {
+      const params = new URLSearchParams({ q: `dbsnp.rsid:${normalizedId}`, fields: requestFields, size: "1" });
+      url = `${MYVARIANT_API}/query?${params}`;
+    } else {
+      const params = new URLSearchParams({ fields: requestFields });
+      url = `${MYVARIANT_API}/variant/${encodeURIComponent(normalizedId)}?${params}`;
+    }
+
+    const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 12000, maxBackoffMs: 3000 });
+
+    const hit = isRsId ? (Array.isArray(data?.hits) ? data.hits[0] : null) : data;
+    if (!hit || hit.notfound) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `Variant ${normalizedId} not found in MyVariant.info.`,
+              keyFields: [`Queried: ${normalizedId}`],
+              sources: [url],
+              limitations: [
+                'Check variant format. Examples: "rs113488022", "chr7:g.140753336A>T".',
+                "MyVariant.info uses hg19 coordinates by default.",
+              ],
+            }),
+          },
+        ],
+      };
+    }
+
+    const keyFields = [];
+    const hgvsId = normalizeWhitespace(hit._id || "");
+    if (hgvsId) keyFields.push(`HGVS ID: ${hgvsId}`);
+
+    const rsid = normalizeWhitespace(hit.dbsnp?.rsid || "");
+    if (rsid) keyFields.push(`dbSNP: ${rsid}`);
+
+    const gene = normalizeWhitespace(hit.dbsnp?.gene?.symbol || hit.cadd?.gene?.[0]?.genename || hit.dbnsfp?.genename || "");
+    if (gene) keyFields.push(`Gene: ${gene}`);
+
+    if (hit.clinvar) {
+      const cv = hit.clinvar;
+      const sig = normalizeWhitespace(
+        Array.isArray(cv.rcv) ? cv.rcv.map((r) => normalizeWhitespace(r.clinical_significance || "")).filter(Boolean).join("; ")
+        : cv.rcv?.clinical_significance || ""
+      );
+      if (sig) keyFields.push(`ClinVar significance: ${sig}`);
+      const conditions = Array.isArray(cv.rcv)
+        ? [...new Set(cv.rcv.map((r) => normalizeWhitespace(r.conditions?.identifiers?.medgen || r.conditions?.name || "")).filter(Boolean))].slice(0, 3)
+        : [];
+      if (conditions.length > 0) keyFields.push(`ClinVar conditions: ${conditions.join(", ")}`);
+    }
+
+    if (hit.cadd) {
+      const phred = hit.cadd.phred != null ? Number(hit.cadd.phred).toFixed(2) : "";
+      const rawScore = hit.cadd.rawscore != null ? Number(hit.cadd.rawscore).toFixed(3) : "";
+      if (phred) keyFields.push(`CADD phred: ${phred}${rawScore ? ` (raw: ${rawScore})` : ""}`);
+      const consequence = normalizeWhitespace(hit.cadd.consequence || "");
+      if (consequence) keyFields.push(`CADD consequence: ${consequence}`);
+    }
+
+    if (hit.dbnsfp) {
+      const sift = normalizeWhitespace(hit.dbnsfp.sift?.pred || "");
+      const pp2 = normalizeWhitespace(hit.dbnsfp.polyphen2?.hdiv?.pred || "");
+      if (sift) keyFields.push(`SIFT (via dbNSFP): ${sift}`);
+      if (pp2) keyFields.push(`PolyPhen-2 (via dbNSFP): ${pp2}`);
+    }
+
+    if (hit.gnomad_exome) {
+      const af = hit.gnomad_exome.af?.af != null ? hit.gnomad_exome.af.af : hit.gnomad_exome.af;
+      if (af != null) keyFields.push(`gnomAD exome AF: ${Number(af).toExponential(3)}`);
+    }
+    if (hit.gnomad_genome) {
+      const af = hit.gnomad_genome.af?.af != null ? hit.gnomad_genome.af.af : hit.gnomad_genome.af;
+      if (af != null) keyFields.push(`gnomAD genome AF: ${Number(af).toExponential(3)}`);
+    }
+
+    if (hit.cosmic) {
+      const cosmicId = normalizeWhitespace(hit.cosmic.cosmic_id || hit.cosmic._license || "");
+      if (cosmicId) keyFields.push(`COSMIC: ${cosmicId}`);
+    }
+
+    if (keyFields.length <= 1) {
+      keyFields.push("Limited annotation data available for this variant.");
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `Aggregated annotations for variant ${normalizedId} from MyVariant.info.`,
+            keyFields,
+            sources: [url, `https://myvariant.info/v1/variant/${encodeURIComponent(hgvsId || normalizedId)}`],
+            limitations: [
+              "MyVariant.info uses hg19 coordinates by default. For hg38, append &assembly=hg38 or convert coordinates.",
+              "Data freshness depends on source update frequency; ClinVar updates monthly, gnomAD less frequently.",
+            ],
+          }),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// AlphaFold — predicted protein structure lookup
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "get_alphafold_structure",
+  {
+    description:
+      "Look up AlphaFold predicted protein structure by UniProt accession. Returns confidence scores (pLDDT), " +
+      "model quality, and download URLs for PDB/CIF structure files. Use for structural biology questions.",
+    inputSchema: {
+      uniprotId: z.string().describe("UniProt accession (e.g. P00533 for EGFR, P04637 for TP53)"),
+    },
+  },
+  async ({ uniprotId }) => {
+    const normalizedId = normalizeWhitespace(uniprotId || "").toUpperCase();
+    if (!normalizedId) {
+      return { content: [{ type: "text", text: "Provide a UniProt accession (e.g. P00533)." }] };
+    }
+
+    const url = `${ALPHAFOLD_API}/prediction/${normalizedId}`;
+    const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 10000, maxBackoffMs: 3000 });
+
+    const entries = Array.isArray(data) ? data : [data];
+    const entry = entries[0];
+    if (!entry || !entry.entryId) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `No AlphaFold prediction found for UniProt accession ${normalizedId}.`,
+              keyFields: [`Queried: ${normalizedId}`],
+              sources: [url],
+              limitations: [
+                "AlphaFold DB covers most of UniProt but not all proteins. Check the accession is correct.",
+              ],
+            }),
+          },
+        ],
+      };
+    }
+
+    const entryId = normalizeWhitespace(entry.entryId || "");
+    const gene = normalizeWhitespace(entry.gene || "");
+    const organism = normalizeWhitespace(entry.organismScientificName || "");
+    const globalPlddt = entry.globalMetricValue != null ? Number(entry.globalMetricValue).toFixed(1) : "N/A";
+    const seqLength = entry.uniprotEnd || entry.sequenceLength || "unknown";
+
+    const confidenceLabel =
+      globalPlddt === "N/A" ? "N/A"
+      : Number(globalPlddt) >= 90 ? `${globalPlddt} (very high)`
+      : Number(globalPlddt) >= 70 ? `${globalPlddt} (confident)`
+      : Number(globalPlddt) >= 50 ? `${globalPlddt} (low)`
+      : `${globalPlddt} (very low)`;
+
+    const pdbUrl = normalizeWhitespace(entry.pdbUrl || "");
+    const cifUrl = normalizeWhitespace(entry.cifUrl || "");
+    const paeUrl = normalizeWhitespace(entry.paeImageUrl || "");
+
+    const keyFields = [
+      `Entry: ${entryId}`,
+      `UniProt: [${normalizedId}](https://www.uniprot.org/uniprotkb/${normalizedId})`,
+    ];
+    if (gene) keyFields.push(`Gene: ${gene}`);
+    if (organism) keyFields.push(`Organism: ${organism}`);
+    keyFields.push(`Sequence length: ${seqLength} residues`);
+    keyFields.push(`Global pLDDT: ${confidenceLabel}`);
+    if (pdbUrl) keyFields.push(`PDB file: ${pdbUrl}`);
+    if (cifUrl) keyFields.push(`CIF file: ${cifUrl}`);
+    if (paeUrl) keyFields.push(`PAE image: ${paeUrl}`);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `AlphaFold structure prediction for ${gene || normalizedId} (pLDDT: ${confidenceLabel}).`,
+            keyFields,
+            sources: [
+              `https://alphafold.ebi.ac.uk/entry/${entryId}`,
+              url,
+            ],
+            limitations: [
+              "pLDDT > 90: high confidence; 70-90: confident backbone; 50-70: low confidence; < 50: likely disordered.",
+              "AlphaFold predictions are computational models, not experimentally determined structures.",
+            ],
+          }),
+        },
+      ],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// GWAS Catalog — trait-variant associations from genome-wide association studies
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "search_gwas_associations",
+  {
+    description:
+      "Search the GWAS Catalog for trait-variant associations from genome-wide association studies. " +
+      "Query by disease/trait name (e.g. 'breast carcinoma', 'Parkinson disease') or variant rsID (e.g. 'rs1234'). " +
+      "Returns SNPs, mapped genes, p-values, odds ratios, and study metadata.",
+    inputSchema: {
+      trait: z.string().optional().describe("Disease or trait name (e.g. 'breast carcinoma', 'type 2 diabetes')"),
+      variantId: z.string().optional().describe("Variant rsID (e.g. 'rs7903146'). Use instead of trait for variant-specific queries."),
+      limit: z.number().int().min(1).max(50).optional().default(20).describe("Max results to return (default 20, max 50)"),
+    },
+  },
+  async ({ trait, variantId, limit = 20 }) => {
+    const cleanTrait = normalizeWhitespace(trait || "");
+    const cleanVariant = normalizeWhitespace(variantId || "");
+
+    if (!cleanTrait && !cleanVariant) {
+      return { content: [{ type: "text", text: "Provide either a trait/disease name or a variant rsID." }] };
+    }
+
+    const params = new URLSearchParams({ size: String(limit), show_child_traits: "false" });
+    if (cleanVariant) {
+      params.set("variant_id", cleanVariant);
+    } else {
+      params.set("efo_trait", cleanTrait);
+    }
+
+    const url = `${GWAS_CATALOG_API}/associations?${params}`;
+    let data;
+    try {
+      data = await fetchJsonWithRetry(url, { retries: 2, timeoutMs: 15000 });
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `GWAS Catalog query failed: ${err.message}`,
+          keyFields: [`Query: ${cleanVariant || cleanTrait}`],
+          sources: [url],
+          limitations: ["The GWAS Catalog API may be temporarily unavailable. Rate limit: 15 req/s."],
+        }) }],
+      };
+    }
+
+    const associations = data?._embedded?.associations || [];
+    const totalElements = data?.page?.totalElements || 0;
+
+    if (associations.length === 0) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `No GWAS associations found for "${cleanVariant || cleanTrait}".`,
+          keyFields: [`Query: ${cleanVariant || cleanTrait}`, `Total results: 0`],
+          sources: [url],
+          limitations: ["Try alternative trait names or check EFO ontology terms at www.ebi.ac.uk/gwas."],
+        }) }],
+      };
+    }
+
+    const rows = associations.map((a) => {
+      const snps = (a.snp_allele || []).map((s) => `${s.rs_id}(${s.effect_allele})`).join(", ");
+      const genes = (a.mapped_genes || []).join(", ");
+      const traits = (a.efo_traits || []).map((t) => t.efo_trait).join("; ");
+      const pval = a.p_value != null ? Number(a.p_value).toExponential(1) : "N/A";
+      const or_val = a.or_value || "-";
+      const beta = a.beta || "-";
+      const ci = (a.ci_lower != null && a.ci_upper != null) ? `[${a.ci_lower}-${a.ci_upper}]` : "";
+      const location = (a.locations || []).join(", ");
+      return `- **${snps || "N/A"}** | genes: ${genes || "intergenic"} | trait: ${traits} | p=${pval} | OR=${or_val} beta=${beta} ${ci} | loc: ${location} | study: ${a.accession_id || ""} (PMID:${a.pubmed_id || "?"})`;
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `Found ${totalElements.toLocaleString()} GWAS associations for "${cleanVariant || cleanTrait}" (showing top ${associations.length}).`,
+          keyFields: [
+            `Query: ${cleanVariant || cleanTrait}`,
+            `Total associations: ${totalElements.toLocaleString()}`,
+            `Showing: ${associations.length}`,
+            ...rows,
+          ],
+          sources: [
+            url,
+            cleanVariant
+              ? `https://www.ebi.ac.uk/gwas/variants/${cleanVariant}`
+              : `https://www.ebi.ac.uk/gwas/search?query=${encodeURIComponent(cleanTrait)}`,
+          ],
+          limitations: [
+            "Results sorted by default API ordering. For strongest associations, filter by p-value.",
+            "GWAS Catalog contains curated top associations from published GWAS only.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// DGIdb — drug-gene interactions and druggability categories
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "search_drug_gene_interactions",
+  {
+    description:
+      "Query DGIdb for drug-gene interactions and druggability categories. Returns approved/experimental drugs " +
+      "targeting the gene, interaction types (inhibitor, agonist, etc.), evidence scores, and gene categories " +
+      "(kinase, druggable genome, clinically actionable, etc.). Use for druggability assessment.",
+    inputSchema: {
+      genes: z.array(z.string()).min(1).max(5).describe('Gene symbols (e.g. ["BRAF", "EGFR"]). Max 5.'),
+    },
+  },
+  async ({ genes }) => {
+    const cleanGenes = (genes || []).map((g) => normalizeWhitespace(g).toUpperCase()).filter(Boolean);
+    if (cleanGenes.length === 0) {
+      return { content: [{ type: "text", text: "Provide at least one gene symbol." }] };
+    }
+
+    const query = `{
+      genes(names: ${JSON.stringify(cleanGenes)}) {
+        nodes {
+          name
+          longName
+          geneCategories { name }
+          interactions {
+            drug { name conceptId approved }
+            interactionScore
+            interactionTypes { type directionality }
+            publications { pmid }
+            sources { fullName }
+          }
+        }
+      }
+    }`;
+
+    let data;
+    try {
+      const resp = await fetchJsonWithRetry(DGIDB_GRAPHQL_API, {
+        retries: 2,
+        timeoutMs: 15000,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query }),
+      });
+      data = resp?.data?.genes?.nodes || [];
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `DGIdb query failed: ${err.message}`,
+          keyFields: [`Genes: ${cleanGenes.join(", ")}`],
+          sources: [DGIDB_GRAPHQL_API],
+          limitations: ["DGIdb API may be temporarily unavailable."],
+        }) }],
+      };
+    }
+
+    if (data.length === 0) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `No genes found in DGIdb for: ${cleanGenes.join(", ")}`,
+          keyFields: [`Queried: ${cleanGenes.join(", ")}`],
+          sources: [`https://dgidb.org/genes/${cleanGenes[0]}`],
+          limitations: ["Check gene symbol spelling. DGIdb uses HUGO gene symbols."],
+        }) }],
+      };
+    }
+
+    const sections = data.map((gene) => {
+      const categories = (gene.geneCategories || []).map((c) => c.name).join(", ") || "None";
+      const interactions = gene.interactions || [];
+      const approved = interactions.filter((i) => i.drug?.approved);
+      const experimental = interactions.filter((i) => !i.drug?.approved);
+
+      const topInteractions = [...interactions]
+        .sort((a, b) => (b.interactionScore || 0) - (a.interactionScore || 0))
+        .slice(0, 15);
+
+      const drugLines = topInteractions.map((i) => {
+        const name = i.drug?.name || "Unknown";
+        const status = i.drug?.approved ? "approved" : "experimental";
+        const types = (i.interactionTypes || []).map((t) => t.type).join(", ") || "unspecified";
+        const score = i.interactionScore != null ? i.interactionScore.toFixed(3) : "N/A";
+        const pmids = (i.publications || []).slice(0, 3).map((p) => `PMID:${p.pmid}`).join(", ");
+        return `  - ${name} (${status}) | type: ${types} | score: ${score} | ${pmids}`;
+      });
+
+      return [
+        `**${gene.name}** — ${gene.longName || ""}`,
+        `Categories: ${categories}`,
+        `Total interactions: ${interactions.length} (${approved.length} approved, ${experimental.length} experimental)`,
+        `Top interactions:`,
+        ...drugLines,
+      ].join("\n");
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `DGIdb results for ${cleanGenes.join(", ")}: ${data.reduce((n, g) => n + (g.interactions || []).length, 0)} drug-gene interactions found.`,
+          keyFields: sections,
+          sources: cleanGenes.map((g) => `https://dgidb.org/genes/${g}`),
+          limitations: [
+            "Interaction scores reflect aggregated evidence; higher is stronger.",
+            "DGIdb aggregates from 40+ sources; individual source quality varies.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// GTEx — tissue-level gene expression
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "get_gene_tissue_expression",
+  {
+    description:
+      "Get median gene expression across human tissues from GTEx (v8). Returns median TPM values for ~54 tissues. " +
+      "Use for target safety assessment ('where is this gene expressed?') and tissue specificity analysis.",
+    inputSchema: {
+      geneSymbol: z.string().describe("Gene symbol (e.g. 'BRCA1', 'EGFR', 'TP53')"),
+    },
+  },
+  async ({ geneSymbol }) => {
+    const symbol = normalizeWhitespace(geneSymbol || "").toUpperCase();
+    if (!symbol) {
+      return { content: [{ type: "text", text: "Provide a gene symbol (e.g. BRCA1)." }] };
+    }
+
+    let gencodeId;
+    try {
+      const geneData = await fetchJsonWithRetry(
+        `${GTEX_API}/reference/gene?geneId=${encodeURIComponent(symbol)}&datasetId=gtex_v8`,
+        { retries: 1, timeoutMs: 10000 }
+      );
+      const genes = geneData?.data || [];
+      if (genes.length === 0) {
+        return {
+          content: [{ type: "text", text: renderStructuredResponse({
+            summary: `Gene "${symbol}" not found in GTEx.`,
+            keyFields: [`Queried: ${symbol}`],
+            sources: [`${GTEX_API}/reference/gene?geneId=${symbol}`],
+            limitations: ["Check gene symbol spelling. GTEx uses HUGO gene symbols."],
+          }) }],
+        };
+      }
+      gencodeId = genes[0].gencodeId;
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `GTEx gene lookup failed: ${err.message}`,
+          keyFields: [`Queried: ${symbol}`],
+          sources: [`${GTEX_API}/reference/gene?geneId=${symbol}`],
+          limitations: ["GTEx API may be temporarily unavailable."],
+        }) }],
+      };
+    }
+
+    let expressionData;
+    try {
+      const exprResp = await fetchJsonWithRetry(
+        `${GTEX_API}/expression/medianGeneExpression?gencodeId=${encodeURIComponent(gencodeId)}&datasetId=gtex_v8&itemsPerPage=100`,
+        { retries: 1, timeoutMs: 10000 }
+      );
+      expressionData = exprResp?.data || [];
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `GTEx expression query failed: ${err.message}`,
+          keyFields: [`Gene: ${symbol}`, `GENCODE ID: ${gencodeId}`],
+          sources: [`${GTEX_API}/expression/medianGeneExpression?gencodeId=${gencodeId}`],
+          limitations: ["GTEx API may be temporarily unavailable."],
+        }) }],
+      };
+    }
+
+    if (expressionData.length === 0) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `No expression data found for ${symbol} in GTEx.`,
+          keyFields: [`Gene: ${symbol}`, `GENCODE ID: ${gencodeId}`],
+          sources: [`https://gtexportal.org/home/gene/${symbol}`],
+          limitations: ["Gene may not have sufficient expression data in GTEx v8."],
+        }) }],
+      };
+    }
+
+    const sorted = [...expressionData].sort((a, b) => (b.median || 0) - (a.median || 0));
+    const formatTissue = (id) => id.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+
+    const tissueLines = sorted.map((t) => {
+      const tpm = (t.median || 0).toFixed(2);
+      const bar = "█".repeat(Math.min(30, Math.round((t.median || 0) / (sorted[0]?.median || 1) * 20)));
+      return `  ${formatTissue(t.tissueSiteDetailId).padEnd(45)} ${tpm.padStart(8)} TPM ${bar}`;
+    });
+
+    const maxTissue = sorted[0];
+    const expressed = sorted.filter((t) => (t.median || 0) > 1);
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `GTEx expression profile for ${symbol}: expressed (>1 TPM) in ${expressed.length}/${sorted.length} tissues. Highest in ${formatTissue(maxTissue.tissueSiteDetailId)} (${maxTissue.median.toFixed(1)} TPM).`,
+          keyFields: [
+            `Gene: ${symbol} (${gencodeId})`,
+            `Tissues with data: ${sorted.length}`,
+            `Tissues >1 TPM: ${expressed.length}`,
+            `Highest expression: ${formatTissue(maxTissue.tissueSiteDetailId)} (${maxTissue.median.toFixed(1)} TPM)`,
+            `\nExpression by tissue (median TPM, GTEx v8):`,
+            ...tissueLines,
+          ],
+          sources: [`https://gtexportal.org/home/gene/${symbol}`],
+          limitations: [
+            "Values are median TPM from GTEx v8 (948 donors, 54 tissues).",
+            "Expression in cell lines may not reflect in vivo tissue expression.",
+            "GTEx samples are from post-mortem donors; disease-state expression may differ.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// RCSB PDB — experimental protein structures
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "search_protein_structures",
+  {
+    description:
+      "Search RCSB PDB for experimentally determined protein structures. Query by UniProt accession (e.g. 'P15056') " +
+      "or gene name. Returns PDB IDs, resolution, experimental method, title, deposition date, and ligands. " +
+      "Complements AlphaFold predictions with actual experimental structures.",
+    inputSchema: {
+      query: z.string().describe("UniProt accession (e.g. 'P15056' for BRAF) or gene name (e.g. 'BRAF')"),
+      limit: z.number().int().min(1).max(20).optional().default(10).describe("Max structures to return (default 10)"),
+    },
+  },
+  async ({ query: rawQuery, limit = 10 }) => {
+    const q = normalizeWhitespace(rawQuery || "");
+    if (!q) {
+      return { content: [{ type: "text", text: "Provide a UniProt accession or gene name." }] };
+    }
+
+    const isUniprot = /^[A-Z][0-9][A-Z0-9]{3}[0-9]$/i.test(q) || /^[A-Z][0-9][A-Z0-9]{3}[0-9]-\d+$/i.test(q);
+
+    const searchBody = isUniprot
+      ? {
+          query: {
+            type: "terminal",
+            service: "text",
+            parameters: {
+              attribute: "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",
+              operator: "in",
+              value: [q.toUpperCase()],
+              negation: false,
+            },
+          },
+          return_type: "entry",
+          request_options: {
+            paginate: { start: 0, rows: limit },
+            results_content_type: ["experimental"],
+            sort: [{ sort_by: "rcsb_accession_info.initial_release_date", direction: "desc" }],
+          },
+        }
+      : {
+          query: {
+            type: "terminal",
+            service: "full_text",
+            parameters: { value: q },
+          },
+          return_type: "entry",
+          request_options: {
+            paginate: { start: 0, rows: limit },
+            results_content_type: ["experimental"],
+            sort: [{ sort_by: "rcsb_accession_info.initial_release_date", direction: "desc" }],
+          },
+        };
+
+    let searchResult;
+    try {
+      searchResult = await fetchJsonWithRetry(RCSB_SEARCH_API, {
+        retries: 2,
+        timeoutMs: 15000,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(searchBody),
+      });
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `RCSB PDB search failed: ${err.message}`,
+          keyFields: [`Query: ${q}`],
+          sources: ["https://www.rcsb.org/"],
+          limitations: ["RCSB API may be temporarily unavailable."],
+        }) }],
+      };
+    }
+
+    const totalCount = searchResult?.total_count || 0;
+    const entries = searchResult?.result_set || [];
+
+    if (entries.length === 0) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `No PDB structures found for "${q}".`,
+          keyFields: [`Query: ${q}`, `Total: 0`],
+          sources: [`https://www.rcsb.org/search?request=${encodeURIComponent(q)}`],
+          limitations: ["Try a UniProt accession for more precise results."],
+        }) }],
+      };
+    }
+
+    const pdbIds = entries.map((e) => e.identifier);
+    const details = await Promise.allSettled(
+      pdbIds.map((id) =>
+        fetchJsonWithRetry(`${RCSB_DATA_API}/core/entry/${id}`, { retries: 1, timeoutMs: 8000 })
+      )
+    );
+
+    const structureLines = pdbIds.map((id, i) => {
+      const d = details[i].status === "fulfilled" ? details[i].value : null;
+      if (!d) return `- **${id}** — details unavailable`;
+      const title = normalizeWhitespace(d?.struct?.title || "N/A");
+      const method = d?.exptl?.[0]?.method || "N/A";
+      const resolution = d?.rcsb_entry_info?.resolution_combined?.[0];
+      const resStr = resolution != null ? `${resolution.toFixed(2)} Å` : "N/A";
+      const deposited = d?.rcsb_accession_info?.deposit_date?.slice(0, 10) || "N/A";
+      const ligands = (d?.rcsb_entry_info?.nonpolymer_bound_components || []).join(", ") || "none";
+      return `- **[${id}](https://www.rcsb.org/structure/${id})** | ${method} ${resStr} | deposited: ${deposited} | ligands: ${ligands}\n  ${title}`;
+    });
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `Found ${totalCount} PDB structures for "${q}" (showing ${pdbIds.length}, newest first).`,
+          keyFields: [
+            `Query: ${q}`,
+            `Total structures: ${totalCount}`,
+            `Showing: ${pdbIds.length}`,
+            ...structureLines,
+          ],
+          sources: [
+            isUniprot
+              ? `https://www.rcsb.org/search?request=${q}`
+              : `https://www.rcsb.org/search?request=${encodeURIComponent(q)}`,
+          ],
+          limitations: [
+            "Results sorted by deposition date (newest first).",
+            "Resolution values are in Ångströms; lower is better (< 2.0 Å = high quality).",
+            "For predicted structures, use the AlphaFold tool instead.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// cBioPortal — cancer mutation profiles across TCGA studies
+// ---------------------------------------------------------------------------
+
+const TCGA_PAN_CANCER_STUDIES = [
+  "acc_tcga_pan_can_atlas_2018", "blca_tcga_pan_can_atlas_2018", "brca_tcga_pan_can_atlas_2018",
+  "cesc_tcga_pan_can_atlas_2018", "chol_tcga_pan_can_atlas_2018", "coadread_tcga_pan_can_atlas_2018",
+  "dlbc_tcga_pan_can_atlas_2018", "esca_tcga_pan_can_atlas_2018", "gbm_tcga_pan_can_atlas_2018",
+  "hnsc_tcga_pan_can_atlas_2018", "kich_tcga_pan_can_atlas_2018", "kirc_tcga_pan_can_atlas_2018",
+  "kirp_tcga_pan_can_atlas_2018", "laml_tcga_pan_can_atlas_2018", "lgg_tcga_pan_can_atlas_2018",
+  "lihc_tcga_pan_can_atlas_2018", "luad_tcga_pan_can_atlas_2018", "lusc_tcga_pan_can_atlas_2018",
+  "meso_tcga_pan_can_atlas_2018", "ov_tcga_pan_can_atlas_2018", "paad_tcga_pan_can_atlas_2018",
+  "pcpg_tcga_pan_can_atlas_2018", "prad_tcga_pan_can_atlas_2018", "sarc_tcga_pan_can_atlas_2018",
+  "skcm_tcga_pan_can_atlas_2018", "stad_tcga_pan_can_atlas_2018", "tgct_tcga_pan_can_atlas_2018",
+  "thca_tcga_pan_can_atlas_2018", "thym_tcga_pan_can_atlas_2018", "ucec_tcga_pan_can_atlas_2018",
+  "ucs_tcga_pan_can_atlas_2018", "uvm_tcga_pan_can_atlas_2018",
+];
+
+server.registerTool(
+  "get_cancer_mutation_profile",
+  {
+    description:
+      "Get mutation profile for a gene across cancer types from cBioPortal (TCGA Pan-Cancer Atlas). " +
+      "Returns mutation counts by cancer type, most frequent protein changes, and mutation types. " +
+      "Use for oncology questions like 'how often is BRAF mutated in melanoma?'.",
+    inputSchema: {
+      geneSymbol: z.string().describe("Gene symbol (e.g. 'BRAF', 'TP53', 'KRAS')"),
+    },
+  },
+  async ({ geneSymbol }) => {
+    const symbol = normalizeWhitespace(geneSymbol || "").toUpperCase();
+    if (!symbol) {
+      return { content: [{ type: "text", text: "Provide a gene symbol (e.g. BRAF)." }] };
+    }
+
+    let entrezGeneId;
+    try {
+      const geneInfo = await fetchJsonWithRetry(
+        `${CBIOPORTAL_API}/genes/${encodeURIComponent(symbol)}`,
+        { retries: 1, timeoutMs: 8000 }
+      );
+      entrezGeneId = geneInfo?.entrezGeneId;
+      if (!entrezGeneId) throw new Error("Gene not found");
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `Gene "${symbol}" not found in cBioPortal.`,
+          keyFields: [`Queried: ${symbol}`],
+          sources: [`${CBIOPORTAL_API}/genes/${symbol}`],
+          limitations: ["Check gene symbol spelling. cBioPortal uses HUGO gene symbols."],
+        }) }],
+      };
+    }
+
+    const mutationProfileIds = TCGA_PAN_CANCER_STUDIES.map((s) => `${s}_mutations`);
+
+    let mutations;
+    try {
+      mutations = await fetchJsonWithRetry(
+        `${CBIOPORTAL_API}/mutations/fetch?projection=SUMMARY`,
+        {
+          retries: 2,
+          timeoutMs: 30000,
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({ entrezGeneIds: [entrezGeneId], molecularProfileIds: mutationProfileIds }),
+        }
+      );
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `cBioPortal mutation query failed: ${err.message}`,
+          keyFields: [`Gene: ${symbol} (Entrez: ${entrezGeneId})`],
+          sources: [`https://www.cbioportal.org/results/mutations?gene_list=${symbol}`],
+          limitations: ["cBioPortal API may be temporarily slow for pan-cancer queries."],
+        }) }],
+      };
+    }
+
+    if (!mutations || mutations.length === 0) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `No mutations found for ${symbol} across TCGA Pan-Cancer Atlas studies.`,
+          keyFields: [`Gene: ${symbol}`, `Studies queried: ${TCGA_PAN_CANCER_STUDIES.length}`],
+          sources: [`https://www.cbioportal.org/results/mutations?gene_list=${symbol}`],
+          limitations: ["Gene may not be frequently mutated in TCGA cohorts."],
+        }) }],
+      };
+    }
+
+    const byCancerType = {};
+    const mutationTypeCounts = {};
+    const proteinChangeCounts = {};
+
+    for (const m of mutations) {
+      const study = (m.studyId || "unknown").replace(/_tcga_pan_can_atlas_2018$/, "").toUpperCase();
+      byCancerType[study] = (byCancerType[study] || 0) + 1;
+      const mtype = m.mutationType || "Unknown";
+      mutationTypeCounts[mtype] = (mutationTypeCounts[mtype] || 0) + 1;
+      const pc = m.proteinChange;
+      if (pc) proteinChangeCounts[pc] = (proteinChangeCounts[pc] || 0) + 1;
+    }
+
+    const sortedCancerTypes = Object.entries(byCancerType).sort((a, b) => b[1] - a[1]);
+    const sortedProteinChanges = Object.entries(proteinChangeCounts).sort((a, b) => b[1] - a[1]).slice(0, 15);
+    const sortedMutTypes = Object.entries(mutationTypeCounts).sort((a, b) => b[1] - a[1]);
+
+    const cancerLines = sortedCancerTypes.map(
+      ([type, count]) => `  ${type.padEnd(12)} ${String(count).padStart(5)} mutations`
+    );
+
+    const hotspotLines = sortedProteinChanges.map(
+      ([change, count]) => `  ${change.padEnd(15)} ${String(count).padStart(4)}x`
+    );
+
+    const typeSummary = sortedMutTypes.map(([t, c]) => `${t}: ${c}`).join(", ");
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `${symbol}: ${mutations.length} mutations across ${sortedCancerTypes.length} cancer types (TCGA Pan-Cancer Atlas). Most mutated in ${sortedCancerTypes[0][0]} (${sortedCancerTypes[0][1]}).`,
+          keyFields: [
+            `Gene: ${symbol} (Entrez: ${entrezGeneId})`,
+            `Total mutations: ${mutations.length}`,
+            `Cancer types with mutations: ${sortedCancerTypes.length}/${TCGA_PAN_CANCER_STUDIES.length}`,
+            `Mutation types: ${typeSummary}`,
+            `\nMutations by cancer type:`,
+            ...cancerLines,
+            `\nTop protein changes (hotspots):`,
+            ...hotspotLines,
+          ],
+          sources: [
+            `https://www.cbioportal.org/results/mutations?gene_list=${symbol}&cancer_study_list=`,
+          ],
+          limitations: [
+            "Data from TCGA Pan-Cancer Atlas (32 cancer types, ~10,000 samples).",
+            "Mutation counts are absolute; frequency depends on cohort size per cancer type.",
+            "Does not include non-TCGA studies. Query cBioPortal directly for broader coverage.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// PubChem — chemical compound data
+// ---------------------------------------------------------------------------
+
+const PUBCHEM_PROPERTIES = [
+  "MolecularFormula", "MolecularWeight", "IUPACName", "CanonicalSMILES",
+  "InChIKey", "XLogP", "ExactMass", "HBondDonorCount", "HBondAcceptorCount",
+  "RotatableBondCount", "TPSA", "Complexity",
+].join(",");
+
+server.registerTool(
+  "get_pubchem_compound",
+  {
+    description:
+      "Look up a chemical compound in PubChem by name, CID, or SMILES. Returns molecular properties " +
+      "(formula, weight, SMILES, InChIKey, XLogP, H-bond donors/acceptors, polar surface area), " +
+      "description, and synonyms. Use for chemistry and pharmacology questions.",
+    inputSchema: {
+      query: z.string().describe("Compound name (e.g. 'metformin'), PubChem CID (e.g. '2244'), or SMILES string"),
+      queryType: z.enum(["name", "cid", "smiles"]).optional().default("name")
+        .describe("Type of query: 'name' (default), 'cid' (PubChem compound ID), or 'smiles'"),
+    },
+  },
+  async ({ query: rawQuery, queryType = "name" }) => {
+    const q = normalizeWhitespace(rawQuery || "");
+    if (!q) {
+      return { content: [{ type: "text", text: "Provide a compound name, CID, or SMILES string." }] };
+    }
+
+    const namespace = queryType === "cid" ? "cid" : queryType === "smiles" ? "smiles" : "name";
+    const encodedQ = encodeURIComponent(q);
+    const baseUrl = `${PUBCHEM_API}/compound/${namespace}/${encodedQ}`;
+
+    const [propsResult, descResult, synResult] = await Promise.allSettled([
+      fetchJsonWithRetry(`${baseUrl}/property/${PUBCHEM_PROPERTIES}/JSON`, { retries: 1, timeoutMs: 10000 }),
+      fetchJsonWithRetry(`${baseUrl}/description/JSON`, { retries: 1, timeoutMs: 10000 }),
+      fetchJsonWithRetry(`${baseUrl}/synonyms/JSON`, { retries: 1, timeoutMs: 10000 }),
+    ]);
+
+    const props = propsResult.status === "fulfilled"
+      ? propsResult.value?.PropertyTable?.Properties?.[0]
+      : null;
+
+    if (!props) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `Compound "${q}" not found in PubChem.`,
+          keyFields: [`Query: ${q} (${namespace})`],
+          sources: [`https://pubchem.ncbi.nlm.nih.gov/#query=${encodeURIComponent(q)}`],
+          limitations: ["Check compound name spelling. Try alternative names or SMILES."],
+        }) }],
+      };
+    }
+
+    const cid = props.CID;
+
+    const descriptions = descResult.status === "fulfilled"
+      ? (descResult.value?.InformationList?.Information || [])
+          .filter((i) => i.Description)
+          .map((i) => normalizeWhitespace(i.Description))
+          .slice(0, 2)
+      : [];
+
+    const synonyms = synResult.status === "fulfilled"
+      ? (synResult.value?.InformationList?.Information?.[0]?.Synonym || []).slice(0, 10)
+      : [];
+
+    const keyFields = [
+      `PubChem CID: [${cid}](https://pubchem.ncbi.nlm.nih.gov/compound/${cid})`,
+      `IUPAC Name: ${props.IUPACName || "N/A"}`,
+      `Formula: ${props.MolecularFormula || "N/A"}`,
+      `Molecular Weight: ${props.MolecularWeight || "N/A"} g/mol`,
+      `Exact Mass: ${props.ExactMass || "N/A"}`,
+      `SMILES: ${props.ConnectivitySMILES || props.CanonicalSMILES || "N/A"}`,
+      `InChIKey: ${props.InChIKey || "N/A"}`,
+      `XLogP: ${props.XLogP != null ? props.XLogP : "N/A"}`,
+      `H-bond Donors: ${props.HBondDonorCount != null ? props.HBondDonorCount : "N/A"}`,
+      `H-bond Acceptors: ${props.HBondAcceptorCount != null ? props.HBondAcceptorCount : "N/A"}`,
+      `Rotatable Bonds: ${props.RotatableBondCount != null ? props.RotatableBondCount : "N/A"}`,
+      `Topological Polar Surface Area: ${props.TPSA != null ? props.TPSA + " Å²" : "N/A"}`,
+      `Complexity: ${props.Complexity != null ? props.Complexity : "N/A"}`,
+    ];
+
+    if (synonyms.length > 0) keyFields.push(`\nSynonyms: ${synonyms.join(", ")}`);
+    if (descriptions.length > 0) keyFields.push(`\nDescription: ${descriptions.join(" ")}`);
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `PubChem compound: ${props.IUPACName || q} (CID ${cid}, MW ${props.MolecularWeight} g/mol, XLogP ${props.XLogP != null ? props.XLogP : "N/A"}).`,
+          keyFields,
+          sources: [`https://pubchem.ncbi.nlm.nih.gov/compound/${cid}`],
+          limitations: [
+            "XLogP is a computed partition coefficient; negative values indicate hydrophilicity.",
+            "Lipinski's Rule of 5: MW <= 500, XLogP <= 5, HBD <= 5, HBA <= 10 for oral drug-likeness.",
+            "Rate limit: 5 requests/second to PubChem PUG-REST.",
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// ChEMBL REST API — Bioactivity & Selectivity
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "get_chembl_bioactivities",
+  {
+    description:
+      "Get bioactivity data (IC50, Ki, Kd, EC50) for a drug from ChEMBL REST API. " +
+      "Returns activity values grouped by target with min/median values — ideal for kinase selectivity " +
+      "profiling and off-target assessment. Prefer this over BigQuery ebi_chembl for bioactivity lookups.",
+    inputSchema: {
+      drugName: z.string().describe("Drug name (e.g. 'tofacitinib') or ChEMBL ID (e.g. 'CHEMBL221959')"),
+      activityTypes: z.string().optional().default("IC50,Ki,Kd")
+        .describe("Comma-separated activity types to retrieve (default: 'IC50,Ki,Kd')"),
+      targetFilter: z.string().optional()
+        .describe("Optional substring to filter target names (e.g. 'JAK', 'kinase'). Case-insensitive."),
+    },
+  },
+  async ({ drugName, activityTypes = "IC50,Ki,Kd", targetFilter }) => {
+    const name = normalizeWhitespace(drugName || "");
+    if (!name) {
+      return { content: [{ type: "text", text: "Provide a drug name or ChEMBL ID." }] };
+    }
+
+    let chemblId = name.toUpperCase().startsWith("CHEMBL") ? name.toUpperCase() : null;
+
+    if (!chemblId) {
+      try {
+        const searchResult = await fetchJsonWithRetry(
+          `${CHEMBL_API}/molecule/search.json?q=${encodeURIComponent(name)}&limit=5`,
+          { retries: 1, timeoutMs: 10000 }
+        );
+        const molecules = searchResult?.molecules || [];
+        const exact = molecules.find(
+          (m) => (m.pref_name || "").toLowerCase() === name.toLowerCase()
+        ) || molecules[0];
+        if (exact) chemblId = exact.molecule_chembl_id;
+      } catch (_) { /* fall through */ }
+    }
+
+    if (!chemblId) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `Drug "${name}" not found in ChEMBL.`,
+          keyFields: [`Query: ${name}`],
+          sources: [`${CHEMBL_API}/molecule/search.json?q=${encodeURIComponent(name)}`],
+          limitations: ["Try the generic drug name or a ChEMBL ID (e.g. CHEMBL221959)."],
+        }) }],
+      };
+    }
+
+    const types = normalizeWhitespace(activityTypes).split(",").map((t) => t.trim()).filter(Boolean).join(",");
+    const activityUrl =
+      `${CHEMBL_API}/activity.json?molecule_chembl_id=${chemblId}` +
+      `&standard_type__in=${encodeURIComponent(types)}` +
+      `&target_organism=Homo%20sapiens&limit=1000`;
+
+    let activities;
+    try {
+      const result = await fetchJsonWithRetry(activityUrl, { retries: 2, timeoutMs: 20000 });
+      activities = result?.activities || [];
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `ChEMBL activity query failed: ${err.message}`,
+          keyFields: [`Drug: ${chemblId}`],
+          sources: [activityUrl],
+          limitations: ["ChEMBL API may be temporarily slow. Try again."],
+        }) }],
+      };
+    }
+
+    if (activities.length === 0) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `No bioactivity data (${types}) found for ${chemblId} against human targets.`,
+          keyFields: [`Drug: ${chemblId}`, `Activity types: ${types}`],
+          sources: [`https://www.ebi.ac.uk/chembl/compound_report_card/${chemblId}/`],
+          limitations: ["Try broader activity types (e.g. IC50,Ki,Kd,EC50,Potency)."],
+        }) }],
+      };
+    }
+
+    const byTarget = {};
+    for (const a of activities) {
+      const tgt = a.target_pref_name || "Unknown";
+      const stype = a.standard_type || "?";
+      const val = parseFloat(a.standard_value);
+      const units = a.standard_units || "nM";
+      if (isNaN(val)) continue;
+
+      const key = `${tgt} | ${stype}`;
+      if (!byTarget[key]) byTarget[key] = { target: tgt, type: stype, units, values: [] };
+      byTarget[key].values.push(val);
+    }
+
+    let entries = Object.values(byTarget);
+
+    if (targetFilter) {
+      const filter = targetFilter.toLowerCase();
+      entries = entries.filter((e) => e.target.toLowerCase().includes(filter));
+    }
+
+    entries.sort((a, b) => Math.min(...a.values) - Math.min(...b.values));
+
+    const median = (arr) => {
+      const s = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(s.length / 2);
+      return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+    };
+
+    const lines = entries.slice(0, 40).map((e) => {
+      const min = Math.min(...e.values);
+      const med = median(e.values);
+      return `  ${e.target.substring(0, 50).padEnd(50)} ${e.type.padEnd(6)} ` +
+        `n=${String(e.values.length).padStart(3)}  min=${String(min.toFixed(1)).padStart(10)} ${e.units}` +
+        (e.values.length > 1 ? `  median=${med.toFixed(1)}` : "");
+    });
+
+    const keyFields = [
+      `Drug: ${chemblId}`,
+      `Activity types: ${types}`,
+      `Total data points: ${activities.length}`,
+      `Unique targets: ${entries.length}${targetFilter ? ` (filtered by "${targetFilter}")` : ""}`,
+    ];
+
+    if (lines.length > 0) {
+      keyFields.push(`\nBioactivity by target (sorted by potency):`);
+      keyFields.push(...lines);
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `ChEMBL: ${activities.length} bioactivity records for ${chemblId} across ${entries.length} targets. ` +
+            `Most potent: ${entries[0]?.target} (${entries[0]?.type} min ${Math.min(...(entries[0]?.values || [0])).toFixed(1)} ${entries[0]?.units || "nM"}).`,
+          keyFields,
+          sources: [`https://www.ebi.ac.uk/chembl/compound_report_card/${chemblId}/`],
+          limitations: [
+            "Values from different assays are not directly comparable (different assay conditions).",
+            "Showing min and median across all deposited measurements per target.",
+            `Limited to first 1000 activity records from ChEMBL (${types}).`,
+          ],
+        }),
+      }],
+    };
+  }
+);
+
+// ---------------------------------------------------------------------------
+// openFDA FAERS — Adverse Event Reports
+// ---------------------------------------------------------------------------
+
+const OPENFDA_API = "https://api.fda.gov/drug/event.json";
+
+server.registerTool(
+  "search_fda_adverse_events",
+  {
+    description:
+      "Search FDA FAERS (post-marketing adverse event reports) for a drug. " +
+      "Returns top adverse reactions by frequency, total report count, serious vs non-serious breakdown, " +
+      "and top reported indications. Use for drug safety questions like 'what are the side effects of sotorasib?'.",
+    inputSchema: {
+      drugName: z.string().describe("Drug generic name, brand name, or active ingredient (e.g. 'sotorasib', 'lumakras', 'ibuprofen')"),
+      limit: z.number().optional().default(20).describe("Max adverse reactions to return (default 20)"),
+    },
+  },
+  async ({ drugName, limit = 20 }) => {
+    const name = normalizeWhitespace(drugName || "");
+    if (!name) {
+      return { content: [{ type: "text", text: "Provide a drug name (e.g. sotorasib)." }] };
+    }
+
+    const boundedLimit = Math.min(Math.max(limit, 5), 50);
+    const encoded = encodeURIComponent(name);
+    const searchFields = [
+      `patient.drug.openfda.generic_name:"${encoded}"`,
+      `patient.drug.openfda.brand_name:"${encoded}"`,
+      `patient.drug.openfda.substance_name:"${encoded}"`,
+    ].join("+");
+
+    const [reactionsResult, seriousResult, indicationsResult, totalResult] = await Promise.allSettled([
+      fetchJsonWithRetry(
+        `${OPENFDA_API}?search=${searchFields}&count=patient.reaction.reactionmeddrapt.exact&limit=${boundedLimit}`,
+        { retries: 1, timeoutMs: 12000 }
+      ),
+      fetchJsonWithRetry(
+        `${OPENFDA_API}?search=${searchFields}&count=serious`,
+        { retries: 1, timeoutMs: 10000 }
+      ),
+      fetchJsonWithRetry(
+        `${OPENFDA_API}?search=${searchFields}&count=patient.drug.drugindication.exact&limit=10`,
+        { retries: 1, timeoutMs: 10000 }
+      ),
+      fetchJsonWithRetry(
+        `${OPENFDA_API}?search=${searchFields}&limit=1`,
+        { retries: 1, timeoutMs: 10000 }
+      ),
+    ]);
+
+    const reactions = reactionsResult.status === "fulfilled"
+      ? (reactionsResult.value?.results || [])
+      : [];
+    const seriousCounts = seriousResult.status === "fulfilled"
+      ? (seriousResult.value?.results || [])
+      : [];
+    const indications = indicationsResult.status === "fulfilled"
+      ? (indicationsResult.value?.results || [])
+      : [];
+    const totalReports = totalResult.status === "fulfilled"
+      ? (totalResult.value?.meta?.results?.total || 0)
+      : 0;
+
+    if (reactions.length === 0 && totalReports === 0) {
+      return {
+        content: [{ type: "text", text: renderStructuredResponse({
+          summary: `No FDA FAERS adverse event reports found for "${name}".`,
+          keyFields: [`Drug: ${name}`],
+          sources: [`https://api.fda.gov/drug/event.json?search=patient.drug.openfda.generic_name:"${encoded}"`],
+          limitations: [
+            "Try alternative drug names (generic, brand, or active ingredient).",
+            "Very new drugs may have limited FAERS data.",
+          ],
+        }) }],
+      };
+    }
+
+    const seriousMap = {};
+    for (const s of seriousCounts) {
+      if (s.term === 1) seriousMap.serious = s.count;
+      else if (s.term === 2) seriousMap.nonSerious = s.count;
+    }
+
+    const reactionLines = reactions.map(
+      (r, i) => `  ${String(i + 1).padStart(2)}. ${r.term.padEnd(45)} ${String(r.count).padStart(5)} reports`
+    );
+
+    const indicationLines = indications.slice(0, 8).map(
+      (ind) => `  ${ind.term}: ${ind.count}`
+    );
+
+    const keyFields = [
+      `Drug: ${name}`,
+      `Total FAERS reports: ${totalReports.toLocaleString()}`,
+    ];
+
+    if (seriousMap.serious != null || seriousMap.nonSerious != null) {
+      keyFields.push(`Serious: ${(seriousMap.serious || 0).toLocaleString()} | Non-serious: ${(seriousMap.nonSerious || 0).toLocaleString()}`);
+    }
+
+    if (reactionLines.length > 0) {
+      keyFields.push(`\nTop adverse reactions (by report count):`);
+      keyFields.push(...reactionLines);
+    }
+
+    if (indicationLines.length > 0) {
+      keyFields.push(`\nTop reported indications:`);
+      keyFields.push(...indicationLines);
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary: `FDA FAERS: ${totalReports.toLocaleString()} adverse event reports for ${name}. ` +
+            `${seriousMap.serious ? seriousMap.serious.toLocaleString() + " serious. " : ""}` +
+            `Most reported: ${reactions.slice(0, 3).map((r) => r.term.toLowerCase()).join(", ")}.`,
+          keyFields,
+          sources: [
+            `https://api.fda.gov/drug/event.json?search=patient.drug.openfda.generic_name:"${encoded}"`,
+            "https://open.fda.gov/apis/drug/event/",
+          ],
+          limitations: [
+            "FAERS is a spontaneous reporting system — counts reflect reports, not incidence rates.",
+            "Reporting bias: serious events and events with new drugs are over-represented.",
+            "A report does not prove causation between the drug and the adverse event.",
+          ],
+        }),
+      }],
+    };
   }
 );
 

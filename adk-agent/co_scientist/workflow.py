@@ -113,6 +113,8 @@ KNOWN_MCP_TOOLS = [
     "get_uniprot_protein_profile",
     "search_reactome_pathways",
     "get_string_interactions",
+    "get_chembl_bioactivities",
+    "search_fda_adverse_events",
     "benchmark_dataset_overview",
     "check_gpqa_access",
 ]
@@ -134,6 +136,8 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "get_uniprot_protein_profile": "Detailed protein profile (isoforms, PTMs, function)",
     "search_reactome_pathways": "Search biological pathway hierarchies",
     "get_string_interactions": "Get protein-protein interaction networks from STRING",
+    "get_chembl_bioactivities": "Get bioactivity data (IC50, Ki, Kd) for a drug from ChEMBL — selectivity profiling",
+    "search_fda_adverse_events": "Search FDA FAERS for post-marketing adverse event reports by drug name",
     "benchmark_dataset_overview": "Overview of available benchmark datasets",
     "check_gpqa_access": "Check access to GPQA benchmark",
 }
@@ -147,16 +151,36 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     "ebi_chembl": "ChEMBL",
     "gnomad": "gnomAD",
     "human_genome_variants": "Human Genome Variants",
-    "human_variant_annotation": "Ensembl Variant Annotations",
-    "deepmind_alphafold": "AlphaFold",
+    "human_variant_annotation": "ClinVar (BigQuery)",
     "immune_epitope_db": "IEDB",
     "nlm_rxnorm": "RxNorm",
     "fda_drug": "FDA Drug (BigQuery)",
     "umiami_lincs": "LINCS L1000",
     "ebi_surechembl": "SureChEMBL",
-    "hackathon_data": "CIViC / ClinGen / GTEx",
-    "civic": "CIViC",
-    "clingen": "ClinGen",
+    # Variant annotation APIs
+    "annotate_variants_vep": "Ensembl VEP",
+    "get_variant_annotations": "MyVariant.info",
+    # CIViC (clinical variant interpretations)
+    "search_civic_variants": "CIViC",
+    "search_civic_genes": "CIViC",
+    # AlphaFold (protein structure predictions)
+    "get_alphafold_structure": "AlphaFold API",
+    # GWAS Catalog (trait-variant associations)
+    "search_gwas_associations": "GWAS Catalog",
+    # DGIdb (drug-gene interactions)
+    "search_drug_gene_interactions": "DGIdb",
+    # GTEx (tissue expression)
+    "get_gene_tissue_expression": "GTEx",
+    # RCSB PDB (experimental protein structures)
+    "search_protein_structures": "RCSB PDB",
+    # cBioPortal (cancer mutation profiles)
+    "get_cancer_mutation_profile": "cBioPortal",
+    # ChEMBL REST API (bioactivity & selectivity)
+    "get_chembl_bioactivities": "ChEMBL API",
+    # PubChem (chemical compound data)
+    "get_pubchem_compound": "PubChem",
+    # FDA FAERS (post-marketing adverse events)
+    "search_fda_adverse_events": "FDA FAERS (openFDA)",
     # PubMed (NCBI E-utilities)
     "search_pubmed": "PubMed",
     "search_pubmed_advanced": "PubMed",
@@ -251,11 +275,16 @@ Rules:
   treat it as illustrative — accept any valid result that fulfills the intent, not the exact example value.
 - Prioritize high-signal evidence before broad expansion.
 - Surface contradictions and unresolved gaps explicitly.
-- Include source identifiers when available (PMID, DOI, NCT, OpenAlex IDs).
+- Include source identifiers when available (PMID, DOI, NCT, OpenAlex IDs, UniProt accessions, PubChem CIDs, PDB IDs, dbSNP rsIDs, ChEMBL IDs, Reactome IDs, GWAS Catalog IDs).
 
 Evidence ID requirements:
-- evidence_ids MUST be populated with real, specific identifiers (PMID:XXXXXXXX, DOI:10.xxxx,
-  NCT########) returned directly by tool calls. Never fabricate identifiers.
+- evidence_ids MUST be populated with real, specific identifiers returned directly by tool
+  calls. Never fabricate identifiers. Use these canonical formats:
+  Literature: PMID:XXXXXXXX, DOI:10.xxxx/..., NCT########, OpenAlex:WXXXXXXX, PMC########
+  Databases:  UniProt:XXXXXX, PubChem:NNNN, PDB:XXXX, rsNNNNNN, CHEMBLNNNN,
+              Reactome:R-HSA-NNNNNNN, GCSTNNNNNN
+- When a tool returns a database record identifier (UniProt accession, PubChem CID, PDB code,
+  rsID, ChEMBL ID, Reactome stable ID, GWAS Catalog study ID), always include it in evidence_ids.
 - If the primary tool for this step does not return individual document IDs (e.g. BigQuery
   aggregate queries), make a secondary call to search_pubmed or search_openalex_works using
   key terms from the findings to harvest supporting PMIDs or DOIs.
@@ -273,7 +302,7 @@ Output requirements:
     "status": "completed" | "blocked",
     "step_progress_note": "<1-2 sentence progress update>",
     "result_summary": "<concise findings summary>",
-    "evidence_ids": ["PMID:...", "NCT:..."],
+    "evidence_ids": ["PMID:...", "NCT:...", "UniProt:...", "rs...", "CHEMBL..."],
     "open_gaps": ["..."],
     "suggested_next_searches": ["..."]
   }
@@ -315,6 +344,7 @@ Rules:
 - Be specific and thorough — avoid terse output.
 - Use ONLY human-readable database/source names (e.g. "PubMed", "ClinicalTrials.gov"). NEVER mention tool names (like run_bigquery_select_query, search_clinical_trials, etc.).
 - Include specific identifiers inline when available (PMID, DOI, NCT numbers).
+- For database records, include identifiers with their canonical prefix so they can be linked: UniProt:P00533, PubChem:2244, PDB:1ABC, rs7903146, CHEMBL25, Reactome:R-HSA-1234567, GCST000001.
 - NEVER include raw URLs, API endpoints, or links to JSON output.
 - Return user-facing Markdown only (not JSON).
 """
@@ -994,7 +1024,14 @@ _INLINE_ID_RE = re.compile(
     r"|\bDOI\s*:?\s*(?P<doi>10\.\S+?)(?=[,;\s\)\]>]|$)"
     r"|\b(?P<nct>NCT\d{8})\b"
     r"|\bOpenAlex\s*:?\s*(?P<openalex>W\d+)\b"
-    r"|\b(?P<pmc>PMC\d+)\b",
+    r"|\b(?P<pmc>PMC\d+)\b"
+    r"|\bUniProt\s*:\s*(?P<uniprot>[A-Z][A-Z0-9]{2,9})\b"
+    r"|\bPubChem\s*:\s*(?P<pubchem>\d+)\b"
+    r"|\bPDB\s*:\s*(?P<pdb>[A-Za-z0-9]{4})\b"
+    r"|\b(?P<rsid>rs\d{3,})\b"
+    r"|\b(?P<chembl>CHEMBL\d+)\b"
+    r"|\bReactome\s*:?\s*(?P<reactome>R-[A-Z]{3}-\d+)\b"
+    r"|\b(?P<gcst>GCST\d{4,})\b",
     re.IGNORECASE,
 )
 
@@ -1017,6 +1054,27 @@ def _evidence_id_to_url(eid: str) -> str | None:
     m = re.fullmatch(r"(?i)(?:PMC:)?(PMC\d+)", raw)
     if m:
         return f"https://www.ncbi.nlm.nih.gov/pmc/articles/{m.group(1)}/"
+    m = re.fullmatch(r"(?i)UniProt:([A-Z][A-Z0-9]{2,9})", raw)
+    if m:
+        return f"https://www.uniprot.org/uniprotkb/{m.group(1)}"
+    m = re.fullmatch(r"(?i)PubChem:(\d+)", raw)
+    if m:
+        return f"https://pubchem.ncbi.nlm.nih.gov/compound/{m.group(1)}"
+    m = re.fullmatch(r"(?i)PDB:([A-Za-z0-9]{4,8})", raw)
+    if m:
+        return f"https://www.rcsb.org/structure/{m.group(1).upper()}"
+    m = re.fullmatch(r"(?i)(rs\d+)", raw)
+    if m:
+        return f"https://www.ncbi.nlm.nih.gov/snp/{m.group(1).lower()}"
+    m = re.fullmatch(r"(?i)(?:ChEMBL:)?(CHEMBL\d+)", raw)
+    if m:
+        return f"https://www.ebi.ac.uk/chembl/compound_report_card/{m.group(1).upper()}"
+    m = re.fullmatch(r"(?i)(?:Reactome:)?(R-[A-Z]{3}-\d+)", raw)
+    if m:
+        return f"https://reactome.org/content/detail/{m.group(1)}"
+    m = re.fullmatch(r"(?i)(GCST\d+)", raw)
+    if m:
+        return f"https://www.ebi.ac.uk/gwas/studies/{m.group(1).upper()}"
     return None
 
 
@@ -1035,6 +1093,20 @@ def _extract_inline_ids_from_text(text: str) -> list[str]:
             normalized = f"OpenAlex:{m.group('openalex')}"
         elif m.group("pmc"):
             normalized = m.group("pmc").upper()
+        elif m.group("uniprot"):
+            normalized = f"UniProt:{m.group('uniprot').upper()}"
+        elif m.group("pubchem"):
+            normalized = f"PubChem:{m.group('pubchem')}"
+        elif m.group("pdb"):
+            normalized = f"PDB:{m.group('pdb').upper()}"
+        elif m.group("rsid"):
+            normalized = m.group("rsid").lower()
+        elif m.group("chembl"):
+            normalized = m.group("chembl").upper()
+        elif m.group("reactome"):
+            normalized = f"Reactome:{m.group('reactome').upper()}"
+        elif m.group("gcst"):
+            normalized = m.group("gcst").upper()
         else:
             continue
         key = normalized.lower()
@@ -1044,6 +1116,16 @@ def _extract_inline_ids_from_text(text: str) -> list[str]:
     return ids
 
 
+_LITERATURE_ID_RE = re.compile(
+    r"(?i)^(PMID:|DOI:|NCT|OpenAlex:|PMC)"
+)
+
+
+def _is_literature_id(eid: str) -> bool:
+    """True for literature/trial identifiers that belong in the References section."""
+    return bool(_LITERATURE_ID_RE.match(re.sub(r"\s*:\s*", ":", eid.strip())))
+
+
 _VALID_EVIDENCE_ID_RE = re.compile(
     r"(?i)^("
     r"PMID:\d{4,9}"
@@ -1051,6 +1133,13 @@ _VALID_EVIDENCE_ID_RE = re.compile(
     r"|NCT\d{8}"
     r"|OpenAlex:W\d+"
     r"|PMC\d+"
+    r"|UniProt:[A-Z][A-Z0-9]{2,9}"
+    r"|PubChem:\d+"
+    r"|PDB:[A-Za-z0-9]{4,8}"
+    r"|rs\d{3,}"
+    r"|CHEMBL\d+"
+    r"|Reactome:R-[A-Z]{3}-\d+"
+    r"|GCST\d{4,}"
     r")$"
 )
 
@@ -1368,9 +1457,10 @@ _PROTECT_RE = re.compile(
 def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> str:
     """Replace bare inline ID mentions with links in the body text.
 
-    When ref_map is provided, links point to the local #ref-N anchor so readers
-    can click through to the APA entry at the bottom of the document.
-    Otherwise falls back to the external URL for the identifier.
+    Literature IDs (PMID, DOI, NCT, OpenAlex, PMC) present in ref_map are
+    replaced with compact numbered citations [N] pointing to the References
+    section.  Database IDs (UniProt, PubChem, PDB, rsID, ChEMBL, Reactome,
+    GCST) are replaced with clickable links to the external database record.
     Skips the ## References section (already formatted) and avoids double-linking.
     """
     # Split off the References section — leave it untouched.
@@ -1403,6 +1493,27 @@ def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> s
             display = f"OpenAlex: {m.group('openalex')}"
         elif m.group("pmc"):
             normalized = m.group("pmc").upper()
+            display = normalized
+        elif m.group("uniprot"):
+            normalized = f"UniProt:{m.group('uniprot').upper()}"
+            display = f"UniProt: {m.group('uniprot').upper()}"
+        elif m.group("pubchem"):
+            normalized = f"PubChem:{m.group('pubchem')}"
+            display = f"PubChem: {m.group('pubchem')}"
+        elif m.group("pdb"):
+            normalized = f"PDB:{m.group('pdb').upper()}"
+            display = f"PDB: {m.group('pdb').upper()}"
+        elif m.group("rsid"):
+            normalized = m.group("rsid").lower()
+            display = normalized
+        elif m.group("chembl"):
+            normalized = m.group("chembl").upper()
+            display = normalized
+        elif m.group("reactome"):
+            normalized = f"Reactome:{m.group('reactome').upper()}"
+            display = m.group("reactome").upper()
+        elif m.group("gcst"):
+            normalized = m.group("gcst").upper()
             display = normalized
         else:
             return m.group(0)
@@ -1584,11 +1695,14 @@ def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -
     # Strip any old-style coverage lines the LLM may have placed at the top callout
     text = re.sub(r">\s*\n>\s*\*\*Coverage:\*\*[^\n]*\n?", "", text)
 
-    # References: inject before Next Steps so _strip_next_steps_section preserves them
+    # References: only literature IDs get numbered entries in the References section;
+    # database IDs (UniProt, PubChem, PDB, rs, ChEMBL, Reactome, GCST) become
+    # clickable inline links handled by _hyperlink_inline_ids.
     inline_ids = _extract_inline_ids_from_text(text)
-    ref_map = _build_ref_map(inline_ids)
+    lit_ids = [eid for eid in inline_ids if _is_literature_id(eid)]
+    ref_map = _build_ref_map(lit_ids)
     if "## References" not in text:
-        refs = _build_references_section(inline_ids)
+        refs = _build_references_section(lit_ids)
         if refs:
             next_steps_pattern = re.compile(
                 r"(\n#{1,3}\s+(?:Potential\s+)?Next\s+(?:Steps?|Actions?)\b)",
@@ -1647,11 +1761,13 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
         lines.extend(f"- {item}" for item in limitations[:20])
         lines.append("")
 
-    # References
+    # References — only literature IDs go into the numbered References section;
+    # database IDs get clickable inline links via _hyperlink_inline_ids.
     current_text = "\n".join(lines)
     inline_ids = _extract_inline_ids_from_text(current_text)
-    ref_map = _build_ref_map(inline_ids)
-    refs = _build_references_section(inline_ids)
+    lit_ids = [eid for eid in inline_ids if _is_literature_id(eid)]
+    ref_map = _build_ref_map(lit_ids)
+    refs = _build_references_section(lit_ids)
     if refs:
         lines += refs.split("\n")
         lines.append("")
@@ -2515,13 +2631,9 @@ BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_ta
     v2_1_1_genomes__chr*). Use for variant frequency lookups and gene constraint analysis.
   **bigquery-public-data.human_genome_variants** — 1000 Genomes Phase 3 variants, Platinum Genomes,
     Simons Genome Diversity Project. Tables: *_variants_*, *_sample_info, *_pedigree.
-  **bigquery-public-data.human_variant_annotation** — Ensembl variant annotations (1000 Genomes, ESP6500)
-    across hg19/hg38 builds (release 89 & 93). Functional consequence, SIFT, PolyPhen scores.
-
-  === Protein structure ===
-  **bigquery-public-data.deepmind_alphafold** — AlphaFold protein structure predictions. Tables: metadata
-    (UniProt accession, organism, confidence metrics, PDB/CIF URLs). Use to assess structural druggability
-    and binding-site availability for targets lacking experimental crystal structures.
+  **bigquery-public-data.human_variant_annotation** — ClinVar variant annotations (hg19/hg38 builds).
+    Contains clinical significance classifications (pathogenic, benign, etc.), variant types, and condition
+    associations. Does NOT contain SIFT/PolyPhen prediction scores.
 
   === Immunology ===
   **bigquery-public-data.immune_epitope_db** — IEDB: immune epitopes, B-cell assays, MHC ligand binding,
@@ -2531,20 +2643,15 @@ BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_ta
   === Drug nomenclature & regulatory ===
   **bigquery-public-data.nlm_rxnorm** — RxNorm drug nomenclature, ingredient relationships, and
     clinical drug pathways. Use for standardizing drug names across sources.
-  **bigquery-public-data.fda_drug** — FDA drug data: adverse event reports (FAERS), drug labels,
-    NDC product listings, enforcement actions. Use for post-marketing safety analysis, label
-    information, and regulatory data.
+  **bigquery-public-data.fda_drug** — FDA drug labels, NDC product listings, enforcement actions.
+    Use for label information and regulatory data. NOTE: for post-marketing adverse event reports
+    (FAERS), use the search_fda_adverse_events tool instead — it queries the openFDA API directly
+    and returns richer data than the BigQuery tables.
 
   === Perturbation biology ===
   **bigquery-public-data.umiami_lincs** — LINCS L1000 perturbation signatures: cell lines, small molecules,
     nucleic acid reagents, readouts, and perturbation signatures. Use for drug repurposing hypotheses
     and mechanism-of-action characterization.
-
-  === Hackathon project data ===
-  **hackathon_data** (project dataset) — Contains:
-    - civic_* tables: Cancer variant clinical interpretations (assertions, evidence, variants, molecular profiles)
-    - clingen_* tables: Gene-disease validity, variant pathogenicity, dosage sensitivity, actionability
-    - gtex_* tables: GTEx tissue expression sample attributes and subject phenotypes
 
   **How to query**: Always wrap table names in backticks in SQL. Short names are auto-expanded:
   `open_targets_platform.target` → `bigquery-public-data.open_targets_platform.target`.
@@ -2560,17 +2667,28 @@ and `list_bigquery_tables(dataset="...", table="...")` to inspect column schemas
     - Protein profiles: search_uniprot_proteins, get_uniprot_protein_profile
     - Pathways: search_reactome_pathways
     - Protein interactions: get_string_interactions
+    - Variant effect predictions (SIFT, PolyPhen, AlphaMissense): annotate_variants_vep (Ensembl VEP)
+    - Aggregated variant annotations (ClinVar, CADD, dbSNP, gnomAD, COSMIC): get_variant_annotations (MyVariant.info)
+    - Clinical variant interpretations in oncology: search_civic_variants, search_civic_genes (CIViC)
+    - Protein structure predictions: get_alphafold_structure (AlphaFold — pLDDT confidence, PDB/CIF downloads)
+    - GWAS trait-variant associations: search_gwas_associations (GWAS Catalog — p-values, odds ratios, mapped genes)
+    - Drug-gene interactions & druggability: search_drug_gene_interactions (DGIdb — approved/experimental drugs)
+    - Tissue-level gene expression: get_gene_tissue_expression (GTEx v8 — median TPM across 54 tissues)
+    - Experimental protein structures: search_protein_structures (RCSB PDB — resolution, method, ligands)
+    - Cancer mutation profiles: get_cancer_mutation_profile (cBioPortal — TCGA pan-cancer mutation frequencies)
+    - Drug bioactivity & selectivity: get_chembl_bioactivities (ChEMBL API — IC50/Ki/Kd by target, kinase selectivity profiling. Prefer over BigQuery ebi_chembl for bioactivity lookups)
+    - Chemical compound data: get_pubchem_compound (PubChem — molecular properties, SMILES, drug-likeness)
+    - Post-marketing adverse events: search_fda_adverse_events (openFDA FAERS — reaction counts, seriousness, indications)
 """
 
 
 BQ_EXECUTOR_POLICY = """- BigQuery-first policy: For any structured data lookup, prefer `list_bigquery_tables` \
 and `run_bigquery_select_query` over non-BQ tools. \
 Available datasets: open_targets_platform (targets, diseases, drugs, evidence), ebi_chembl (bioactivity), \
-gnomAD (variant frequencies), human_genome_variants, human_variant_annotation (Ensembl), \
-deepmind_alphafold (protein structures), immune_epitope_db (IEDB), \
-nlm_rxnorm (drug nomenclature), fda_drug (adverse events, drug labels, NDC, enforcement), \
-umiami_lincs (perturbation signatures), ebi_surechembl (patents), \
-and project hackathon_data (CIViC, ClinGen, GTEx).
+gnomAD (variant frequencies), human_genome_variants, human_variant_annotation (ClinVar), \
+immune_epitope_db (IEDB), \
+nlm_rxnorm (drug nomenclature), fda_drug (drug labels, NDC, enforcement), \
+umiami_lincs (perturbation signatures), ebi_surechembl (patents).
 CRITICAL SQL syntax: Always wrap table references in backticks in your SQL queries. \
 Short names are auto-expanded: `open_targets_platform.target` → `bigquery-public-data.open_targets_platform.target`. \
 Example: SELECT id, approvedSymbol FROM `open_targets_platform.target` WHERE approvedSymbol = 'BRCA1'.
@@ -2582,7 +2700,18 @@ Before writing queries:
   and use IDs rather than human-readable names (e.g. targetId is an Ensembl ID like "ENSG00000012048", \
   diseaseId is an EFO ID like "EFO_0001075"). Look up IDs from reference tables first.
 Fall back to non-BQ tools for: literature search (search_pubmed, search_openalex_works), \
-ClinicalTrials.gov, UniProt, Reactome pathways, and STRING interactions."""
+ClinicalTrials.gov, UniProt, Reactome pathways, STRING interactions, \
+variant effect predictions (annotate_variants_vep for SIFT/PolyPhen/AlphaMissense), \
+aggregated variant annotations (get_variant_annotations for ClinVar/CADD/dbSNP/gnomAD/COSMIC), \
+clinical variant interpretations (search_civic_variants, search_civic_genes for CIViC), \
+protein structure predictions (get_alphafold_structure for pLDDT), \
+GWAS associations (search_gwas_associations), drug-gene interactions (search_drug_gene_interactions), \
+tissue expression (get_gene_tissue_expression), experimental structures (search_protein_structures), \
+cancer mutations (get_cancer_mutation_profile), \
+drug bioactivity and selectivity (get_chembl_bioactivities — prefer over BigQuery ebi_chembl), \
+chemical compound data (get_pubchem_compound), \
+and post-marketing adverse events (search_fda_adverse_events for openFDA FAERS — \
+prefer this over BigQuery fda_drug for adverse event reports)."""
 
 
 def _format_tool_catalog(tool_hints: list[str]) -> str:
@@ -2614,8 +2743,20 @@ def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) 
             "- BigQuery-first policy:\n"
             f"{BQ_DATASET_CATALOG}"
             "\n- tool_hint for BigQuery steps: use the specific dataset name (e.g. open_targets_platform,"
-            " gnomad, ebi_chembl, deepmind_alphafold, hackathon_data)"
-            " rather than run_bigquery_select_query, so the plan clearly shows which source is being accessed."
+            " gnomad, ebi_chembl)"
+            " rather than run_bigquery_select_query, so the plan clearly shows which source is being accessed.\n"
+            "- For variant pathogenicity predictions, use annotate_variants_vep (Ensembl VEP — SIFT, PolyPhen, AlphaMissense).\n"
+            "- For aggregated variant annotations (ClinVar, CADD, dbSNP, gnomAD, COSMIC), use get_variant_annotations (MyVariant.info).\n"
+            "- For clinical variant interpretations in oncology, use search_civic_variants or search_civic_genes (CIViC).\n"
+            "- For protein structure predictions and confidence scores, use get_alphafold_structure (AlphaFold API).\n"
+            "- For GWAS trait-variant associations and genetic evidence, use search_gwas_associations (GWAS Catalog).\n"
+            "- For druggability assessment and known drug-gene interactions, use search_drug_gene_interactions (DGIdb).\n"
+            "- For tissue-level gene expression and target safety, use get_gene_tissue_expression (GTEx).\n"
+            "- For experimental protein structures (X-ray, cryo-EM), use search_protein_structures (RCSB PDB).\n"
+            "- For cancer mutation frequencies across tumor types, use get_cancer_mutation_profile (cBioPortal).\n"
+            "- For drug bioactivity, IC50/Ki/Kd values, and kinase selectivity profiling, use get_chembl_bioactivities (ChEMBL API — prefer over BigQuery ebi_chembl).\n"
+            "- For chemical compound properties, SMILES, drug-likeness, use get_pubchem_compound (PubChem).\n"
+            "- For post-marketing adverse events (FAERS), use search_fda_adverse_events (openFDA) — not BigQuery fda_drug."
         )
     else:
         bq_policy = "- BigQuery-first policy is disabled for this run."

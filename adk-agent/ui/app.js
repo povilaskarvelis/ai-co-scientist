@@ -1135,6 +1135,7 @@ function bindEvents() {
   el.messages.addEventListener("click", (event) => {
     const activityCard = event.target.closest('[data-action="toggle-activity"]');
     if (activityCard) {
+      if (activityCard.classList.contains("expanded") && event.target.closest(".activity-details")) return;
       const taskId = String(activityCard.dataset.taskId || "").trim();
       const expanded = !isActivityExpanded(taskId);
       setActivityExpanded(taskId, expanded);
@@ -1174,6 +1175,7 @@ function bindEvents() {
     if (event.key !== "Enter" && event.key !== " ") return;
     const activityCard = event.target.closest('[data-action="toggle-activity"]');
     if (activityCard) {
+      if (activityCard.classList.contains("expanded") && event.target.closest(".activity-details")) return;
       event.preventDefault();
       const taskId = String(activityCard.dataset.taskId || "").trim();
       const expanded = !isActivityExpanded(taskId);

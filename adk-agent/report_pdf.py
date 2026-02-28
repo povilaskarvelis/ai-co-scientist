@@ -47,7 +47,7 @@ HIGH_FIDELITY_CSS = """
 html, body {
   margin: 0;
   padding: 0;
-  background: #0b0f19;
+  background: #ffffff;
   -webkit-print-color-adjust: exact;
   print-color-adjust: exact;
 }
@@ -55,8 +55,8 @@ body {
   font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   font-size: 10.5pt;
   line-height: 1.6;
-  color: #e2e8f0;
-  background: #0b0f19;
+  color: #1a1a1a;
+  background: #ffffff;
 }
 article.report {
   max-width: 100%;
@@ -66,8 +66,8 @@ article.report {
 h1 {
   font-size: 26pt;
   font-weight: 700;
-  color: #ffffff;
-  border-bottom: 3px solid #6366f1;
+  color: #111111;
+  border-bottom: 3px solid #333333;
   padding-bottom: 0.35em;
   margin-top: 0;
   margin-bottom: 0.6em;
@@ -79,17 +79,17 @@ h1 {
 h2 {
   font-size: 14.5pt;
   font-weight: 700;
-  color: #a5b4fc;
+  color: #222222;
   margin-top: 1.5em;
   margin-bottom: 0.45em;
   padding-bottom: 0.2em;
-  border-bottom: 1.5px solid #312e81;
+  border-bottom: 1.5px solid #cccccc;
   line-height: 1.25;
 }
 h3 {
   font-size: 11.5pt;
   font-weight: 600;
-  color: #818cf8;
+  color: #333333;
   margin-top: 1.1em;
   margin-bottom: 0.3em;
 }
@@ -98,43 +98,50 @@ h3 {
 blockquote {
   margin: 1em 0;
   padding: 0.8em 1.1em;
-  border-left: 4px solid #6366f1;
-  background: #1e1b4b;
-  color: #c7d2fe;
+  border-left: 4px solid #555555;
+  background: #f5f5f5;
+  color: #333333;
   border-radius: 0 8px 8px 0;
   font-size: 10.5pt;
 }
 blockquote strong {
-  color: #e0e7ff;
+  color: #111111;
 }
 
 /* ── Body text ── */
 p {
   margin: 0.5em 0;
-  color: #cbd5e1;
+  color: #1a1a1a;
 }
 
 /* ── Lists ── */
-ul, ol {
+ul {
+  list-style-type: disc;
   margin: 0.5em 0 0.5em 1.4em;
   padding-left: 0.8em;
-  color: #cbd5e1;
+  color: #1a1a1a;
+}
+ol {
+  list-style-type: decimal;
+  margin: 0.5em 0 0.5em 1.4em;
+  padding-left: 0.8em;
+  color: #1a1a1a;
 }
 li {
   margin: 0.35em 0;
   line-height: 1.55;
 }
 li::marker {
-  color: #818cf8;
+  color: #333333;
 }
 
 /* ── Code ── */
 pre {
   margin: 0.8em 0;
   padding: 0.8em 1em;
-  background: #020617;
-  color: #a5f3fc;
-  border: 1px solid #1e293b;
+  background: #f5f5f5;
+  color: #1a1a1a;
+  border: 1px solid #dddddd;
   border-radius: 8px;
   font-size: 9pt;
   overflow: auto;
@@ -142,10 +149,10 @@ pre {
 code {
   font-family: "SFMono-Regular", Menlo, Consolas, monospace;
   font-size: 0.9em;
-  background: #1e293b;
+  background: #f0f0f0;
   padding: 0.15em 0.4em;
   border-radius: 4px;
-  color: #a5f3fc;
+  color: #1a1a1a;
 }
 pre code {
   background: transparent;
@@ -161,46 +168,51 @@ table {
   font-size: 9.5pt;
 }
 th {
-  background: #312e81;
-  color: #e0e7ff;
+  background: #f0f0f0;
+  color: #111111;
   font-weight: 600;
   padding: 0.5em 0.7em;
   text-align: left;
-  border: 1px solid #3730a3;
+  border: 1px solid #cccccc;
 }
 td {
-  border: 1px solid #1e293b;
+  border: 1px solid #cccccc;
   padding: 0.45em 0.65em;
   vertical-align: top;
-  color: #cbd5e1;
+  color: #1a1a1a;
 }
 tr:nth-child(even) td {
-  background: #0f172a;
+  background: #fafafa;
 }
 tr:nth-child(odd) td {
-  background: #111827;
+  background: #ffffff;
 }
 
 /* ── Horizontal rule ── */
 hr {
   border: none;
-  border-top: 1px solid #1e293b;
+  border-top: 1px solid #cccccc;
   margin: 1.3em 0;
 }
 
 /* ── Coverage / footer note ── */
 em {
-  color: #94a3b8;
+  color: #555555;
   font-size: 9.5pt;
 }
 
 /* ── Links ── */
 a {
-  color: #818cf8;
+  color: #1a0dab;
   text-decoration: underline;
   word-break: break-all;
 }
 """
+
+
+def _normalize_list_markers(text: str) -> str:
+    """Replace ``* `` list markers with ``- `` to avoid ambiguity with emphasis."""
+    return re.sub(r"^(\s*)\*(\s+)", r"\1-\2", text, flags=re.MULTILINE)
 
 
 def _heading_level(line: str) -> int:
@@ -237,7 +249,7 @@ def _format_inline_markdown(text: str) -> str:
         def repl(match: re.Match[str]) -> str:
             label = escape(match.group(1).strip())
             href = _escape_attr(match.group(2).strip())
-            return _store(f'<font color="#818cf8"><u><link href="{href}">{label}</link></u></font>')
+            return _store(f'<font color="#1a0dab"><u><link href="{href}">{label}</link></u></font>')
 
         return pattern.sub(repl, raw)
 
@@ -340,7 +352,7 @@ def _build_html_document(markdown_text: str, *, title: str) -> str:
     safe_title = escape(title or "AI Co-Scientist Report")
     if MARKDOWN_AVAILABLE:
         body_html = markdown_lib.markdown(
-            markdown_text,
+            _normalize_list_markers(markdown_text),
             extensions=[
                 "extra",
                 "sane_lists",
@@ -357,7 +369,7 @@ def _build_html_document(markdown_text: str, *, title: str) -> str:
         "<head>\n"
         "  <meta charset=\"utf-8\" />\n"
         "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n"
-        "  <meta name=\"color-scheme\" content=\"dark\" />\n"
+        "  <meta name=\"color-scheme\" content=\"light\" />\n"
         f"  <title>{safe_title}</title>\n"
         f"  <style>{HIGH_FIDELITY_CSS}</style>\n"
         "</head>\n"
@@ -551,7 +563,7 @@ def _styles() -> dict[str, ParagraphStyle]:
             fontSize=10.5,
             leading=14,
             spaceAfter=4,
-            textColor=colors.HexColor("#cbd5e1"),
+            textColor=colors.HexColor("#1a1a1a"),
         ),
         "h1": ParagraphStyle(
             "report_h1",
@@ -560,7 +572,7 @@ def _styles() -> dict[str, ParagraphStyle]:
             fontSize=18,
             leading=22,
             spaceAfter=10,
-            textColor=colors.HexColor("#ffffff"),
+            textColor=colors.HexColor("#111111"),
         ),
         "h2": ParagraphStyle(
             "report_h2",
@@ -569,7 +581,7 @@ def _styles() -> dict[str, ParagraphStyle]:
             fontSize=14,
             leading=18,
             spaceAfter=8,
-            textColor=colors.HexColor("#a5b4fc"),
+            textColor=colors.HexColor("#222222"),
         ),
         "h3": ParagraphStyle(
             "report_h3",
@@ -578,7 +590,7 @@ def _styles() -> dict[str, ParagraphStyle]:
             fontSize=12,
             leading=16,
             spaceAfter=6,
-            textColor=colors.HexColor("#818cf8"),
+            textColor=colors.HexColor("#333333"),
         ),
         "code": ParagraphStyle(
             "report_code",
@@ -589,8 +601,8 @@ def _styles() -> dict[str, ParagraphStyle]:
             leftIndent=10,
             rightIndent=10,
             spaceAfter=6,
-            textColor=colors.HexColor("#a5f3fc"),
-            backColor=colors.HexColor("#020617"),
+            textColor=colors.HexColor("#1a1a1a"),
+            backColor=colors.HexColor("#f5f5f5"),
         ),
         "quote": ParagraphStyle(
             "report_quote",
@@ -600,8 +612,8 @@ def _styles() -> dict[str, ParagraphStyle]:
             leading=13,
             leftIndent=14,
             rightIndent=8,
-            textColor=colors.HexColor("#c7d2fe"),
-            backColor=colors.HexColor("#1e1b4b"),
+            textColor=colors.HexColor("#333333"),
+            backColor=colors.HexColor("#f5f5f5"),
             borderPadding=6,
             spaceAfter=6,
         ),
@@ -697,12 +709,12 @@ def _add_table(lines: list[str], start_idx: int, story: list, styles: dict[str, 
     table.setStyle(
         TableStyle(
             [
-                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#1e293b")),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#312e81")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#e0e7ff")),
-                ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor("#cbd5e1")),
-                ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#111827")),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#111827"), colors.HexColor("#0f172a")]),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f0f0")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#111111")),
+                ("TEXTCOLOR", (0, 1), (-1, -1), colors.HexColor("#1a1a1a")),
+                ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#ffffff")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#ffffff"), colors.HexColor("#fafafa")]),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("LEFTPADDING", (0, 0), (-1, -1), 6),
@@ -721,7 +733,7 @@ def _markdown_story(markdown: str) -> list:
     styles = _styles()
     story: list = []
     paragraph_buffer: list[str] = []
-    lines = markdown.splitlines()
+    lines = _normalize_list_markers(markdown).splitlines()
     idx = 0
     while idx < len(lines):
         stripped = lines[idx].strip()
@@ -792,13 +804,6 @@ def _write_markdown_pdf_legacy(markdown: str, output_path: Path, *, title: str =
     # as literal text in the ReportLab path.
     clean_markdown = re.sub(r'<a\s[^>]*></a>', '', (markdown or "").strip())
     try:
-        def _dark_bg_canvas(canvas, doc):
-            """Draw a dark background on every page for the legacy renderer."""
-            canvas.saveState()
-            canvas.setFillColor(colors.HexColor("#0b0f19"))
-            canvas.rect(0, 0, LETTER[0], LETTER[1], fill=True, stroke=False)
-            canvas.restoreState()
-
         doc = SimpleDocTemplate(
             str(output_path),
             pagesize=LETTER,
@@ -809,7 +814,7 @@ def _write_markdown_pdf_legacy(markdown: str, output_path: Path, *, title: str =
             bottomMargin=54,
         )
         story = _markdown_story(clean_markdown)
-        doc.build(story, onFirstPage=_dark_bg_canvas, onLaterPages=_dark_bg_canvas)
+        doc.build(story)
     except Exception as exc:
         if output_path.exists():
             output_path.unlink(missing_ok=True)
