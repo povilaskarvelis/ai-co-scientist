@@ -1292,15 +1292,18 @@ class UiRuntime:
 
     # -- Read APIs (conversations, tasks, runs) --------------------------------
 
+    _ACTIVE_RUN_STATUSES = frozenset({"running", "queued", "awaiting_hitl", "in_progress"})
+
     async def _overlay_live_progress(self, task: dict) -> dict:
-        """Merge live progress from an active run into the task dict."""
+        """Merge live progress from an active run into the task dict. Adds active_run_id when run is in progress."""
         task_id = task.get("task_id", "")
         if not task_id:
             return task
         async with self.runs_lock:
             for run in self.runs.values():
-                if run.task_id == task_id and run.status in ("running", "queued", "awaiting_hitl"):
+                if run.task_id == task_id and run.status in self._ACTIVE_RUN_STATUSES:
                     task = dict(task)
+                    task["active_run_id"] = run.run_id
                     if run.progress_events:
                         task["progress_events"] = list(run.progress_events)
                     if run.progress_summaries:

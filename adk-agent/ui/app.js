@@ -3,11 +3,13 @@ const state = {
   selectedConversationId: null,
   selectedConversationDetail: null,
   selectedReportTaskId: null,
-  activeRunId: null,
+  activeRunIds: new Set(),
+  runsByRunId: {},
+  runsByTaskId: {},
+  pendingRunId: null,
   pollTimer: null,
   isLoading: false,
   health: null,
-  latestRun: null,
   clarificationMessage: "",
   pendingUserMessage: "",
   exportingPdf: false,
@@ -421,7 +423,7 @@ function reactTraceLines({ trace = "", phases = null } = {}) {
   return lines;
 }
 
-function buildActivitySnapshot({ taskId = "", status = "", events = [], summaries = [] } = {}) {
+function buildActivitySnapshot({ taskId = "", status = "", events = [], summaries = [], planApproved = true } = {}) {
   const normalizedStatus = String(status || "").trim();
   const safeEvents = Array.isArray(events) ? events : [];
   const safeSummaries = Array.isArray(summaries) ? summaries : [];
@@ -566,18 +568,21 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
     summary,
     preview,
     detailsHtml: markdownToHtml(details.join("\n")),
+    planApproved: !!planApproved,
   };
 }
 
-function activityCardClassNames(status, expanded) {
+function activityCardClassNames(status, expanded, planApproved = true) {
   const normalized = String(status || "").trim();
+  const isActive = normalized === "running" || normalized === "in_progress" || normalized === "queued";
+  const showSpinner = planApproved && isActive;
   return [
     "activity-card",
     expanded ? "expanded" : "",
-    (normalized === "running" || normalized === "in_progress" || normalized === "queued") ? "is-running" : "",
+    showSpinner ? "is-running" : "",
     normalized === "completed" ? "is-complete" : "",
     normalized === "failed" ? "is-error" : "",
-    normalized === "awaiting_hitl" ? "is-paused" : "",
+    (normalized === "awaiting_hitl" || (isActive && !planApproved)) ? "is-paused" : "",
   ].filter(Boolean).join(" ");
 }
 
@@ -585,7 +590,8 @@ function activityCardHtml(snapshot) {
   if (!snapshot) return "";
   const expanded = isActivityExpanded(snapshot.taskId);
   const status = String(snapshot.status || "").trim();
-  const classNames = activityCardClassNames(status, expanded);
+  const planApproved = snapshot.planApproved !== false;
+  const classNames = activityCardClassNames(status, expanded, planApproved);
 
   return `
     <section
@@ -615,7 +621,8 @@ function activityCardHtml(snapshot) {
 function patchActivityCardElement(card, snapshot) {
   if (!card || !snapshot) return;
   const expanded = isActivityExpanded(snapshot.taskId);
-  card.className = activityCardClassNames(snapshot.status, expanded);
+  const planApproved = snapshot.planApproved !== false;
+  card.className = activityCardClassNames(snapshot.status, expanded, planApproved);
   card.dataset.taskId = snapshot.taskId;
   card.setAttribute("aria-expanded", expanded ? "true" : "false");
 
@@ -632,11 +639,16 @@ function patchActivityCardElement(card, snapshot) {
   }
 }
 
+function getRunForTask(taskId) {
+  const tid = String(taskId || "").trim();
+  return tid ? (state.runsByTaskId[tid] || null) : null;
+}
+
 function iterationActivitySnapshot(iteration) {
   const task = iteration?.task || {};
   const taskId = String(task.task_id || "").trim();
   if (!taskId) return null;
-  const run = String(state.latestRun?.task_id || "").trim() === taskId ? state.latestRun : null;
+  const run = getRunForTask(taskId);
   const researchLog = iteration?.research_log || {};
   const events = run
     ? (Array.isArray(run.progress_events) ? run.progress_events : [])
@@ -645,15 +657,17 @@ function iterationActivitySnapshot(iteration) {
     ? (Array.isArray(run.progress_summaries) ? run.progress_summaries : [])
     : (Array.isArray(researchLog.summaries) ? researchLog.summaries : []);
   const status = String(run?.status || task.status || researchLog.status || "").trim();
-  return buildActivitySnapshot({ taskId, status, events, summaries });
+  // Plan is approved if we have an active run executing, or task's hitl_history shows continue
+  const planApproved = (run && ["running", "queued", "in_progress"].includes(status)) || taskHasStarted(task);
+  return buildActivitySnapshot({ taskId, status, events, summaries, planApproved });
 }
 
 function pendingActivitySnapshot() {
-  const run = state.latestRun || {};
-  const taskId = String(run.task_id || "").trim() || "pending";
-  const status = String(run.status || "queued").trim();
-  const events = Array.isArray(run.progress_events) ? run.progress_events : [];
-  const summaries = Array.isArray(run.progress_summaries) ? run.progress_summaries : [];
+  const run = state.pendingRunId ? (state.runsByRunId[state.pendingRunId] || state.runsByTaskId["__pending__"]) : null;
+  const taskId = String(run?.task_id || "").trim() || "pending";
+  const status = String(run?.status || "queued").trim();
+  const events = Array.isArray(run?.progress_events) ? run.progress_events : [];
+  const summaries = Array.isArray(run?.progress_summaries) ? run.progress_summaries : [];
   return buildActivitySnapshot({ taskId, status, events, summaries });
 }
 
@@ -664,8 +678,13 @@ function taskHasStarted(task) {
 
 function placeActivityAfterPlan(task, activeRun) {
   const status = String(activeRun?.status || task?.status || "").trim();
+  // When we have an active run that's executing, plan was approved - place below immediately
+  // (avoids delay until conversation is re-fetched with updated hitl_history)
+  if (activeRun && ["running", "queued", "in_progress"].includes(status)) return true;
+  // When plan hasn't been approved/started, always show research log above the plan
+  if (!taskHasStarted(task)) return false;
   if (["running", "queued", "in_progress", "completed", "failed", "needs_clarification"].includes(status)) return true;
-  if (status === "awaiting_hitl" && taskHasStarted(task)) return true;
+  if (status === "awaiting_hitl") return true;
   return false;
 }
 
@@ -774,7 +793,7 @@ function renderMessages() {
     const task = iteration?.task || {};
     const userText = String(task.user_query || task.objective || "").trim() || "(empty query)";
     parts.push(`<article class="message user"><pre class="message-body">${escapeHtml(userText)}</pre></article>`);
-    const runForTask = String(state.latestRun?.task_id || "").trim() === String(task.task_id || "").trim() ? state.latestRun : null;
+    const runForTask = getRunForTask(task.task_id);
     const activityCard = activityCardHtml(iterationActivitySnapshot(iteration));
     const shouldPlaceAfterPlan = placeActivityAfterPlan(task, runForTask);
     if (activityCard && !shouldPlaceAfterPlan) parts.push(activityCard);
@@ -921,6 +940,20 @@ async function selectConversation(conversationId, { silent = false } = {}) {
   try {
     const detail = await api(`/api/conversations/${encodeURIComponent(conversationId)}`);
     state.selectedConversationDetail = detail;
+    const iterations = Array.isArray(detail?.iterations) ? detail.iterations : [];
+    for (const it of iterations) {
+      const runId = it?.task?.active_run_id;
+      if (runId && !state.activeRunIds.has(runId)) {
+        try {
+          const run = await api(`/api/runs/${encodeURIComponent(runId)}`);
+          storeRunData(run);
+          const terminal = ["completed", "failed", "awaiting_hitl", "needs_clarification"].includes(String(run?.status || ""));
+          if (!terminal) startRunPolling(runId);
+        } catch {
+          /* run may have finished, ignore */
+        }
+      }
+    }
     const defaultReportTaskId = String(detail?.conversation?.selected_report_task_id || "").trim();
     const latestDone = latestCompletedTaskId(detail);
     if (!state.selectedReportTaskId || !findIteration(detail, state.selectedReportTaskId)) {
@@ -976,34 +1009,61 @@ async function exportFinalReportPdf(taskId) {
   }
 }
 
+function storeRunData(run) {
+  if (!run?.run_id) return;
+  state.runsByRunId[run.run_id] = run;
+  if (run.task_id) {
+    state.runsByTaskId[run.task_id] = run;
+  } else if (run.run_id === state.pendingRunId) {
+    state.runsByTaskId["__pending__"] = run;
+  }
+}
+
 function stopRunPolling() {
   if (state.pollTimer) {
     clearInterval(state.pollTimer);
     state.pollTimer = null;
   }
-  state.activeRunId = null;
+  state.activeRunIds.clear();
   setLoading(false);
 }
 
-function startRunPolling(runId) {
-  stopRunPolling();
-  state.activeRunId = runId;
+function ensurePollTimerRunning() {
+  if (state.pollTimer || state.activeRunIds.size === 0) return;
   setLoading(true);
-
   const poll = async () => {
-    try {
-      const run = await api(`/api/runs/${encodeURIComponent(runId)}`);
-      state.latestRun = run;
+    const ids = Array.from(state.activeRunIds);
+    if (ids.length === 0) return;
+    const results = await Promise.allSettled(
+      ids.map((runId) => api(`/api/runs/${encodeURIComponent(runId)}`))
+    );
+    for (let i = 0; i < ids.length; i++) {
+      const runId = ids[i];
+      const r = results[i];
+      if (r.status === "rejected") {
+        state.activeRunIds.delete(runId);
+        setNotice(`Run polling failed: ${r.reason?.message || "Unknown error"}`, true);
+        continue;
+      }
+      const run = r.value;
+      storeRunData(run);
       updateInlineActivityCard(run);
       await handleTerminalRunState(run);
-    } catch (err) {
-      stopRunPolling();
-      setNotice(`Run polling failed: ${err.message}`, true);
+    }
+    if (state.activeRunIds.size === 0 && state.pollTimer) {
+      clearInterval(state.pollTimer);
+      state.pollTimer = null;
+      setLoading(false);
     }
   };
-
   poll();
   state.pollTimer = setInterval(poll, 1000);
+}
+
+function startRunPolling(runId) {
+  if (!runId) return;
+  state.activeRunIds.add(runId);
+  ensurePollTimerRunning();
 }
 
 async function handleTerminalRunState(run) {
@@ -1014,7 +1074,13 @@ async function handleTerminalRunState(run) {
   const terminalStates = new Set(["completed", "failed", "awaiting_hitl", "needs_clarification"]);
   if (!terminalStates.has(status) && !isQueuedFeedbackAck) return;
 
-  stopRunPolling();
+  state.activeRunIds.delete(run.run_id);
+  if (state.pendingRunId === run.run_id) state.pendingRunId = null;
+  if (state.activeRunIds.size === 0 && state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+    setLoading(false);
+  }
 
   if (status === "failed") {
     setNotice(run.error || "Run failed.", true);
@@ -1052,7 +1118,6 @@ async function submitNewQuery(query, { conversationId = null, parentTaskId = nul
   state.pendingUserMessage = String(query || "").trim();
   state.clarificationMessage = "";
   setActivityExpanded("pending", false);
-  state.latestRun = null;
   renderAll();
 
   const requestBody = { query };
@@ -1064,7 +1129,8 @@ async function submitNewQuery(query, { conversationId = null, parentTaskId = nul
     body: JSON.stringify(requestBody),
   });
 
-  state.latestRun = payload;
+  state.pendingRunId = payload.run_id;
+  storeRunData(payload);
   renderMessages();
   startRunPolling(payload.run_id);
 }
@@ -1086,7 +1152,7 @@ async function submitContinue(taskId) {
       body: JSON.stringify({}),
     });
   }
-  state.latestRun = payload;
+  storeRunData(payload);
   renderMessages();
   startRunPolling(payload.run_id);
 }
@@ -1105,7 +1171,7 @@ async function submitFeedback(taskId, message) {
       body: JSON.stringify({ scope: message }),
     });
   }
-  state.latestRun = payload;
+  storeRunData(payload);
   renderMessages();
   startRunPolling(payload.run_id);
 }
@@ -1114,7 +1180,10 @@ function clearDraft() {
   state.selectedConversationId = null;
   state.selectedConversationDetail = null;
   state.selectedReportTaskId = null;
-  state.latestRun = null;
+  stopRunPolling();
+  state.runsByRunId = {};
+  state.runsByTaskId = {};
+  state.pendingRunId = null;
   state.clarificationMessage = "";
   state.pendingUserMessage = "";
   state.activityExpandedByTask = {};
