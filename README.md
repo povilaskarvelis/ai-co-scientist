@@ -55,11 +55,9 @@ Source of truth: `adk-agent/co_scientist/workflow.py`.
 ```mermaid
 flowchart TD
     U["User question"] --> P["planner (LlmAgent)<br/>builds plan JSON"]
-    P --> G{"Plan approval required?"}
-    G -->|yes| H["User reviews plan"]
+    P --> H["User reviews plan"]
     H -->|approve| L
     H -->|revise| P
-    G -->|no| L
 
     subgraph L["react_loop (LoopAgent, max 25 iterations)"]
       direction TB
@@ -94,7 +92,7 @@ flowchart TD
     classDef cmd fill:#fef9c3,stroke:#ca8a04,stroke-width:1.5px,color:#1f2933;
     classDef react fill:#e0f2fe,stroke:#0284c7,stroke-width:1.5px,color:#1f2933;
     class P,Y llm;
-    class G,H,X,W,C,M guard;
+    class H,X,W,C,M guard;
     class HC,HR cmd;
     class S,R,A,O react;
 ```
