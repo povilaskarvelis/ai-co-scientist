@@ -1118,6 +1118,14 @@ class UiRuntime:
                 task["follow_up_suggestions"] = _extract_next_steps(final_md)
                 stripped_md = _strip_next_steps_section(final_md)
                 task["report_markdown"] = stripped_md
+                await self._append_progress_event(
+                    run_id,
+                    phase="finalize",
+                    event_type="run.completed",
+                    status="done",
+                    human_line="Report completed.",
+                    task_id=task_id,
+                )
                 await self._save_task_with_progress(task, run_id)
 
                 self._write_report(task_id, stripped_md)
@@ -1126,14 +1134,6 @@ class UiRuntime:
                     run_id, status="completed", task_id=task_id,
                     final_report=stripped_md,
                     follow_up_suggestions=task["follow_up_suggestions"],
-                )
-                await self._append_progress_event(
-                    run_id,
-                    phase="finalize",
-                    event_type="run.completed",
-                    status="done",
-                    human_line="Report completed.",
-                    task_id=task_id,
                 )
 
             elif plan_pending:
@@ -1169,13 +1169,6 @@ class UiRuntime:
                 task["follow_up_suggestions"] = _extract_next_steps(response_text)
                 stripped_md = _strip_next_steps_section(response_text)
                 task["report_markdown"] = stripped_md
-                await self._save_task_with_progress(task, run_id)
-                self._write_report(task_id, stripped_md)
-                await self._update_run(
-                    run_id, status="completed", task_id=task_id,
-                    final_report=stripped_md,
-                    follow_up_suggestions=task["follow_up_suggestions"],
-                )
                 await self._append_progress_event(
                     run_id,
                     phase="finalize",
@@ -1183,6 +1176,13 @@ class UiRuntime:
                     status="done",
                     human_line="Report completed.",
                     task_id=task_id,
+                )
+                await self._save_task_with_progress(task, run_id)
+                self._write_report(task_id, stripped_md)
+                await self._update_run(
+                    run_id, status="completed", task_id=task_id,
+                    final_report=stripped_md,
+                    follow_up_suggestions=task["follow_up_suggestions"],
                 )
 
         except Exception as exc:
@@ -1300,17 +1300,20 @@ class UiRuntime:
         if not task_id:
             return task
         async with self.runs_lock:
+            best: RunRecord | None = None
             for run in self.runs.values():
                 if run.task_id != task_id:
                     continue
+                if best is None or run.updated_at > best.updated_at:
+                    best = run
+            if best is not None:
                 task = dict(task)
-                if run.status in self._ACTIVE_RUN_STATUSES:
-                    task["active_run_id"] = run.run_id
-                if run.progress_events:
-                    task["progress_events"] = list(run.progress_events)
-                if run.progress_summaries:
-                    task["progress_summaries"] = list(run.progress_summaries)
-                break
+                if best.status in self._ACTIVE_RUN_STATUSES:
+                    task["active_run_id"] = best.run_id
+                if best.progress_events:
+                    task["progress_events"] = list(best.progress_events)
+                if best.progress_summaries:
+                    task["progress_summaries"] = list(best.progress_summaries)
         return task
 
     def list_conversations(self, *, owner_ip: str = "") -> list[dict]:

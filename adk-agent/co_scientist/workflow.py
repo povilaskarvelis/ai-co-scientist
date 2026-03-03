@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 
 
 MCP_SERVER_DIR = Path(__file__).resolve().parents[2] / "research-mcp"
-DEFAULT_MODEL = os.getenv("ADK_NATIVE_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL = os.getenv("ADK_NATIVE_MODEL", "gemini-3.1-flash-lite-preview")
+SYNTHESIZER_MODEL = os.getenv("ADK_SYNTHESIZER_MODEL", "gemini-2.5-flash")
+THINKING_CONFIG = types.ThinkingConfig(thinking_level="HIGH")
 HAS_BIGQUERY_RUNTIME_HINT = any(
     str(os.getenv(name, "")).strip()
     for name in ("BQ_PROJECT_ID", "BQ_DATASET_ALLOWLIST", "GOOGLE_CLOUD_PROJECT")
@@ -462,10 +464,10 @@ Start with ONE short overview paragraph that:
 - Lists the investigative steps taken and what type of evidence each provided at a high level.
 - Notes how many planned steps completed vs. total (e.g. "5 of 5 planned steps completed" or "3 of 5 planned steps completed; 2 steps could not be executed due to data unavailability").
 Then provide a subsection for EACH step with a status indicator in the heading (e.g. "### Step 1: <goal> — COMPLETED" or "### Step 2: <goal> — FAILED"), detailing:
-- The data source queried (use the human-readable source name, not tool names).
-- Key findings with specific identifiers (PMID, DOI, NCT numbers) inline.
-- Why the findings matter for the research question.
-- Any gaps or limitations specific to that step.
+- The data source (use the human-readable source name, not tool names).
+- Key findings (with specific identifiers (PMID, DOI, NCT numbers) inline).
+- Significance: why these findings matter for the research question.
+- Limiatations: any uncertainties or limitations specific to that step.
 Mark failed/blocked steps clearly with what went wrong.
 
 ## Limitations
@@ -2264,6 +2266,7 @@ def _make_planner_before_model_callback(*, require_approval: bool):
                 callback_context.state[STATE_WORKFLOW_TASK] = None
                 callback_context.state[STATE_PLAN_PENDING_APPROVAL] = False
                 llm_request.config = llm_request.config or types.GenerateContentConfig()
+                llm_request.config.thinking_config = THINKING_CONFIG
                 llm_request.config.response_mime_type = "application/json"
                 llm_request.append_instructions([
                     f"Revise the previous plan for this objective: {original_objective}",
@@ -2296,6 +2299,7 @@ def _make_planner_before_model_callback(*, require_approval: bool):
             callback_context.state[STATE_WORKFLOW_TASK] = None
 
         llm_request.config = llm_request.config or types.GenerateContentConfig()
+        llm_request.config.thinking_config = THINKING_CONFIG
         llm_request.config.response_mime_type = "application/json"
         llm_request.append_instructions([_planner_json_instruction_suffix()])
         return None
@@ -2506,6 +2510,7 @@ def _react_before_model_callback(*, callback_context: CallbackContext, llm_reque
     logger.info("[react:before] executing step %s (retry=%d): %s", current_step_id, retries, active_step.get("goal", ""))
 
     llm_request.config = llm_request.config or types.GenerateContentConfig()
+    llm_request.config.thinking_config = THINKING_CONFIG
     llm_request.config.response_mime_type = None
     instructions = _react_step_context_instructions(task_state, active_step)
     if retries > 0:
@@ -2721,6 +2726,7 @@ def _synth_before_model_callback(*, callback_context: CallbackContext, llm_reque
 
     callback_context.state[STATE_SYNTH_BUFFER] = ""
     llm_request.config = llm_request.config or types.GenerateContentConfig()
+    # Synthesizer uses 2.5 Flash by default; skip thinking_config (3.1-only feature)
     llm_request.config.response_mime_type = None
     llm_request.append_instructions(_synth_context_instructions(task_state, callback_context))
     return None
@@ -3007,6 +3013,7 @@ def create_workflow_agent(
             ``revise: <feedback>`` before executing the plan.
     """
     runtime_model = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    synthesizer_model = SYNTHESIZER_MODEL
     use_bigquery_priority = DEFAULT_PREFER_BIGQUERY if prefer_bigquery is None else bool(prefer_bigquery)
 
     mcp_toolset = create_mcp_toolset(tool_filter=tool_filter)
@@ -3061,7 +3068,7 @@ def create_workflow_agent(
     )
     report_synthesizer = LlmAgent(
         name="report_synthesizer",
-        model=runtime_model,
+        model=synthesizer_model,
         instruction=SYNTHESIZER_INSTRUCTION,
         tools=[],
         before_agent_callback=hitl_agent_gate,
