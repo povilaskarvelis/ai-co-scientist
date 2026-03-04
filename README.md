@@ -35,26 +35,108 @@ This stack combines live REST APIs (literature, trials, protein/pathway, neurosc
 
 ## Architecture
 
+The system uses a **router-based agentic architecture**: a top-level intent classifier routes user messages to specialist agents. Research questions enter the full evidence-gathering pipeline; factual Q&A, clarification prompts, and post-report follow-ups go to lighter-weight agents.
+
+### High-Level Architecture
+
 ```mermaid
 flowchart TB
-    U["Browser UI"] --> S["ui_server.py (FastAPI)"]
-    S --> R["ADK Runner + Session State"]
-    R --> W["SequentialAgent co_scientist_workflow<br/>planner → react_loop → report_synthesizer"]
-    W --> M["MCPToolset → research-mcp/server.js"]
-    M --> W
-    W --> S
-    S --> U
+    subgraph Client["Client Layer"]
+        U["Browser UI<br/>(index.html, app.js)"]
+    end
+
+    subgraph Server["Server Layer"]
+        S["ui_server.py<br/>(FastAPI)"]
+    end
+
+    subgraph Runtime["ADK Runtime"]
+        RUN["Runner + InMemorySessionService"]
+        ROUTER["LlmAgent (router)"]
+    end
+
+    subgraph Tools["Tool Layer"]
+        MCP["research-mcp/server.js<br/>(MCP Tool Server)"]
+    end
+
+    U <-->|HTTP/SSE| S
+    S --> RUN
+    RUN --> ROUTER
+    ROUTER <-->|via tool-enabled agents| MCP
+    RUN --> S
 ```
 
-The custom web UI (`ui/index.html`, `app.js`, `styles.css`) communicates with `ui_server.py`, which manages conversations, run orchestration, and PDF export. Under the hood it uses the Google ADK `Runner` with `InMemorySessionService`.
+### Agentic Agent Hierarchy
+
+```mermaid
+flowchart TB
+    subgraph Root["Root Agent"]
+        ROUTER["co_scientist_router<br/>(LlmAgent)"]
+    end
+
+    subgraph Specialists["Specialist Agents"]
+        GQ["general_qa<br/>Factual biomedical Q&A, no tools"]
+        CL["clarifier<br/>Asks for clarification on vague queries"]
+        RA["report_assistant<br/>Post-report interaction, light tool access"]
+    end
+
+    subgraph Research["research_workflow (SequentialAgent)"]
+        direction TB
+        PL["planner<br/>Builds plan JSON with tool/dataset proposals"]
+        LOOP["react_loop<br/>LoopAgent, max 25 iterations"]
+        SYN["report_synthesizer<br/>Final cited Markdown report"]
+        PL --> LOOP --> SYN
+    end
+
+    ROUTER --> GQ
+    ROUTER --> CL
+    ROUTER --> RA
+    ROUTER --> Research
+
+    subgraph LoopInternals["react_loop internals"]
+        SE["step_executor<br/>(LlmAgent, ReAct cycle)"]
+    end
+
+    LOOP --> SE
+```
+
+**Router behavior:** The router uses a fast model (`ADK_ROUTER_MODEL`) to classify intent. It transfers to `general_qa` for straightforward knowledge questions, `clarifier` for ambiguous queries, `report_assistant` when the user is asking about an existing report, and `research_workflow` for full evidence-gathering investigations. In-workflow commands (approve, continue, finalize, etc.) bypass the router LLM and go directly to `research_workflow`.
+
+### Data Flow
+
+```mermaid
+flowchart LR
+    subgraph User["User"]
+        Q["Question"]
+        A["Approval / Commands"]
+    end
+
+    subgraph Pipeline["Evidence Pipeline"]
+        P["Planner"]
+        E["ReAct Loop<br/>(Reason → Act → Observe)"]
+        R["Report Synthesizer"]
+    end
+
+    Q --> ROUTER
+    A --> ROUTER
+    ROUTER -->|research| P
+    P -->|plan JSON| A
+    A -->|approved| E
+    E -->|step results| R
+    R -->|Markdown report| User
+
+    E <-->|MCP tools| MCP["research-mcp"]
+```
+
+The custom web UI (`ui/index.html`, `app.js`, `styles.css`) communicates with `ui_server.py`, which manages conversations, run orchestration, and PDF export. Under the hood it uses the Google ADK `Runner` with `InMemorySessionService`. Source of truth for agent definitions: `adk-agent/co_scientist/workflow.py`.
 
 ## Dynamic Workflow
 
-Source of truth: `adk-agent/co_scientist/workflow.py`.
+The **research_workflow** is the main evidence-gathering pipeline. It runs only when the router transfers to it (research questions, workflow commands, or in-progress continuation).
 
 ```mermaid
 flowchart TD
-    U["User question"] --> P["planner (LlmAgent)<br/>builds plan JSON"]
+    U["User question / command"] --> ROUTER{"Router"}
+    ROUTER -->|research| P["planner (LlmAgent)<br/>builds plan JSON"]
     P --> H["User reviews plan"]
     H -->|approve| L
     H -->|revise| P

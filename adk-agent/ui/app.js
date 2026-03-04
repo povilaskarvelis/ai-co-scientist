@@ -287,7 +287,7 @@ function planHtmlForIteration(iteration) {
     : Array.isArray(task?.steps)
       ? task.steps
       : [];
-  if (!steps.length) return "<p>Plan is not available yet.</p>";
+  if (!steps.length) return "";
 
   let html = "<p>Here is the proposed plan:</p><ol class=\"plan-steps\">";
   steps.forEach((step, idx) => {
@@ -326,6 +326,7 @@ function planHtmlForIteration(iteration) {
 }
 
 function checkpointHtml(taskId, planHtml, showAction, buttonLabel) {
+  if (!planHtml && !showAction) return "";
   const action = showAction
     ? `<button class="primary-btn checkpoint-start-btn" data-action="checkpoint-start" data-task-id="${escapeHtml(taskId)}">${escapeHtml(buttonLabel || "Start research")}</button>`
     : "";
@@ -357,12 +358,17 @@ function reportCardHtml(iteration) {
 }
 
 function followUpSuggestionsHtml(iteration) {
+  if (iteration?.is_direct_response) return "";
   const task = iteration?.task || {};
   if (String(task.status || "") !== "completed") return "";
+  const report = iteration?.report || {};
+  if (!report.has_report) return "";
   const suggestions = Array.isArray(iteration?.follow_up_suggestions) ? iteration.follow_up_suggestions : [];
-  const lines = ["What do you want to do next?"];
+  const lines = ["What would you like to do next?"];
+  lines.push("");
+  lines.push("For example, I could:");
   if (suggestions.length) {
-    for (const item of suggestions.slice(0, 5)) {
+    for (const item of suggestions.slice(0, 3)) {
       lines.push(`- ${String(item || "").trim()}`);
     }
   } else {
@@ -425,7 +431,7 @@ function reactTraceLines({ trace = "", phases = null } = {}) {
 
 function buildActivitySnapshot({ taskId = "", status = "", events = [], summaries = [], planApproved = true } = {}) {
   const normalizedStatus = String(status || "").trim();
-  const safeEvents = Array.isArray(events) ? events : [];
+  const safeEvents = (Array.isArray(events) ? events : []).filter((e) => String(e?.type || "") !== "plan.initializing");
   const safeSummaries = Array.isArray(summaries) ? summaries : [];
   const visibleStatuses = new Set(["running", "queued", "awaiting_hitl", "needs_clarification", "failed", "completed", "in_progress"]);
   const shouldShow = visibleStatuses.has(normalizedStatus) || safeEvents.length > 0 || safeSummaries.length > 0;
@@ -436,14 +442,21 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
   const latestLine = String(latestEvent?.human_line || latestEvent?.type || "").trim();
 
   const stepEvents = safeEvents.filter((e) => e?.type === "step.completed" && e?.metrics?.step_id);
+  const toolCalledEvents = safeEvents.filter((e) => e?.type === "tool.called");
+  const stepStartedEvents = safeEvents.filter((e) => e?.type === "step.started" && e?.metrics?.step_id);
+  const latestToolCalled = toolCalledEvents.length ? toolCalledEvents[toolCalledEvents.length - 1] : null;
+  const latestStepStarted = stepStartedEvents.length ? stepStartedEvents[stepStartedEvents.length - 1] : null;
   const stepsCompleted = Number(latestSummary?.steps_completed || stepEvents.length || 0);
   const stepsTotal = Number(latestSummary?.steps_total || 0);
   const stepDetails = Array.isArray(latestSummary?.step_details) ? latestSummary.step_details : [];
 
+  const currentStepFromDetails = stepDetails.find((s) => String(s?.status || "") === "in_progress")
+    || stepDetails.find((s) => String(s?.status || "") === "pending");
+
   const summaryByStatus = {
     queued: "Preparing research workflow.",
-    running: "Executing the approved plan.",
-    in_progress: "Executing the approved plan.",
+    running: "Preparing to execute the plan\u2026",
+    in_progress: "Preparing to execute the plan\u2026",
     awaiting_hitl: "Waiting at a checkpoint for your input.",
     completed: "Research run completed.",
     failed: "Run ended with an error.",
@@ -462,22 +475,37 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
   }
 
   let summary = "";
-  if (stepEvents.length > 0) {
-    const lastStep = stepEvents[stepEvents.length - 1];
-    const sid = String(lastStep?.metrics?.step_id || "").trim();
-    const goal = String(lastStep?.metrics?.goal || "").trim();
-    summary = sid && goal ? `${sid}: ${goal}` : latestLine;
+  if (normalizedStatus === "completed" && (stepsTotal > 0 || latestSummary?.summary)) {
+    summary = String(latestSummary?.summary || "").trim() || `${stepsCompleted}/${stepsTotal} plan steps executed`;
+  } else if (latestToolCalled) {
+    summary = String(latestToolCalled?.human_line || "").trim() || "Querying sources\u2026";
+  } else if (latestStepStarted) {
+    summary = String(latestStepStarted?.human_line || "").trim() || "Executing step\u2026";
+  } else if (currentStepFromDetails) {
+    const sid = String(currentStepFromDetails?.id || "").trim();
+    const goal = String(currentStepFromDetails?.goal || "").trim();
+    const source = String(currentStepFromDetails?.source || currentStepFromDetails?.tool_hint || "").trim();
+    summary = source ? `Querying ${source}\u2026` : (sid && goal ? `${sid}: ${goal}` : "Executing step\u2026");
+  } else if (stepEvents.length > 0) {
+    summary = String(latestSummary?.summary || "").trim() || summaryByStatus[normalizedStatus] || "Tracking workflow progress.";
   } else {
     summary = String(latestSummary?.summary || "").trim() || latestLine || summaryByStatus[normalizedStatus] || "Tracking workflow progress.";
   }
 
   let preview = "";
+  const completedStepIds = new Set(stepEvents.map((e) => String(e?.metrics?.step_id || "").trim()).filter(Boolean));
   const stepPips = stepEvents.map((e) => {
     const sid = String(e?.metrics?.step_id || "").trim();
     const st = String(e?.metrics?.step_status || "completed").trim();
     const icon = st === "completed" ? "✓" : st === "blocked" ? "✗" : "…";
     return `${sid} ${icon}`;
   });
+  const inProgressStepId = latestStepStarted && !completedStepIds.has(String(latestStepStarted?.metrics?.step_id || "").trim())
+    ? String(latestStepStarted.metrics?.step_id || "").trim()
+    : "";
+  if (inProgressStepId) {
+    stepPips.push(`${inProgressStepId} …`);
+  }
   if (stepPips.length) {
     preview = stepPips.join("  ·  ");
     if (stepsTotal > stepPips.length) {
@@ -546,8 +574,6 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
       if (tools.length) details.push(`**Sources:** ${tools.map((t) => `\`${t}\``).join(", ")}`);
       const evidence = Array.isArray(m.evidence) ? m.evidence : [];
       if (evidence.length) details.push(`**Evidence:** ${evidence.slice(0, 6).map((e) => `\`${e}\``).join(", ")}`);
-      const progress = String(m.progress || "").trim();
-      if (progress) details.push(`_${progress}_`);
       details.push("");
     }
   } else if (safeEvents.length > 0) {
@@ -644,11 +670,56 @@ function getRunForTask(taskId) {
   return tid ? (state.runsByTaskId[tid] || null) : null;
 }
 
+const RESEARCH_EVENT_TYPES = new Set([
+  "plan.generated", "plan.retry", "plan.failed", "task.created", "step.completed", "step.started", "tool.called",
+  "synthesis.completed", "checkpoint.opened", "execution.paused", "execution.running", "run.completed",
+]);
+
+function hasResearchProgress(run) {
+  const evs = Array.isArray(run?.progress_events) ? run.progress_events : [];
+  return evs.some((e) => RESEARCH_EVENT_TYPES.has(String(e?.type || "")));
+}
+
+function minimalLoadingSpinnerHtml(label = "") {
+  const labelHtml = label ? `<span class="loading-label">${escapeHtml(label)}</span>` : "";
+  return `<article class="message assistant loading-spinner-only" data-role="loading-spinner"><span class="activity-wheel" aria-hidden="true"></span>${labelHtml}</article>`;
+}
+
+function pendingRunLabel() {
+  const run = state.pendingRunId ? (state.runsByRunId[state.pendingRunId] || state.runsByTaskId["__pending__"]) : null;
+  const evs = Array.isArray(run?.progress_events) ? run.progress_events : [];
+  if (evs.some((e) => String(e?.type || "") === "plan.initializing")) return "Preparing a plan\u2026";
+  return "";
+}
+
+function updateLoadingSpinnerLabel() {
+  if (!el.messages) return;
+  const spinner = el.messages.querySelector('[data-role="loading-spinner"]');
+  if (!spinner) return;
+  const label = pendingRunLabel();
+  let labelEl = spinner.querySelector(".loading-label");
+  if (label) {
+    if (!labelEl) {
+      labelEl = document.createElement("span");
+      labelEl.className = "loading-label";
+      spinner.appendChild(labelEl);
+    }
+    labelEl.textContent = label;
+  } else if (labelEl) {
+    labelEl.remove();
+  }
+}
+
 function iterationActivitySnapshot(iteration) {
+  if (iteration?.is_direct_response) return null;
   const task = iteration?.task || {};
   const taskId = String(task.task_id || "").trim();
   if (!taskId) return null;
   const run = getRunForTask(taskId);
+  const taskStatus = String(task.status || "").trim();
+  const runStatus = String(run?.status || "").trim();
+  const hasActiveRun = run && ["running", "queued", "in_progress"].includes(runStatus);
+  if (!hasActiveRun && !taskHasStarted(task) && taskStatus !== "completed" && taskStatus !== "failed") return null;
   const researchLog = iteration?.research_log || {};
   const runEvents = Array.isArray(run?.progress_events) ? run.progress_events : [];
   const runSummaries = Array.isArray(run?.progress_summaries) ? run.progress_summaries : [];
@@ -768,8 +839,13 @@ function renderMessages() {
     const parts = [];
     if (state.pendingUserMessage) {
       parts.push(`<article class="message user"><pre class="message-body">${escapeHtml(state.pendingUserMessage)}</pre></article>`);
-      const pendingCard = activityCardHtml(pendingActivitySnapshot());
-      if (pendingCard) parts.push(pendingCard);
+      const pendingRun = state.pendingRunId ? (state.runsByRunId[state.pendingRunId] || state.runsByTaskId["__pending__"]) : null;
+      if (pendingRun && hasResearchProgress(pendingRun)) {
+        const pendingCard = activityCardHtml(pendingActivitySnapshot());
+        if (pendingCard) parts.push(pendingCard);
+      } else {
+        parts.push(minimalLoadingSpinnerHtml(pendingRunLabel()));
+      }
     }
     parts.push(`<article class="message assistant"><div class="message-body markdown-body">${markdownToHtml(state.clarificationMessage)}</div></article>`);
     el.messages.innerHTML = parts.join("");
@@ -782,8 +858,13 @@ function renderMessages() {
       const parts = [
         `<article class="message user"><pre class="message-body">${escapeHtml(state.pendingUserMessage)}</pre></article>`,
       ];
-      const pendingCard = activityCardHtml(pendingActivitySnapshot());
-      if (pendingCard) parts.push(pendingCard);
+      const pendingRun = state.pendingRunId ? (state.runsByRunId[state.pendingRunId] || state.runsByTaskId["__pending__"]) : null;
+      if (pendingRun && hasResearchProgress(pendingRun)) {
+        const pendingCard = activityCardHtml(pendingActivitySnapshot());
+        if (pendingCard) parts.push(pendingCard);
+      } else {
+        parts.push(minimalLoadingSpinnerHtml(pendingRunLabel()));
+      }
       el.messages.innerHTML = parts.join("");
       el.messages.scrollTop = el.messages.scrollHeight;
       return;
@@ -799,6 +880,15 @@ function renderMessages() {
     const task = iteration?.task || {};
     const userText = String(task.user_query || task.objective || "").trim() || "(empty query)";
     parts.push(`<article class="message user"><pre class="message-body">${escapeHtml(userText)}</pre></article>`);
+
+    if (iteration?.is_direct_response) {
+      const directText = String(iteration?.direct_response_text || "").trim();
+      if (directText) {
+        parts.push(`<article class="message assistant"><div class="message-body markdown-body">${markdownToHtml(directText)}</div></article>`);
+      }
+      continue;
+    }
+
     const runForTask = getRunForTask(task.task_id);
     const activityCard = activityCardHtml(iterationActivitySnapshot(iteration));
     const shouldPlaceAfterPlan = placeActivityAfterPlan(task, runForTask);
@@ -826,8 +916,13 @@ function renderMessages() {
 
   if (state.pendingUserMessage) {
     parts.push(`<article class="message user"><pre class="message-body">${escapeHtml(state.pendingUserMessage)}</pre></article>`);
-    const pendingCard = activityCardHtml(pendingActivitySnapshot());
-    if (pendingCard) parts.push(pendingCard);
+    const pendingRun = state.pendingRunId ? (state.runsByRunId[state.pendingRunId] || state.runsByTaskId["__pending__"]) : null;
+    if (pendingRun && hasResearchProgress(pendingRun)) {
+      const pendingCard = activityCardHtml(pendingActivitySnapshot());
+      if (pendingCard) parts.push(pendingCard);
+    } else {
+      parts.push(minimalLoadingSpinnerHtml(pendingRunLabel()));
+    }
   }
 
   el.messages.innerHTML = parts.join("");
@@ -1054,6 +1149,7 @@ function ensurePollTimerRunning() {
       const run = r.value;
       storeRunData(run);
       updateInlineActivityCard(run);
+      updateLoadingSpinnerLabel();
       await handleTerminalRunState(run);
     }
     if (state.activeRunIds.size === 0 && state.pollTimer) {

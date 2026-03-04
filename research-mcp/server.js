@@ -6348,6 +6348,28 @@ server.registerTool(
 // Neurobagel cohort discovery tools
 // ---------------------------------------------------------------------------
 
+const NEUROBAGEL_NIDM_TERMS = new Set([
+  "T1Weighted", "T2Weighted", "DiffusionWeighted", "FlowWeighted",
+  "ArterialSpinLabeling", "Electroencephalography", "Magnetoencephalography", "PositronEmissionTomography",
+]);
+
+/** Convert full URIs or plain terms to API-required prefix:term format (e.g. nidm:T1Weighted). */
+function neurobagelNormalizeControlledTerm(value) {
+  const raw = normalizeWhitespace(value || "");
+  if (!raw) return "";
+  if (/^[a-zA-Z]+:\S+$/.test(raw)) return raw;
+  if (raw.startsWith("http://snomed.info/id/") || raw.startsWith("https://snomed.info/id/")) {
+    const id = raw.replace(/^https?:\/\/snomed\.info\/id\//i, "").split(/[#?/]/)[0] || "";
+    return id ? `snomed:${id}` : "";
+  }
+  if (raw.includes("nidash/nidm") || raw.includes("nidm#")) {
+    const term = raw.replace(/^https?:\/\/[^#]*#?/i, "").split("/").pop() || "";
+    return term ? `nidm:${term}` : "";
+  }
+  if (NEUROBAGEL_NIDM_TERMS.has(raw)) return `nidm:${raw}`;
+  return "";
+}
+
 function neurobagelFormatTerm(value) {
   const raw = normalizeWhitespace(value || "");
   if (!raw) return "";
@@ -6370,20 +6392,20 @@ server.registerTool(
       "IMPORTANT query strategy: " +
       "(1) Start with broad demographic/imaging filters (age range, sex, image_modal) rather than diagnosis codes. " +
       "Most indexed datasets do NOT have diagnosis annotations, so diagnosis filters often return zero results. " +
-      "(2) Use image_modal to find datasets by modality: 'http://purl.org/nidash/nidm#T1Weighted', 'http://purl.org/nidash/nidm#T2Weighted', 'http://purl.org/nidash/nidm#FlowWeighted', 'http://purl.org/nidash/nidm#DiffusionWeighted'. " +
+      "(2) Use image_modal for modality: nidm:T1Weighted, nidm:T2Weighted, nidm:FlowWeighted, nidm:DiffusionWeighted, nidm:Electroencephalography, nidm:Magnetoencephalography. " +
       "(3) Calling with NO filters returns all indexed cohorts — useful for browsing available datasets. " +
       "(4) Only use diagnosis if you know the specific SNOMED code is present in the graph (rare for the public node).",
     inputSchema: {
       minAge: z.number().optional().describe("Minimum participant age in years."),
       maxAge: z.number().optional().describe("Maximum participant age in years."),
-      sex: z.string().optional().describe("SNOMED sex term: 'snomed:248152002' (female) or 'snomed:248153007' (male)."),
-      diagnosis: z.string().optional().describe("SNOMED diagnosis term. WARNING: most public-node datasets lack diagnosis annotations — this filter often returns empty results. Only use if you know the term is indexed."),
+      sex: z.string().optional().describe("SNOMED sex: snomed:248152002 (female) or snomed:248153007 (male)."),
+      diagnosis: z.string().optional().describe("SNOMED diagnosis. WARNING: most public datasets lack diagnosis — often returns empty."),
       minImagingSessions: z.number().optional().describe("Minimum number of imaging sessions per participant."),
       minPhenotypicSessions: z.number().optional().describe("Minimum number of phenotypic sessions per participant."),
-      assessment: z.string().optional().describe("Assessment/tool term used in Neurobagel harmonization."),
-      imageModal: z.string().optional().describe("Imaging modality NIDM URI, e.g. 'http://purl.org/nidash/nidm#T1Weighted', 'http://purl.org/nidash/nidm#DiffusionWeighted'."),
-      pipelineName: z.string().optional().describe("Pipeline name URI from Neurobagel pipeline catalog."),
-      pipelineVersion: z.string().optional().describe("Pipeline version string."),
+      assessment: z.string().optional().describe("Assessment/tool term in prefix:term format."),
+      imageModal: z.string().optional().describe("Imaging modality in nidm:term format, e.g. nidm:T1Weighted, nidm:Electroencephalography, nidm:Magnetoencephalography."),
+      pipelineName: z.string().optional().describe("Pipeline name in prefix:term format from Neurobagel pipeline catalog."),
+      pipelineVersion: z.string().optional().describe("Pipeline version string, e.g. 1.0.0."),
       maxResults: z.number().optional().describe("Maximum records to display (default 25, max 100)."),
     },
   },
@@ -6403,13 +6425,18 @@ server.registerTool(
     const params = new URLSearchParams();
     if (Number.isFinite(minAge)) params.set("min_age", String(minAge));
     if (Number.isFinite(maxAge)) params.set("max_age", String(maxAge));
-    if (normalizeWhitespace(sex)) params.set("sex", normalizeWhitespace(sex));
-    if (normalizeWhitespace(diagnosis)) params.set("diagnosis", normalizeWhitespace(diagnosis));
+    const sexNorm = neurobagelNormalizeControlledTerm(sex) || normalizeWhitespace(sex);
+    if (sexNorm) params.set("sex", sexNorm);
+    const diagNorm = neurobagelNormalizeControlledTerm(diagnosis) || normalizeWhitespace(diagnosis);
+    if (diagNorm) params.set("diagnosis", diagNorm);
     if (Number.isFinite(minImagingSessions)) params.set("min_num_imaging_sessions", String(minImagingSessions));
     if (Number.isFinite(minPhenotypicSessions)) params.set("min_num_phenotypic_sessions", String(minPhenotypicSessions));
-    if (normalizeWhitespace(assessment)) params.set("assessment", normalizeWhitespace(assessment));
-    if (normalizeWhitespace(imageModal)) params.set("image_modal", normalizeWhitespace(imageModal));
-    if (normalizeWhitespace(pipelineName)) params.set("pipeline_name", normalizeWhitespace(pipelineName));
+    const assessNorm = neurobagelNormalizeControlledTerm(assessment) || normalizeWhitespace(assessment);
+    if (assessNorm) params.set("assessment", assessNorm);
+    const modalNorm = neurobagelNormalizeControlledTerm(imageModal) || normalizeWhitespace(imageModal);
+    if (modalNorm) params.set("image_modal", modalNorm);
+    const pipeNorm = neurobagelNormalizeControlledTerm(pipelineName) || normalizeWhitespace(pipelineName);
+    if (pipeNorm) params.set("pipeline_name", pipeNorm);
     if (normalizeWhitespace(pipelineVersion)) params.set("pipeline_version", normalizeWhitespace(pipelineVersion));
 
     const limit = Math.min(Math.max(1, maxResults || 25), 100);
@@ -6418,8 +6445,8 @@ server.registerTool(
     let rows;
     try {
       rows = await fetchJsonWithRetry(url, {
-        retries: 1,
-        timeoutMs: 20000,
+        retries: 2,
+        timeoutMs: 35000,
         headers: { Accept: "application/json" },
       });
     } catch (error) {

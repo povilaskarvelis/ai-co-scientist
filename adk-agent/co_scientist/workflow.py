@@ -1,9 +1,19 @@
 """
 ADK-native orchestration graph for the Co-Scientist agent.
 
-Architecture: SequentialAgent[planner → LoopAgent[step_executor] → synthesizer].
-The LoopAgent implements a ReAct (Reason-Act-Observe) cycle, executing one plan
-step per iteration with explicit reasoning traces. Step state is maintained in
+Architecture:
+  LlmAgent (router) — classifies user intent, transfers to specialist agents
+    ├── LlmAgent (general_qa)        — factual biomedical Q&A, no tools
+    ├── LlmAgent (clarifier)         — asks for clarification on vague queries
+    ├── LlmAgent (report_assistant)  — post-report interaction with light tool access
+    └── SequentialAgent (research_workflow)
+          ├── LlmAgent (planner)
+          ├── LoopAgent (react_loop)
+          │   └── LlmAgent (step_executor)  — ReAct cycle, one step per iteration
+          └── LlmAgent (report_synthesizer)
+
+The router uses a fast model for intent classification. The research_workflow
+preserves the original SequentialAgent pipeline. Step state is maintained in
 ADK session state via callbacks.
 """
 from __future__ import annotations
@@ -33,8 +43,9 @@ logger = logging.getLogger(__name__)
 
 
 MCP_SERVER_DIR = Path(__file__).resolve().parents[2] / "research-mcp"
-DEFAULT_MODEL = os.getenv("ADK_NATIVE_MODEL", "gemini-3.1-flash-lite-preview")
+DEFAULT_MODEL = os.getenv("ADK_NATIVE_MODEL", "gemini-2.5-flash")
 SYNTHESIZER_MODEL = os.getenv("ADK_SYNTHESIZER_MODEL", "gemini-2.5-flash")
+ROUTER_MODEL = os.getenv("ADK_ROUTER_MODEL", "gemini-3.1-flash-lite-preview")
 THINKING_CONFIG = types.ThinkingConfig(thinking_level="HIGH")
 HAS_BIGQUERY_RUNTIME_HINT = any(
     str(os.getenv(name, "")).strip()
@@ -229,7 +240,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "get_ebrains_kg_document": "Get detailed metadata for a specific EBRAINS Knowledge Graph resource (dataset, model, etc.)",
     "search_conp_datasets": "Search CONP dataset repositories by modality/method keywords (e.g. 'EEG', 'fMRI', 'MRI') or study names — NOT disease names. Disease queries rarely match; use broad neuroscience terms instead",
     "get_conp_dataset_details": "Get detailed metadata (README, license, topics) for a specific CONP dataset repository returned by search_conp_datasets",
-    "query_neurobagel_cohorts": "Query Neurobagel public cohorts by age, sex, and imaging modality. Start broad (no filters = browse all). Avoid diagnosis filters — most public datasets lack diagnosis annotations. Use image_modal URIs for modality filtering",
+    "query_neurobagel_cohorts": "Query Neurobagel public cohorts by age, sex, and imaging modality. Start broad (no filters = browse all). Avoid diagnosis filters — most public datasets lack annotations. Use image_modal as nidm:term (e.g. nidm:T1Weighted, nidm:Electroencephalography)",
     "search_openneuro_datasets": "Search OpenNeuro neuroimaging datasets by modality (MRI, MEG, EEG, PET, iEEG, behavioral). Omit modality to browse all. Returns dataset IDs for get_openneuro_dataset",
     "get_openneuro_dataset": "Get detailed metadata (name, DOI, modalities, snapshot) for an OpenNeuro dataset by ID (e.g. ds000224)",
     "search_dandi_datasets": "Search DANDI Archive neurophysiology datasets (electrophysiology, calcium imaging, behavioral). Use keywords like 'hippocampus', 'electrophysiology'. Omit query to browse recent dandisets",
@@ -484,6 +495,110 @@ Rules:
 - For database records, include identifiers with their canonical prefix so they can be linked: UniProt:P00533, PubChem:2244, PDB:1ABC, rs7903146, CHEMBL25, Reactome:R-HSA-1234567, GCST000001.
 - NEVER include raw URLs, API endpoints, or links to JSON output.
 - Return user-facing Markdown only (not JSON).
+"""
+
+
+ROUTER_INSTRUCTION = """You are the intent router for the AI Co-Scientist, a biomedical research assistant.
+Your ONLY job is to read the user's message and the session context below, then IMMEDIATELY transfer
+to the correct specialist agent. Never answer questions yourself — always transfer.
+
+Available agents:
+
+1. **general_qa** — Answers factual biomedical questions directly from knowledge (no database lookups).
+   Examples: "What is CRISPR?", "Explain the MAPK signaling pathway", "What are common side effects of metformin?"
+
+2. **clarifier** — Asks the user to clarify vague, incomplete, or nonsensical queries.
+   Examples: "evaluate the thing", "compare them", random characters, overly broad requests with no focus
+
+3. **research_workflow** — Full evidence-gathering research pipeline: plans an investigation, searches
+   biomedical databases and APIs, and produces a formal report with citations. Also handles all workflow
+   commands and plan management.
+   Examples: "Evaluate LRRK2 as a therapeutic target for Parkinson disease",
+   "Compare the safety profiles of SGLT2 inhibitors vs DPP-4 inhibitors",
+   any command (approve, continue, finalize, revise:, history, rollback, switch)
+
+4. **report_assistant** — Interacts with an existing research report: answers questions about findings,
+   restructures sections, and performs light follow-up lookups using tools.
+   ONLY available when report_exists is True.
+   Examples: "What does this p-value mean?", "Expand the limitations section",
+   "Get the abstract for PMID:38912345", "Restructure the evidence section"
+
+Routing priority rules (check in order):
+1. If plan_pending_approval is True → transfer to research_workflow
+2. Workflow commands (approve, continue, finalize, revise:, history, rollback, switch) → research_workflow
+3. If has_pending_steps is True and user sends a continuation-like message → research_workflow
+4. If report_exists AND the user asks about the report, wants restructuring, or a light lookup → report_assistant
+5. If report_exists AND the user wants a NEW comprehensive investigation → research_workflow
+6. If the query is a clear research question requiring evidence from databases → research_workflow
+7. If the query is a straightforward biomedical knowledge question → general_qa
+8. If the query is ambiguous, incomplete, or doesn't make sense → clarifier
+
+You MUST always transfer. Never respond with text yourself.
+"""
+
+
+GENERAL_QA_INSTRUCTION = """You are a knowledgeable biomedical expert within the AI Co-Scientist platform.
+Answer the user's question directly and accurately from your training knowledge.
+
+Guidelines:
+- Provide clear, accurate, evidence-informed answers using appropriate scientific terminology.
+- Explain complex concepts when helpful for understanding.
+- Be concise but thorough — include key details a researcher would need.
+- When discussing drugs, genes, diseases, or mechanisms, mention relevant context (e.g. FDA approval
+  status, known pathways, key study findings) but flag uncertainty where appropriate.
+- Do not fabricate specific statistics, paper titles, clinical trial numbers, or database identifiers.
+- If the question would benefit from a formal evidence-based investigation with real-time data
+  from biomedical databases, suggest: "For a comprehensive evidence-based analysis with citations,
+  you can ask me to formally investigate this as a research question."
+"""
+
+
+CLARIFIER_INSTRUCTION = """You are a helpful query assistant for the AI Co-Scientist, a biomedical research platform.
+The user's query is unclear, ambiguous, or incomplete. Help them formulate a clear request.
+
+Your approach:
+1. Identify specifically what is unclear or missing (target, scope, comparison, outcome).
+2. Ask focused clarifying questions (1-3 questions, not a long list).
+3. Suggest 2-3 well-formed example queries that might match what the user intended.
+
+Be friendly, specific, and helpful. Don't just say "please clarify" — explain WHAT needs clarifying.
+
+Examples:
+- Vague: "evaluate the thing" → "Could you specify what you'd like me to evaluate? For example:
+  • 'Evaluate LRRK2 as a therapeutic target for Parkinson disease'
+  • 'Evaluate the efficacy of pembrolizumab in NSCLC'
+  • 'Evaluate the safety profile of SGLT2 inhibitors'"
+
+- Missing context: "compare them" → "I'd be happy to run a comparison. Could you specify which
+  entities to compare? For instance, two drugs, two gene targets, or two treatment approaches?"
+
+- Too broad: "cancer" → "That's a very broad topic. Could you narrow it down? For example:
+  • A specific cancer type (e.g. 'triple-negative breast cancer')
+  • A specific gene or target (e.g. 'BRAF V600E in melanoma')
+  • A specific therapeutic question (e.g. 'emerging immunotherapy combinations for NSCLC')"
+"""
+
+
+REPORT_ASSISTANT_INSTRUCTION = """You are the report assistant for the AI Co-Scientist.
+A research report has been produced, and the user has a follow-up request about it.
+
+You can:
+1. **Answer questions** about the report's findings, methodology, or terminology.
+2. **Explain** specific results, statistical measures, or biological concepts in the report.
+3. **Restructure** or reformat sections of the report upon request.
+4. **Perform light follow-up lookups** using the available tools (e.g. fetch a specific abstract,
+   run a quick database search). Keep to 1-3 tool calls maximum.
+5. **Provide additional context** for findings mentioned in the report.
+
+Guidelines:
+- Ground your answers in the report content and any new tool results.
+- Maintain the report's citation style when referencing sources.
+- When restructuring, preserve all evidence and citations — don't drop content unless asked.
+- If the user's request requires a comprehensive multi-step investigation (new hypothesis, full
+  comparative analysis, deep-dive across multiple databases), tell them: "This would require a full
+  research investigation. You can ask me to investigate this formally, and I'll create a new plan
+  that builds on the current findings."
+- Be conversational and helpful.
 """
 
 
@@ -2266,7 +2381,9 @@ def _make_planner_before_model_callback(*, require_approval: bool):
                 callback_context.state[STATE_WORKFLOW_TASK] = None
                 callback_context.state[STATE_PLAN_PENDING_APPROVAL] = False
                 llm_request.config = llm_request.config or types.GenerateContentConfig()
-                llm_request.config.thinking_config = THINKING_CONFIG
+                # 2.5 Flash doesn't support thinking_config
+                if "3.1" in str(DEFAULT_MODEL):
+                    llm_request.config.thinking_config = THINKING_CONFIG
                 llm_request.config.response_mime_type = "application/json"
                 llm_request.append_instructions([
                     f"Revise the previous plan for this objective: {original_objective}",
@@ -2299,7 +2416,8 @@ def _make_planner_before_model_callback(*, require_approval: bool):
             callback_context.state[STATE_WORKFLOW_TASK] = None
 
         llm_request.config = llm_request.config or types.GenerateContentConfig()
-        llm_request.config.thinking_config = THINKING_CONFIG
+        if "3.1" in str(DEFAULT_MODEL):
+            llm_request.config.thinking_config = THINKING_CONFIG
         llm_request.config.response_mime_type = "application/json"
         llm_request.append_instructions([_planner_json_instruction_suffix()])
         return None
@@ -2510,7 +2628,8 @@ def _react_before_model_callback(*, callback_context: CallbackContext, llm_reque
     logger.info("[react:before] executing step %s (retry=%d): %s", current_step_id, retries, active_step.get("goal", ""))
 
     llm_request.config = llm_request.config or types.GenerateContentConfig()
-    llm_request.config.thinking_config = THINKING_CONFIG
+    if "3.1" in str(DEFAULT_MODEL):
+        llm_request.config.thinking_config = THINKING_CONFIG
     llm_request.config.response_mime_type = None
     instructions = _react_step_context_instructions(task_state, active_step)
     if retries > 0:
@@ -2977,6 +3096,119 @@ def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) 
     )
 
 
+def _router_before_model_callback(
+    *,
+    callback_context: CallbackContext,
+    llm_request: LlmRequest,
+) -> LlmResponse | None:
+    """Route by session state when in-workflow (no LLM call); otherwise inject
+    context for the router LLM to classify. This avoids an extra API call when
+    the user is mid-workflow (e.g. approving a plan, continuing execution).
+    """
+    _clear_turn_temp_state(callback_context)
+
+    task_state = _get_task_state(callback_context)
+    plan_pending = bool(
+        callback_context.state.get(STATE_PLAN_PENDING_APPROVAL, False)
+    )
+    plan_status = str(task_state.get("plan_status", "none")) if task_state else "none"
+    has_pending_steps = bool(
+        task_state
+        and any(str(s.get("status")) == "pending" for s in task_state.get("steps", []))
+    )
+    has_report = False
+    report_objective = ""
+    objective = str(task_state.get("objective", "")) if task_state else ""
+    if task_state:
+        synthesis = task_state.get("latest_synthesis")
+        if isinstance(synthesis, dict) and synthesis.get("markdown"):
+            has_report = True
+            report_objective = objective
+        elif plan_status == "completed" and any(
+            str(s.get("status")) == "completed" for s in task_state.get("steps", [])
+        ):
+            has_report = True
+            report_objective = objective
+
+    # In-workflow: bypass router LLM entirely — transfer straight to research_workflow
+    if plan_pending or plan_status in ("ready", "blocked", "in_progress") or has_pending_steps:
+        transfer_part = types.Part(
+            function_call=types.FunctionCall(
+                name="transfer_to_agent",
+                args={"agent_name": "research_workflow"},
+            )
+        )
+        return LlmResponse(
+            content=types.Content(role="model", parts=[transfer_part]),
+            partial=False,
+            turn_complete=False,
+        )
+
+    # Idle / fresh query: inject state context for LLM to classify
+    state_context = (
+        "Session context for routing:\n"
+        f"- report_exists: {has_report}\n"
+        f"- report_objective: {report_objective or 'N/A'}\n"
+        f"- plan_pending_approval: {plan_pending}\n"
+        f"- plan_status: {plan_status}\n"
+        f"- has_pending_steps: {has_pending_steps}\n"
+        f"- current_objective: {objective or 'N/A'}"
+    )
+    llm_request.append_instructions([state_context])
+    return None
+
+
+def _report_assistant_before_model_callback(
+    *,
+    callback_context: CallbackContext,
+    llm_request: LlmRequest,
+) -> LlmResponse | None:
+    """Inject the current report into the report-assistant's context."""
+    task_state = _get_task_state(callback_context)
+    if not task_state:
+        return _make_text_response(
+            "No research report is available yet. "
+            "Try asking a research question first, and I can help you "
+            "explore the results afterward."
+        )
+
+    synthesis = task_state.get("latest_synthesis")
+    report_markdown = ""
+    if isinstance(synthesis, dict):
+        report_markdown = str(synthesis.get("markdown", "")).strip()
+
+    if not report_markdown:
+        obj = str(task_state.get("objective", "")).strip()
+        step_lines: list[str] = []
+        for step in task_state.get("steps", []):
+            status = str(step.get("status", "")).strip()
+            sid = str(step.get("id", "")).strip()
+            goal = str(step.get("goal", "")).strip()
+            summary = str(step.get("result_summary", "")).strip()
+            step_lines.append(f"- {sid} ({status}): {goal}")
+            if summary:
+                step_lines.append(f"  Findings: {summary}")
+        report_context = (
+            f"Research objective: {obj}\n\nStep results:\n"
+            + "\n".join(step_lines)
+        )
+    else:
+        report_context = report_markdown
+
+    max_context_chars = 12_000
+    if len(report_context) > max_context_chars:
+        report_context = (
+            report_context[:max_context_chars]
+            + "\n\n[... report truncated for context ...]"
+        )
+
+    llm_request.append_instructions([
+        "Current research report for reference:",
+        report_context,
+    ])
+    return None
+
+
 def create_mcp_toolset(tool_filter: list[str] | None = None) -> McpToolset | None:
     """Build an MCP toolset for the native evidence-executor agent."""
     if tool_filter is not None and len(tool_filter) == 0:
@@ -3004,20 +3236,27 @@ def create_workflow_agent(
     model: str | None = None,
     prefer_bigquery: bool | None = None,
     require_plan_approval: bool = False,
-) -> tuple[SequentialAgent, McpToolset | None]:
-    """Create an ADK-native workflow graph and return (root_agent, mcp_toolset).
+) -> tuple[LlmAgent | SequentialAgent, McpToolset | None]:
+    """Create the routed ADK agent graph and return (root_agent, mcp_toolset).
+
+    The root agent is an intent-classifying router that transfers to:
+      - general_qa: factual biomedical Q&A (no tools)
+      - clarifier: asks for clarification on vague/ambiguous queries
+      - report_assistant: post-report interaction (with tools for light lookups)
+      - research_workflow: full plan → execute → synthesize pipeline
 
     Args:
-        require_plan_approval: When True, the workflow pauses after plan
-            generation and waits for the user to ``approve`` or
+        require_plan_approval: When True, the research_workflow pauses after
+            plan generation and waits for the user to ``approve`` or
             ``revise: <feedback>`` before executing the plan.
     """
     runtime_model = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
     synthesizer_model = SYNTHESIZER_MODEL
+    router_model = ROUTER_MODEL
     use_bigquery_priority = DEFAULT_PREFER_BIGQUERY if prefer_bigquery is None else bool(prefer_bigquery)
 
     mcp_toolset = create_mcp_toolset(tool_filter=tool_filter)
-    executor_tools = [mcp_toolset] if mcp_toolset is not None else []
+    executor_tools: list[McpToolset] = [mcp_toolset] if mcp_toolset is not None else []
     base_tool_hints = _dedupe_str_list(tool_filter if tool_filter else KNOWN_MCP_TOOLS, limit=120)
     if use_bigquery_priority:
         base_hint_set = set(base_tool_hints)
@@ -3029,6 +3268,8 @@ def create_workflow_agent(
         executor_tool_hints = base_tool_hints
 
     hitl_agent_gate = _hitl_skip_agent if require_plan_approval else None
+
+    # ── Research workflow agents (plan → execute → synthesize) ────────────
 
     planner = LlmAgent(
         name="planner",
@@ -3077,12 +3318,71 @@ def create_workflow_agent(
         on_model_error_callback=_on_model_error,
     )
 
-    root = SequentialAgent(
-        name="co_scientist_workflow",
-        description="ADK-native biomedical workflow: planner, ReAct executor loop, synthesis.",
+    research_workflow = SequentialAgent(
+        name="research_workflow",
+        description=(
+            "Full research pipeline: plans an investigation, gathers evidence "
+            "from biomedical databases and APIs, and produces a formal report "
+            "with citations. Also handles workflow commands (approve, continue, "
+            "finalize, revise, history, rollback, switch)."
+        ),
         sub_agents=[planner, react_loop, report_synthesizer],
     )
-    return root, mcp_toolset
+
+    # ── Lightweight specialist agents ─────────────────────────────────────
+
+    general_qa = LlmAgent(
+        name="general_qa",
+        description=(
+            "Answers factual biomedical questions directly from knowledge. "
+            "No database lookups or tool calls needed."
+        ),
+        model=runtime_model,
+        instruction=GENERAL_QA_INSTRUCTION,
+        tools=[],
+        disallow_transfer_to_parent=True,
+    )
+
+    clarifier = LlmAgent(
+        name="clarifier",
+        description=(
+            "Asks the user to clarify vague, ambiguous, incomplete, or "
+            "nonsensical queries before proceeding."
+        ),
+        model=runtime_model,
+        instruction=CLARIFIER_INSTRUCTION,
+        tools=[],
+        disallow_transfer_to_parent=True,
+    )
+
+    report_assistant = LlmAgent(
+        name="report_assistant",
+        description=(
+            "Helps with an existing research report: answers questions about "
+            "findings, restructures sections, and performs light follow-up "
+            "lookups using biomedical tools. Only available after a report "
+            "has been produced."
+        ),
+        model=runtime_model,
+        instruction=REPORT_ASSISTANT_INSTRUCTION,
+        tools=executor_tools,
+        disallow_transfer_to_parent=True,
+        before_model_callback=_report_assistant_before_model_callback,
+        on_tool_error_callback=_on_tool_error,
+    )
+
+    # ── Intent router (root agent) ────────────────────────────────────────
+
+    router = LlmAgent(
+        name="co_scientist_router",
+        description="AI Co-Scientist: biomedical research assistant with intent routing.",
+        model=router_model,
+        instruction=ROUTER_INSTRUCTION,
+        sub_agents=[general_qa, clarifier, report_assistant, research_workflow],
+        before_model_callback=_router_before_model_callback,
+    )
+
+    return router, mcp_toolset
 
 
 __all__ = [

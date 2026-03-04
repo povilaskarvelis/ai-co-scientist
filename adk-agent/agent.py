@@ -330,7 +330,14 @@ async def _run_native_workflow_turn(
             )
             continue
 
-        for preferred_author in ("report_synthesizer", "co_scientist_workflow"):
+        for preferred_author in (
+            "report_synthesizer",
+            "general_qa",
+            "clarifier",
+            "report_assistant",
+            "research_workflow",
+            "co_scientist_router",
+        ):
             candidate = final_by_author.get(preferred_author, "").strip()
             if candidate:
                 return candidate

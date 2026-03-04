@@ -7,37 +7,42 @@ from co_scientist.workflow import create_workflow_agent
 def test_native_workflow_graph_shape():
     root_agent, mcp_tools = create_workflow_agent(tool_filter=[])
     assert mcp_tools is None
-    assert isinstance(root_agent, SequentialAgent)
+    assert isinstance(root_agent, LlmAgent)
+    assert root_agent.name == "co_scientist_router"
 
     top_level_names = [sub_agent.name for sub_agent in root_agent.sub_agents]
-    assert top_level_names == [
+    assert "research_workflow" in top_level_names
+    assert "general_qa" in top_level_names
+    assert "clarifier" in top_level_names
+    assert "report_assistant" in top_level_names
+
+    research_workflow = next(a for a in root_agent.sub_agents if a.name == "research_workflow")
+    assert isinstance(research_workflow, SequentialAgent)
+    assert [a.name for a in research_workflow.sub_agents] == [
         "planner",
         "react_loop",
         "report_synthesizer",
     ]
 
-    planner_agent = root_agent.sub_agents[0]
+    planner_agent = research_workflow.sub_agents[0]
     assert isinstance(planner_agent, LlmAgent)
     assert planner_agent.before_model_callback is not None
     assert planner_agent.after_model_callback is not None
 
-    react_loop = root_agent.sub_agents[1]
+    react_loop = research_workflow.sub_agents[1]
     assert isinstance(react_loop, LoopAgent)
     assert react_loop.max_iterations == 25
     assert len(react_loop.sub_agents) == 1
-    assert react_loop.before_agent_callback is None
 
     step_executor = react_loop.sub_agents[0]
     assert isinstance(step_executor, LlmAgent)
-    assert step_executor.tools == []
     assert step_executor.before_model_callback is not None
     assert step_executor.after_model_callback is not None
 
-    report_agent = root_agent.sub_agents[2]
+    report_agent = research_workflow.sub_agents[2]
     assert isinstance(report_agent, LlmAgent)
     assert report_agent.before_model_callback is not None
     assert report_agent.after_model_callback is not None
-    assert report_agent.before_agent_callback is None
 
 
 def test_native_workflow_graph_shape_with_hitl():
@@ -45,19 +50,15 @@ def test_native_workflow_graph_shape_with_hitl():
         tool_filter=[], require_plan_approval=True,
     )
     assert mcp_tools is None
-    assert isinstance(root_agent, SequentialAgent)
-    top_level_names = [sub_agent.name for sub_agent in root_agent.sub_agents]
-    assert top_level_names == [
-        "planner",
-        "react_loop",
-        "report_synthesizer",
-    ]
+    assert isinstance(root_agent, LlmAgent)
+    research_workflow = next(a for a in root_agent.sub_agents if a.name == "research_workflow")
+    assert isinstance(research_workflow, SequentialAgent)
 
-    react_loop = root_agent.sub_agents[1]
+    react_loop = research_workflow.sub_agents[1]
     assert isinstance(react_loop, LoopAgent)
     assert react_loop.before_agent_callback is not None
 
-    synth = root_agent.sub_agents[2]
+    synth = research_workflow.sub_agents[2]
     assert synth.before_agent_callback is not None
 
 

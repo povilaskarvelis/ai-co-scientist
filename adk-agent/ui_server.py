@@ -97,6 +97,39 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _resolve_tool_source(tool_name: str, args: dict) -> str:
+    """Resolve tool name + args to human-readable source. For BigQuery tools, extract dataset from args."""
+    name = str(tool_name or "").strip()
+    args = args or {}
+
+    if name == "list_bigquery_tables":
+        dataset = str(args.get("dataset", "") or "").strip()
+        if dataset:
+            parts = dataset.replace("`", "").split(".")
+            dataset_id = parts[-1] if len(parts) >= 2 else parts[0] if parts else ""
+            if dataset_id:
+                return str(TOOL_SOURCE_NAMES.get(dataset_id, dataset_id)).strip()
+        return "BigQuery"
+
+    if name == "run_bigquery_select_query":
+        query = str(args.get("query", "") or "")
+        for m in re.finditer(r"`([a-zA-Z0-9_.-]+(?:\.[a-zA-Z0-9_.-]+)*)`", query):
+            ref = m.group(1)
+            parts = ref.split(".")
+            if len(parts) >= 3:
+                dataset_id = parts[1]
+            elif len(parts) == 2:
+                dataset_id = parts[0]
+            else:
+                continue
+            label = TOOL_SOURCE_NAMES.get(dataset_id)
+            if label:
+                return str(label).strip()
+        return "BigQuery"
+
+    return str(TOOL_SOURCE_NAMES.get(name, name)).strip()
+
+
 def _compact_text(value: str, *, max_chars: int = 180) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if len(text) <= max_chars:
@@ -470,13 +503,18 @@ def _iteration_from_task(task: dict, idx: int = 1) -> dict:
         "steps": steps,
     } if steps else None
 
-    report_md = task.get("report_markdown", "")
+    is_direct = bool(task.get("is_direct_response"))
+    report_md = task.get("report_markdown", "") if not is_direct else ""
+    direct_response_text = task.get("direct_response_text", "") if is_direct else ""
+
     return {
         "iteration_index": idx,
         "task": _task_detail(task),
         "task_summary": _task_summary(task),
         "active_plan_version": active_plan,
         "latest_plan_delta": None,
+        "is_direct_response": is_direct,
+        "direct_response_text": direct_response_text,
         "research_log": {
             "task_id": task["task_id"],
             "events": task.get("progress_events", []),
@@ -598,13 +636,16 @@ class UiRuntime:
         prompt: str,
         *,
         run_id: str,
-    ) -> str:
-        """Run a workflow turn in a dedicated thread so it can't block other conversations."""
+    ) -> tuple[str, str]:
+        """Run a workflow turn in a dedicated thread.
+
+        Returns (response_text, responding_author).
+        """
         cs = await self._get_or_create_session(conversation_id)
         main_loop = asyncio.get_running_loop()
         thread_lock = self._get_conv_thread_lock(conversation_id)
 
-        def _thread_target() -> str:
+        def _thread_target() -> tuple[str, str]:
             thread_lock.acquire()
             try:
                 loop = asyncio.new_event_loop()
@@ -627,13 +668,21 @@ class UiRuntime:
         *,
         run_id: str,
         caller_loop: asyncio.AbstractEventLoop,
-    ) -> str:
-        """The actual event-processing loop — runs inside its own thread event loop."""
+    ) -> tuple[str, str]:
+        """The actual event-processing loop — runs inside its own thread event loop.
+
+        Returns (response_text, responding_author).
+        """
         current_message = Content(role="user", parts=[Part(text=prompt)])
         partial_by_author: dict[str, str] = {}
         final_by_author: dict[str, str] = {}
         fallback_chunks: list[str] = []
         step_counter = 0
+        planner_seen = False
+        step_started_ids: set[str] = set()
+
+        def _step_source_label(tn: str) -> str:
+            return str(TOOL_SOURCE_NAMES.get(str(tn or "").strip(), tn or "")).strip()
 
         def _fire_progress(**kwargs) -> None:
             asyncio.run_coroutine_threadsafe(
@@ -649,6 +698,71 @@ class UiRuntime:
             parts = getattr(content, "parts", None)
             if not parts:
                 continue
+
+            if not planner_seen:
+                for part in parts:
+                    fc = getattr(part, "function_call", None)
+                    if fc and getattr(fc, "name", "") == "transfer_to_agent":
+                        target = (getattr(fc, "args", None) or {}).get("agent_name", "")
+                        if target == "research_workflow":
+                            planner_seen = True
+                            _fire_progress(
+                                phase="plan",
+                                event_type="plan.initializing",
+                                status="progress",
+                                human_line="Preparing a plan...",
+                            )
+                            break
+
+            author = str(getattr(event, "author", "") or "").strip()
+            for part in parts:
+                fc = getattr(part, "function_call", None)
+                if not fc:
+                    continue
+                name = str(getattr(fc, "name", "") or "").strip()
+                if not name or name == "transfer_to_agent":
+                    continue
+                source = _resolve_tool_source(name, getattr(fc, "args", None) or {})
+                human = f"Querying {source}…" if source else f"Calling {name}…"
+                _fire_progress(
+                    phase="execute",
+                    event_type="tool.called",
+                    status="progress",
+                    human_line=human,
+                    metrics={"tool": name},
+                )
+                # Emit step.started when step_executor first calls a tool (### S1 appears only at completion)
+                if author == "step_executor":
+                    wf_state = await self._read_workflow_state(conversation_id)
+                    sid = ""
+                    if wf_state:
+                        for s in (wf_state.get("steps") or []):
+                            st = str(s.get("status", "")).strip()
+                            if st == "in_progress":
+                                sid = str(s.get("id", "")).strip()
+                                break
+                        if not sid:
+                            for s in (wf_state.get("steps") or []):
+                                if str(s.get("status", "")).strip() != "completed":
+                                    sid = str(s.get("id", "")).strip()
+                                    break
+                    if sid and sid not in step_started_ids:
+                        step_started_ids.add(sid)
+                        hint = ""
+                        if wf_state:
+                            for s in (wf_state.get("steps") or []):
+                                if str(s.get("id", "")) == sid:
+                                    hint = str(s.get("tool_hint", "")).strip()
+                                    break
+                        human_step = f"Querying {_step_source_label(hint)}…" if hint else f"Step {sid}…"
+                        _fire_progress(
+                            phase="execute",
+                            event_type="step.started",
+                            status="progress",
+                            human_line=human_step,
+                            metrics={"step_id": sid},
+                        )
+
             text = "".join(
                 part.text
                 for part in parts
@@ -656,11 +770,34 @@ class UiRuntime:
             ).strip()
             if not text:
                 continue
-            author = str(getattr(event, "author", "") or "").strip()
             if not author:
                 continue
 
             fallback_chunks.append(text)
+
+            if author == "step_executor":
+                accumulated = f"{partial_by_author.get('step_executor', '')}{text}"
+                m = re.search(r"###\s*(S\d+)", accumulated)
+                if m:
+                    sid = m.group(1)
+                    if sid not in step_started_ids:
+                        step_started_ids.add(sid)
+                        wf_state = await self._read_workflow_state(conversation_id)
+                        source = ""
+                        if wf_state:
+                            for s in (wf_state.get("steps") or []):
+                                if str(s.get("id", "")) == sid:
+                                    hint = str(s.get("tool_hint", "")).strip()
+                                    source = _step_source_label(hint) if hint else ""
+                                    break
+                        human = f"Querying {source}…" if source else f"Step {sid}…"
+                        _fire_progress(
+                            phase="execute",
+                            event_type="step.started",
+                            status="progress",
+                            human_line=human,
+                            metrics={"step_id": sid},
+                        )
 
             if author == "step_executor" and not bool(getattr(event, "partial", False)):
                 step_counter += 1
@@ -731,16 +868,25 @@ class UiRuntime:
             )
             fut.result(timeout=10)
 
-        for preferred_author in ("report_synthesizer", "co_scientist_workflow"):
+        _preferred_authors = (
+            "report_synthesizer",
+            "general_qa",
+            "clarifier",
+            "report_assistant",
+            "research_workflow",
+            "co_scientist_router",
+        )
+        for preferred_author in _preferred_authors:
             candidate = final_by_author.get(preferred_author, "").strip()
             if candidate:
-                return candidate
+                return candidate, preferred_author
         if final_by_author:
             for author in sorted(final_by_author.keys(), reverse=True):
                 candidate = final_by_author.get(author, "").strip()
                 if candidate:
-                    return candidate
-        return "\n".join(chunk for chunk in fallback_chunks if chunk).strip() or "(No response)"
+                    return candidate, author
+        fallback = "\n".join(chunk for chunk in fallback_chunks if chunk).strip() or "(No response)"
+        return fallback, ""
 
     async def _emit_step_summary(self, run_id: str, wf_state: dict, steps_executed: int) -> None:
         """Build a structured progress summary from workflow state after execution."""
@@ -773,10 +919,14 @@ class UiRuntime:
 
         step_details = []
         for s in steps:
+            tool_hint = str(s.get("tool_hint", "")).strip()
+            source = str(TOOL_SOURCE_NAMES.get(tool_hint, tool_hint)).strip() if tool_hint else ""
             step_details.append({
                 "id": s.get("id", ""),
                 "goal": s.get("goal", ""),
                 "status": s.get("status", "pending"),
+                "tool_hint": tool_hint,
+                "source": source,
                 "step_progress_note": s.get("step_progress_note", ""),
                 "result_summary": s.get("result_summary", ""),
                 "evidence_ids": s.get("evidence_ids", []),
@@ -805,9 +955,11 @@ class UiRuntime:
                 run.progress_summaries.append(summary)
                 run.updated_at = _utc_now()
 
-    async def _save_task_with_progress(self, task: dict, run_id: str | None = None, *, owner_ip: str = "") -> None:
-        """Save task to store, syncing progress data from the active run."""
-        if run_id:
+    async def _save_task_with_progress(
+        self, task: dict, run_id: str | None = None, *, owner_ip: str = "", merge_progress: bool = True
+    ) -> None:
+        """Save task to store, syncing progress data from the active run unless merge_progress=False."""
+        if run_id and merge_progress:
             async with self.runs_lock:
                 run = self.runs.get(run_id)
                 if run:
@@ -952,31 +1104,44 @@ class UiRuntime:
             await self._save_task_with_progress(task, run_id, owner_ip=owner_ip)
             await self._update_run(run_id, task_id=task_id, title=title)
 
-            await self._append_progress_event(
-                run_id,
-                phase="intake",
-                event_type="run.started",
-                status="start",
-                human_line=f"Started: {title}",
-                task_id=task_id,
-            )
-            await self._append_progress_event(
-                run_id,
-                phase="plan",
-                event_type="plan.initializing",
-                status="progress",
-                human_line="Building research plan...",
-                task_id=task_id,
-            )
+            _DIRECT_RESPONSE_AGENTS = {"general_qa", "clarifier", "report_assistant"}
 
             max_plan_attempts = 2
-            for plan_attempt in range(1, max_plan_attempts + 1):
-                response_text = await self._run_workflow_turn(
-                    conv_id, query, run_id=run_id,
+            responding_author = ""
+            planner_failed = False
+            plan_pending = False
+
+            response_text, responding_author = await self._run_workflow_turn(
+                conv_id, query, run_id=run_id,
+            )
+
+            wf_state = await self._read_workflow_state(conv_id)
+            plan_pending = await self._is_plan_pending_approval(conv_id)
+            has_steps = bool(_steps_from_workflow_state(wf_state))
+
+            direct_response_detected = (
+                responding_author in _DIRECT_RESPONSE_AGENTS
+                or (not wf_state and not plan_pending and not has_steps)
+            )
+
+            if not direct_response_detected:
+                await self._append_progress_event(
+                    run_id,
+                    phase="intake",
+                    event_type="run.started",
+                    status="start",
+                    human_line=f"Started: {title}",
+                    task_id=task_id,
+                )
+                await self._append_progress_event(
+                    run_id,
+                    phase="plan",
+                    event_type="plan.initializing",
+                    status="progress",
+                    human_line="Building research plan...",
+                    task_id=task_id,
                 )
 
-                wf_state = await self._read_workflow_state(conv_id)
-                plan_pending = await self._is_plan_pending_approval(conv_id)
                 task["steps"] = _steps_from_workflow_state(wf_state)
                 task["current_step_index"] = 0
 
@@ -986,23 +1151,53 @@ class UiRuntime:
                     task["title"] = _generate_chat_title(restated)
 
                 planner_failed = not wf_state and not plan_pending
-                if planner_failed and plan_attempt < max_plan_attempts:
-                    logger.warning(
-                        "[new_task] Planner failed (attempt %d/%d), retrying...",
-                        plan_attempt, max_plan_attempts,
-                    )
-                    await self._append_progress_event(
-                        run_id,
-                        phase="plan",
-                        event_type="plan.retry",
-                        status="progress",
-                        human_line=f"Plan generation failed (attempt {plan_attempt}), retrying...",
-                        task_id=task_id,
-                    )
-                    continue
-                break
+                if planner_failed:
+                    for plan_attempt in range(2, max_plan_attempts + 1):
+                        logger.warning(
+                            "[new_task] Planner failed (attempt %d/%d), retrying...",
+                            plan_attempt - 1, max_plan_attempts,
+                        )
+                        await self._append_progress_event(
+                            run_id,
+                            phase="plan",
+                            event_type="plan.retry",
+                            status="progress",
+                            human_line=f"Plan generation failed (attempt {plan_attempt - 1}), retrying...",
+                            task_id=task_id,
+                        )
+                        response_text, responding_author = await self._run_workflow_turn(
+                            conv_id, query, run_id=run_id,
+                        )
+                        wf_state = await self._read_workflow_state(conv_id)
+                        plan_pending = await self._is_plan_pending_approval(conv_id)
+                        task["steps"] = _steps_from_workflow_state(wf_state)
+                        task["current_step_index"] = 0
+                        restated = (wf_state or {}).get("objective", "").strip()
+                        if restated:
+                            task["objective"] = restated
+                            task["title"] = _generate_chat_title(restated)
+                        planner_failed = not wf_state and not plan_pending
+                        if not planner_failed:
+                            break
 
-            if planner_failed:
+            if direct_response_detected:
+                task["status"] = "completed"
+                task["is_direct_response"] = True
+                task["direct_response_text"] = response_text
+                task["progress_events"] = []
+                task["progress_summaries"] = []
+                await self._save_task_with_progress(task, run_id, merge_progress=False)
+                async with self.runs_lock:
+                    run = self.runs.get(run_id)
+                    if run:
+                        run.progress_events.clear()
+                        run.progress_summaries.clear()
+                await self._update_run(
+                    run_id, status="completed", task_id=task_id,
+                    final_report=response_text,
+                )
+
+            elif planner_failed:
                 task["status"] = "failed"
                 task["report_markdown"] = response_text
                 await self._save_task_with_progress(task, run_id)
@@ -1092,7 +1287,7 @@ class UiRuntime:
                 task_id=task_id,
             )
 
-            response_text = await self._run_workflow_turn(
+            response_text, _ = await self._run_workflow_turn(
                 conv_id, "approve", run_id=run_id,
             )
 
@@ -1223,7 +1418,7 @@ class UiRuntime:
                 task_id=task_id,
             )
 
-            response_text = await self._run_workflow_turn(
+            response_text, _ = await self._run_workflow_turn(
                 conv_id, prompt, run_id=run_id,
             )
 
@@ -1403,7 +1598,7 @@ def _extract_next_steps(markdown: str) -> list[str]:
             m = re.match(r"^[-*\d.]+\s+(.+)$", stripped)
             if m:
                 suggestions.append(m.group(1).strip())
-            if len(suggestions) >= 5:
+            if len(suggestions) >= 3:
                 break
     return suggestions
 
