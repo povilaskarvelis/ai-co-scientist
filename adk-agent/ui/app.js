@@ -366,7 +366,7 @@ function followUpSuggestionsHtml(iteration) {
   const suggestions = Array.isArray(iteration?.follow_up_suggestions) ? iteration.follow_up_suggestions : [];
   const lines = ["What would you like to do next?"];
   lines.push("");
-  lines.push("For example, I could:");
+  lines.push("For example, we could:");
   if (suggestions.length) {
     for (const item of suggestions.slice(0, 3)) {
       lines.push(`- ${String(item || "").trim()}`);
@@ -750,7 +750,7 @@ function pendingActivitySnapshot() {
 
 function taskHasStarted(task) {
   const history = Array.isArray(task?.hitl_history) ? task.hitl_history : [];
-  return history.includes("continue");
+  return history.includes("approve") || history.includes("continue");
 }
 
 function placeActivityAfterPlan(task, activeRun) {
@@ -903,7 +903,7 @@ function renderMessages() {
 
     const planHtml = planHtmlForIteration(iteration);
     const awaiting = Boolean(task.awaiting_hitl);
-    const buttonLabel = task.hitl_history && task.hitl_history.includes("continue") ? "Continue" : "Start research";
+    const buttonLabel = task.hitl_history && (task.hitl_history.includes("approve") || task.hitl_history.includes("continue")) ? "Approve plan" : "Start research";
     parts.push(checkpointHtml(task.task_id, planHtml, awaiting, buttonLabel));
     if (activityCard && shouldPlaceAfterPlan) parts.push(activityCard);
 

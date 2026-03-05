@@ -3233,7 +3233,7 @@ server.registerTool(
     inputSchema: {
       gene: z.string().describe("Gene symbol (e.g. BRAF, EGFR, KRAS)"),
       variantName: z.string().optional().describe("Optional variant name filter (e.g. V600E)"),
-      limit: z.number().optional().default(10).describe("Max variants to return (default 10, max 25)"),
+      limit: z.coerce.number().optional().default(10).describe("Max variants to return (default 10, max 25)"),
     },
   },
   async ({ gene, variantName, limit = 10 }) => {
@@ -3241,53 +3241,125 @@ server.registerTool(
     if (!normalizedGene) {
       return { content: [{ type: "text", text: "Provide a gene symbol (e.g. BRAF)." }] };
     }
-    const boundedLimit = Math.max(1, Math.min(25, Math.round(limit)));
+    const baseLimit = Math.max(1, Math.min(25, Math.round(Number(limit) || 10)));
 
-    const query = `
-      query SearchVariants($geneName: String!, $first: Int) {
-        variants(
-          geneNames: [$geneName]
-          first: $first
-          sortBy: { column: evidenceItemCount, direction: DESC }
-        ) {
-          totalCount
-          nodes {
-            id
-            name
-            feature {
+    let variants = [];
+    let totalCount = 0;
+    let filtered = [];
+
+    if (variantName) {
+      const normalizedVariant = normalizeWhitespace(variantName);
+      const browseQuery = `
+        query BrowseCivicByVariant($featureName: String!, $variantName: String!) {
+          browseMolecularProfiles(
+            featureName: $featureName
+            variantName: $variantName
+            first: 15
+          ) {
+            nodes {
+              id
               name
+              evidenceItemCount
             }
-            molecularProfiles {
+          }
+        }
+      `;
+      const browseData = await fetchCivicGraphQL(browseQuery, {
+        featureName: normalizedGene,
+        variantName: normalizedVariant,
+      });
+      const profiles = browseData?.browseMolecularProfiles?.nodes || [];
+      if (profiles.length === 0) {
+        const genesQuery = `
+          query GenesFallback($entrezSymbols: [String!]!, $first: Int) {
+            genes(entrezSymbols: $entrezSymbols, first: 1) {
               nodes {
-                id
-                name
-                evidenceCountByClinicalSignificance
-                evidenceItems(first: 5) {
-                  nodes {
-                    id
-                    status
-                    evidenceLevel
-                    evidenceDirection
-                    significance
-                    therapies { name }
-                    disease { name }
-                    source { citation }
+                variants(first: $first) { totalCount nodes { id name molecularProfiles(first: 5) {
+                  nodes { evidenceItems(first: 5) { nodes { id status evidenceLevel evidenceDirection significance therapies { name } disease { name } source { citation } } }
+                } } }
+              }
+            }
+          }
+        }
+        `;
+        const fallbackData = await fetchCivicGraphQL(genesQuery, {
+          entrezSymbols: [normalizedGene],
+          first: 100,
+        });
+        const geneNode = fallbackData?.genes?.nodes?.[0];
+        variants = geneNode?.variants?.nodes || [];
+        totalCount = geneNode?.variants?.totalCount || 0;
+        filtered = variants.filter((v) =>
+          normalizeWhitespace(v.name || "").toLowerCase().includes(normalizedVariant.toLowerCase())
+        );
+      } else {
+        const topIds = profiles
+          .sort((a, b) => (b.evidenceItemCount || 0) - (a.evidenceItemCount || 0))
+          .slice(0, 5)
+          .map((p) => p.id);
+        const frag = `
+          id name evidenceItems(first: 8) {
+            nodes { id status evidenceLevel evidenceDirection significance therapies { name } disease { name } source { citation } }
+          }
+        `;
+        const aliasQueries = topIds.map((id, i) => `p${i}: molecularProfile(id: ${id}) { ${frag} }`).join("\n");
+        const detailQuery = `query { ${aliasQueries} }`;
+        const detailData = await fetchCivicGraphQL(detailQuery);
+        const profileNodes = topIds.map((_, i) => detailData?.[`p${i}`]).filter(Boolean);
+        variants = profileNodes.map((p) => ({
+          id: p.id,
+          name: p.name,
+          molecularProfiles: { nodes: [{ evidenceItems: p.evidenceItems }] },
+        }));
+        totalCount = profiles.length;
+        filtered = variants;
+      }
+    } else {
+      const boundedLimit = baseLimit;
+      const query = `
+        query SearchCivicVariants($entrezSymbols: [String!]!, $first: Int) {
+          genes(entrezSymbols: $entrezSymbols, first: 1) {
+            nodes {
+              id
+              name
+              variants(first: $first) {
+                totalCount
+                nodes {
+                  id
+                  name
+                  molecularProfiles(first: 5) {
+                    nodes {
+                      id
+                      name
+                      evidenceItems(first: 5) {
+                        nodes {
+                          id
+                          status
+                          evidenceLevel
+                          evidenceDirection
+                          significance
+                          therapies { name }
+                          disease { name }
+                          source { citation }
+                        }
+                      }
+                    }
                   }
                 }
               }
             }
           }
         }
-      }
-    `;
-
-    const data = await fetchCivicGraphQL(query, { geneName: normalizedGene, first: boundedLimit });
-    const variants = data?.variants?.nodes || [];
-    const totalCount = data?.variants?.totalCount || 0;
-
-    const filtered = variantName
-      ? variants.filter((v) => normalizeWhitespace(v.name || "").toLowerCase().includes(normalizeWhitespace(variantName).toLowerCase()))
-      : variants;
+      `;
+      const data = await fetchCivicGraphQL(query, {
+        entrezSymbols: [normalizedGene],
+        first: boundedLimit,
+      });
+      const geneNode = data?.genes?.nodes?.[0];
+      variants = geneNode?.variants?.nodes || [];
+      totalCount = geneNode?.variants?.totalCount || 0;
+      filtered = variants;
+    }
 
     if (filtered.length === 0) {
       return {
@@ -3364,8 +3436,8 @@ server.registerTool(
     }
 
     const query = `
-      query GeneDetail($name: String!) {
-        genes(name: $name) {
+      query GeneDetail($entrezSymbols: [String!]!) {
+        genes(entrezSymbols: $entrezSymbols, first: 1) {
           nodes {
             id
             name
@@ -3396,7 +3468,7 @@ server.registerTool(
       }
     `;
 
-    const data = await fetchCivicGraphQL(query, { name: normalizedName });
+    const data = await fetchCivicGraphQL(query, { entrezSymbols: [normalizedName] });
     const genes = data?.genes?.nodes || [];
 
     if (genes.length === 0) {

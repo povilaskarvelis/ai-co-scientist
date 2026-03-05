@@ -768,12 +768,10 @@ def _compose_non_finalize_turn_output(callback_context: CallbackContext) -> str:
         total = _total_step_count(task_state)
         next_id = str(task_state.get("current_step_id") or "")
         if total > 0 and completed < total:
-            hint = (
-                f"\n\n---\n_Completed {completed} of {total} steps."
-            )
+            hint = f"\n\n---\n_Completed {completed} of {total} steps."
             if next_id:
                 hint += f" Next: **{next_id}**."
-            hint += " Send `continue` to execute remaining steps, or `finalize` for a partial summary._"
+            hint += " Send `finalize` for a partial summary._"
             combined += hint
 
     return combined
@@ -2134,7 +2132,16 @@ def _resolve_source_label(tool_hint: str) -> str:
     tool_hint = str(tool_hint or "").strip()
     if not tool_hint:
         return ""
-    return TOOL_SOURCE_NAMES.get(tool_hint, tool_hint)
+    label = TOOL_SOURCE_NAMES.get(tool_hint)
+    if label:
+        return label
+    # BigQuery tool_hints can be dataset.table (e.g. open_targets_platform.disease)
+    if "." in tool_hint:
+        base = tool_hint.split(".", 1)[0]
+        label = TOOL_SOURCE_NAMES.get(base)
+        if label:
+            return label
+    return tool_hint
 
 
 def _synth_context_instructions(task_state: dict[str, Any], callback_context: CallbackContext | None = None) -> list[str]:
@@ -2362,7 +2369,7 @@ def _make_planner_before_model_callback(*, require_approval: bool):
                 f"## Restored Research Cycle {target_idx + 1}\n\n"
                 f"**Objective:** {obj}\n\n"
                 f"**Status:** {plan_status} ({completed}/{total} steps completed)\n\n"
-                "Send `finalize` to regenerate the report, or `continue` to resume execution."
+                "Send `finalize` to regenerate the report, or `approve` to resume execution."
             )
             callback_context.state[STATE_TURN_ABORT_REASON] = "command_handled"
             return _make_text_response(rendered)
@@ -2513,7 +2520,7 @@ def _on_model_error(
             f"## Execution Error\n\n"
             f"A model error occurred: **{error_type}**\n\n"
             f"`{error_msg[:300]}`\n\n"
-            "Send `continue` to retry."
+            "Send `approve` to retry."
         )
     return _make_text_response(user_msg)
 

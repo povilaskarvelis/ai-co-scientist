@@ -37,6 +37,7 @@ from co_scientist.workflow import (
     STATE_PLAN_PENDING_APPROVAL,
     TOOL_SOURCE_NAMES,
     create_workflow_agent,
+    _resolve_source_label,
 )
 
 load_dotenv()
@@ -388,10 +389,7 @@ def _steps_from_workflow_state(wf_state: dict | None) -> list[dict]:
     if not wf_state:
         return []
     def _source_label(tool_name: str) -> str:
-        name = str(tool_name or "").strip()
-        if not name:
-            return ""
-        return str(TOOL_SOURCE_NAMES.get(name, name)).strip()
+        return _resolve_source_label(tool_name or "")
 
     return [
         {
@@ -427,13 +425,13 @@ def _normalize_steps_for_ui(steps: list[dict] | None) -> list[dict]:
         instruction = str(step.get("instruction", "")).strip()
 
         if not source and tool_hint:
-            source = str(TOOL_SOURCE_NAMES.get(tool_hint, tool_hint)).strip()
+            source = _resolve_source_label(tool_hint)
 
         if not source and instruction:
             tool_match = re.search(r"Tool:\s*([^.\n]+)", instruction)
             if tool_match:
                 inferred_tool = tool_match.group(1).strip()
-                source = str(TOOL_SOURCE_NAMES.get(inferred_tool, inferred_tool)).strip()
+                source = _resolve_source_label(inferred_tool)
                 tool_hint = tool_hint or inferred_tool
 
         if not completion and instruction:
@@ -682,7 +680,7 @@ class UiRuntime:
         step_started_ids: set[str] = set()
 
         def _step_source_label(tn: str) -> str:
-            return str(TOOL_SOURCE_NAMES.get(str(tn or "").strip(), tn or "")).strip()
+            return _resolve_source_label(tn or "")
 
         def _fire_progress(**kwargs) -> None:
             asyncio.run_coroutine_threadsafe(
@@ -920,7 +918,7 @@ class UiRuntime:
         step_details = []
         for s in steps:
             tool_hint = str(s.get("tool_hint", "")).strip()
-            source = str(TOOL_SOURCE_NAMES.get(tool_hint, tool_hint)).strip() if tool_hint else ""
+            source = _resolve_source_label(tool_hint) if tool_hint else ""
             step_details.append({
                 "id": s.get("id", ""),
                 "goal": s.get("goal", ""),
@@ -1274,7 +1272,7 @@ class UiRuntime:
 
             conv_id = task["conversation_id"]
             await self._update_run(run_id, task_id=task_id, title=task.get("title", ""))
-            task["hitl_history"].append("continue")
+            task["hitl_history"].append("approve")
             task["awaiting_hitl"] = False
             await self._save_task_with_progress(task, run_id)
 
@@ -1287,79 +1285,78 @@ class UiRuntime:
                 task_id=task_id,
             )
 
-            response_text, _ = await self._run_workflow_turn(
-                conv_id, "approve", run_id=run_id,
-            )
-
-            wf_state = await self._read_workflow_state(conv_id)
-            plan_pending = await self._is_plan_pending_approval(conv_id)
-
-            task["steps"] = _steps_from_workflow_state(wf_state)
-            completed_steps = sum(
-                1 for s in task["steps"] if s.get("status") == "completed"
-            )
-            task["current_step_index"] = completed_steps
-
-            plan_status = wf_state.get("plan_status", "") if wf_state else ""
-            has_synthesis = bool(
-                wf_state
-                and wf_state.get("latest_synthesis", {})
-                and wf_state["latest_synthesis"].get("markdown", "").strip()
-            )
-
-            if plan_status == "completed" and has_synthesis:
-                task["status"] = "completed"
-                final_md = wf_state["latest_synthesis"]["markdown"]
-                task["follow_up_suggestions"] = _extract_next_steps(final_md)
-                stripped_md = _strip_next_steps_section(final_md)
-                task["report_markdown"] = stripped_md
-                await self._append_progress_event(
-                    run_id,
-                    phase="finalize",
-                    event_type="run.completed",
-                    status="done",
-                    human_line="Report completed.",
-                    task_id=task_id,
-                )
-                await self._save_task_with_progress(task, run_id)
-
-                self._write_report(task_id, stripped_md)
-
-                await self._update_run(
-                    run_id, status="completed", task_id=task_id,
-                    final_report=stripped_md,
-                    follow_up_suggestions=task["follow_up_suggestions"],
+            max_continue_loops = 100
+            for loop_idx in range(max_continue_loops):
+                response_text, _ = await self._run_workflow_turn(
+                    conv_id, "approve", run_id=run_id,
                 )
 
-            elif plan_pending:
-                task["awaiting_hitl"] = True
-                task["status"] = "in_progress"
-                await self._save_task_with_progress(task, run_id)
-                await self._update_run(run_id, status="awaiting_hitl", task_id=task_id)
-                await self._append_progress_event(
-                    run_id,
-                    phase="checkpoint",
-                    event_type="checkpoint.opened",
-                    status="done",
-                    human_line="Revised plan ready. Waiting for approval.",
-                    task_id=task_id,
+                wf_state = await self._read_workflow_state(conv_id)
+                plan_pending = await self._is_plan_pending_approval(conv_id)
+
+                task["steps"] = _steps_from_workflow_state(wf_state)
+                completed_steps = sum(
+                    1 for s in task["steps"] if s.get("status") == "completed"
+                )
+                task["current_step_index"] = completed_steps
+
+                plan_status = wf_state.get("plan_status", "") if wf_state else ""
+                has_synthesis = bool(
+                    wf_state
+                    and wf_state.get("latest_synthesis", {})
+                    and wf_state["latest_synthesis"].get("markdown", "").strip()
                 )
 
-            elif plan_status != "completed":
-                task["awaiting_hitl"] = True
-                task["status"] = "in_progress"
-                await self._save_task_with_progress(task, run_id)
-                await self._update_run(run_id, status="awaiting_hitl", task_id=task_id)
-                await self._append_progress_event(
-                    run_id,
-                    phase="execute",
-                    event_type="execution.paused",
-                    status="done",
-                    human_line=f"Completed {completed_steps}/{len(task['steps'])} steps. Send continue to resume.",
-                    task_id=task_id,
-                )
+                if plan_status == "completed" and has_synthesis:
+                    task["status"] = "completed"
+                    final_md = wf_state["latest_synthesis"]["markdown"]
+                    task["follow_up_suggestions"] = _extract_next_steps(final_md)
+                    stripped_md = _strip_next_steps_section(final_md)
+                    task["report_markdown"] = stripped_md
+                    await self._append_progress_event(
+                        run_id,
+                        phase="finalize",
+                        event_type="run.completed",
+                        status="done",
+                        human_line="Report completed.",
+                        task_id=task_id,
+                    )
+                    await self._save_task_with_progress(task, run_id)
+                    self._write_report(task_id, stripped_md)
+                    await self._update_run(
+                        run_id, status="completed", task_id=task_id,
+                        final_report=stripped_md,
+                        follow_up_suggestions=task["follow_up_suggestions"],
+                    )
+                    break
 
-            else:
+                if plan_pending:
+                    task["awaiting_hitl"] = True
+                    task["status"] = "in_progress"
+                    await self._save_task_with_progress(task, run_id)
+                    await self._update_run(run_id, status="awaiting_hitl", task_id=task_id)
+                    await self._append_progress_event(
+                        run_id,
+                        phase="checkpoint",
+                        event_type="checkpoint.opened",
+                        status="done",
+                        human_line="Revised plan ready. Waiting for approval.",
+                        task_id=task_id,
+                    )
+                    break
+
+                if plan_status != "completed":
+                    await self._save_task_with_progress(task, run_id)
+                    await self._append_progress_event(
+                        run_id,
+                        phase="execute",
+                        event_type="execution.running",
+                        status="progress",
+                        human_line=f"Executing step {completed_steps + 1}/{len(task['steps'])}...",
+                        task_id=task_id,
+                    )
+                    continue
+
                 task["status"] = "completed"
                 task["follow_up_suggestions"] = _extract_next_steps(response_text)
                 stripped_md = _strip_next_steps_section(response_text)
@@ -1379,6 +1376,7 @@ class UiRuntime:
                     final_report=stripped_md,
                     follow_up_suggestions=task["follow_up_suggestions"],
                 )
+                break
 
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"

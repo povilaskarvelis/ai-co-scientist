@@ -95,14 +95,18 @@
               </button>
             </form>
             <div id="exampleQueries" class="example-queries">
-              <div class="example-query" data-query="Interpret the clinical significance of BRAF V600E — ClinVar and MyVariant pathogenicity evidence, cBioPortal mutation frequency across tumor types, and CIViC therapeutic relevance.">BRAF V600E — pathogenicity, prevalence, clinical actionability</div>
-              <div class="example-query" data-query="Evaluate PCSK9 as a cardiovascular drug target — Open Targets and GWAS evidence, GTEx tissue expression, DGIdb druggability categories, and related compounds from ChEMBL/PubChem.">PCSK9 as a target — genetics, expression, druggability</div>
-              <div class="example-query" data-query="Profile sotorasib (AMG 510) — PubChem molecular descriptors, ChEMBL bioactivity, KRAS G12C binding site structures from RCSB PDB and AlphaFold context, plus ClinicalTrials.gov and FDA FAERS signals.">Sotorasib profile — chemistry, structure, trials, safety</div>
-              <div class="example-query" data-query="Characterize TP53 across cancers — cBioPortal mutation hotspots, GTEx baseline expression, STRING interaction partners, and Reactome pathway context.">TP53 in cancer — mutations, expression, network, pathways</div>
-              <div class="example-query" data-query="Prioritize type 2 diabetes targets by integrating GWAS Catalog associations, Open Targets evidence scores, and active interventional studies from ClinicalTrials.gov.">Type 2 diabetes targets — GWAS, Open Targets, trials</div>
-              <div class="example-query" data-query="Compare safety and mechanism profiles of JAK inhibitors — FDA FAERS adverse events, ChEMBL selectivity patterns, RxNorm ingredient normalization, and IEDB immune epitope context for downstream targets.">JAK inhibitors — safety, selectivity, immune context</div>
-              <div class="example-query" data-query="Assess LRRK2 for Parkinson disease drug development — OpenAlex/PubMed literature trends, GWAS support, GTEx expression in relevant tissues, and available structural models from AlphaFold and RCSB PDB.">LRRK2 in Parkinson disease — evidence to tractability</div>
-              <div class="example-query" data-query="Find public neuro datasets for schizophrenia EEG/MEG and imaging studies — query OpenNeuro, NEMAR, DANDI, Neurobagel, and CONP, then summarize cohort metadata and reusable analysis resources from EBRAINS KG.">Schizophrenia neuro data landscape — EEG/MEG/imaging</div>
+              <span class="example-queries-label">Example queries</span>
+              <div class="example-queries-grid">
+                <div class="example-query" data-query="For BRAF V600E, where does evidence support standard-of-care actionability versus off-label uncertainty, stratified by tumor type and line of therapy?">BRAF V600E actionability by context</div>
+                <div class="example-query" data-query="If we were selecting one new cardiometabolic target beyond PCSK9, which candidates have the best genetics-to-tractability profile and lowest anticipated safety liabilities?">Cardiometabolic target triage beyond PCSK9</div>
+                <div class="example-query" data-query="For KRAS G12C inhibitors, compare sotorasib and adagrasib on efficacy durability, resistance mechanisms, CNS activity, and adverse event patterns; highlight likely class effects versus molecule-specific effects.">KRAS G12C drugs — class vs molecule effects</div>
+                <div class="example-query" data-query="Use cBioPortal, GTEx, and Reactome to identify TP53-altered tumor contexts where pathway co-dependencies suggest plausible combination strategies rather than TP53 restoration alone.">TP53 contexts with combination rationale</div>
+                <div class="example-query" data-query="Rank type 2 diabetes targets by translational confidence, then run a sensitivity analysis showing which assumptions most change the top-three ranking.">T2D targets with sensitivity analysis</div>
+                <div class="example-query" data-query="Across approved JAK inhibitors, where does kinase selectivity plausibly explain observed safety differences, and where do dose, indication, or patient mix look like stronger explanations?">JAK safety signals — selectivity or confounding?</div>
+                <div class="example-query" data-query="Is LRRK2 still a high-conviction Parkinson's target after accounting for human genetics, CNS target engagement constraints, and biomarker feasibility for proof-of-mechanism studies?">LRRK2 conviction after translational constraints</div>
+                <div class="example-query" data-query="Find schizophrenia EEG/MEG and MRI datasets suitable for cross-cohort replication, and propose a realistic first analysis plan with harmonization risks and expected effect sizes.">Schizophrenia datasets for replication-ready analyses</div>
+                <div class="example-query" data-query="For Alzheimer disease, which target classes currently have the strongest mechanism-to-clinic bridge, and what near-term experiments would most reduce uncertainty for each class?">Alzheimer target classes and de-risking experiments</div>
+              </div>
             </div>
           </section>
 

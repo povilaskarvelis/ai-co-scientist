@@ -283,3 +283,6 @@ def test_resolve_source_label():
     assert workflow._resolve_source_label("search_clinical_trials") == "ClinicalTrials.gov"
     assert workflow._resolve_source_label("unknown_tool") == "unknown_tool"
     assert workflow._resolve_source_label("") == ""
+    # BigQuery dataset.table format - use dataset's display name
+    assert workflow._resolve_source_label("open_targets_platform.disease") == "Open Targets Platform"
+    assert workflow._resolve_source_label("ebi_chembl.some_table") == "ChEMBL"
