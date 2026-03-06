@@ -281,8 +281,221 @@ def test_render_react_step_progress_with_structured_trace():
 def test_resolve_source_label():
     assert workflow._resolve_source_label("run_bigquery_select_query") == "BigQuery"
     assert workflow._resolve_source_label("search_clinical_trials") == "ClinicalTrials.gov"
+    assert workflow._resolve_source_label("resolve_gene_identifiers") == "MyGene.info"
+    assert workflow._resolve_source_label("map_ontology_terms_oxo") == "EBI OxO"
+    assert workflow._resolve_source_label("search_hpo_terms") == "Human Phenotype Ontology"
+    assert workflow._resolve_source_label("get_orphanet_disease_profile") == "Orphanet / ORDO"
+    assert workflow._resolve_source_label("query_monarch_associations") == "Monarch Initiative"
+    assert workflow._resolve_source_label("get_quickgo_annotations") == "QuickGO"
+    assert workflow._resolve_source_label("search_europe_pmc_literature") == "Europe PMC"
+    assert workflow._resolve_source_label("search_pathway_commons_top_pathways") == "Pathway Commons"
+    assert workflow._resolve_source_label("get_guidetopharmacology_target") == "Guide to Pharmacology"
+    assert workflow._resolve_source_label("get_dailymed_drug_label") == "DailyMed"
+    assert workflow._resolve_source_label("get_clingen_gene_curation") == "ClinGen"
+    assert workflow._resolve_source_label("get_alliance_genome_gene_profile") == "Alliance Genome Resources"
+    assert workflow._resolve_source_label("get_biogrid_interactions") == "BioGRID"
+    assert workflow._resolve_source_label("get_biogrid_orcs_gene_summary") == "BioGRID ORCS"
+    assert workflow._resolve_source_label("get_human_protein_atlas_gene") == "Human Protein Atlas"
+    assert workflow._resolve_source_label("get_depmap_gene_dependency") == "DepMap"
+    assert workflow._resolve_source_label("get_gdsc_drug_sensitivity") == "GDSC / CancerRxGene"
+    assert workflow._resolve_source_label("get_prism_repurposing_response") == "PRISM Repurposing"
+    assert workflow._resolve_source_label("get_pharmacodb_compound_response") == "PharmacoDB"
+    assert workflow._resolve_source_label("get_intact_interactions") == "IntAct"
+    assert workflow._resolve_source_label("search_cellxgene_datasets") == "CELLxGENE Discover / Census"
     assert workflow._resolve_source_label("unknown_tool") == "unknown_tool"
     assert workflow._resolve_source_label("") == ""
     # BigQuery dataset.table format - use dataset's display name
     assert workflow._resolve_source_label("open_targets_platform.disease") == "Open Targets Platform"
     assert workflow._resolve_source_label("ebi_chembl.some_table") == "ChEMBL"
+
+
+def test_format_source_precedence_rules_mentions_overlap_groups():
+    text = workflow._format_source_precedence_rules([
+        "search_pubmed",
+        "search_europe_pmc_literature",
+        "search_openalex_works",
+        "search_hpo_terms",
+        "get_orphanet_disease_profile",
+        "query_monarch_associations",
+        "get_guidetopharmacology_target",
+        "get_chembl_bioactivities",
+        "get_pubchem_compound",
+        "get_biogrid_interactions",
+        "get_string_interactions",
+        "get_alliance_genome_gene_profile",
+        "get_clingen_gene_curation",
+        "get_biogrid_orcs_gene_summary",
+        "get_depmap_gene_dependency",
+        "get_gdsc_drug_sensitivity",
+        "get_prism_repurposing_response",
+        "get_pharmacodb_compound_response",
+        "query_monarch_associations",
+    ])
+    assert "Literature search" in text
+    assert "`search_pubmed`" in text
+    assert "`search_europe_pmc_literature`" in text
+    assert "Phenotype and rare-disease reasoning" in text
+    assert "`search_hpo_terms`" in text
+    assert "`get_orphanet_disease_profile`" in text
+    assert "Translational model-organism evidence" in text
+    assert "`get_alliance_genome_gene_profile`" in text
+    assert "Compound pharmacology" in text
+    assert "`get_guidetopharmacology_target`" in text
+    assert "Interaction evidence" in text
+    assert "`get_biogrid_interactions`" in text
+    assert "Functional screening vs drug response" in text
+    assert "`get_biogrid_orcs_gene_summary`" in text
+    assert "`get_prism_repurposing_response`" in text
+    assert "`get_pharmacodb_compound_response`" in text
+
+
+def test_prioritize_tools_for_step_prefers_hint_then_fallbacks():
+    ordered = workflow._prioritize_tools_for_step(
+        [
+            "get_pubchem_compound",
+            "get_guidetopharmacology_target",
+            "get_chembl_bioactivities",
+            "search_drug_gene_interactions",
+        ],
+        "get_guidetopharmacology_target",
+    )
+    assert ordered[0] == "get_guidetopharmacology_target"
+    assert ordered[1] == "get_chembl_bioactivities"
+    assert ordered[2] == "search_drug_gene_interactions"
+
+
+def test_react_step_context_instructions_include_routing_guidance():
+    task_state = {
+        "objective": "Assess TP53 interactions",
+        "steps": [
+            {
+                "id": "S1",
+                "status": "pending",
+                "goal": "Collect curated interaction evidence",
+                "tool_hint": "get_intact_interactions",
+                "domains": ["protein"],
+                "completion_condition": "Summarize top partners and PMIDs",
+            },
+        ],
+    }
+    active_step = task_state["steps"][0]
+    instructions = workflow._react_step_context_instructions(task_state, active_step)
+    text = "\n".join(instructions)
+    assert "Routing guidance for this step's tool_hint `get_intact_interactions`" in text
+    assert "`get_string_interactions` (STRING)" in text
+    assert "Start with `get_intact_interactions`" in text
+
+
+def test_react_step_context_instructions_include_phenotype_routing_guidance():
+    task_state = {
+        "objective": "Prioritize a rare-disease phenotype route",
+        "steps": [
+            {
+                "id": "S1",
+                "status": "pending",
+                "goal": "Map ataxia to candidate genes using phenotype reasoning",
+                "tool_hint": "query_monarch_associations",
+                "domains": ["genomics"],
+                "completion_condition": "Return top phenotype-to-gene associations",
+            },
+        ],
+    }
+    active_step = task_state["steps"][0]
+    instructions = workflow._react_step_context_instructions(task_state, active_step)
+    text = "\n".join(instructions)
+    assert "Routing guidance for this step's tool_hint `query_monarch_associations`" in text
+    assert "`search_hpo_terms` (Human Phenotype Ontology)" in text
+    assert "`get_orphanet_disease_profile` (Orphanet / ORDO)" in text
+    assert "Start with `query_monarch_associations`" in text
+
+
+def test_react_step_context_instructions_include_translational_routing_guidance():
+    task_state = {
+        "objective": "Assess model-organism evidence for TP53",
+        "steps": [
+            {
+                "id": "S1",
+                "status": "pending",
+                "goal": "Collect ortholog and disease-model context",
+                "tool_hint": "get_alliance_genome_gene_profile",
+                "domains": ["genomics"],
+                "completion_condition": "Summarize orthologs and representative models",
+            },
+        ],
+    }
+    active_step = task_state["steps"][0]
+    instructions = workflow._react_step_context_instructions(task_state, active_step)
+    text = "\n".join(instructions)
+    assert "Routing guidance for this step's tool_hint `get_alliance_genome_gene_profile`" in text
+    assert "`get_clingen_gene_curation` (ClinGen)" in text
+    assert "`query_monarch_associations` (Monarch Initiative)" in text
+    assert "Start with `get_alliance_genome_gene_profile`" in text
+
+
+def test_react_step_context_instructions_include_biogrid_routing_guidance():
+    task_state = {
+        "objective": "Collect broader experimental interaction evidence for TP53",
+        "steps": [
+            {
+                "id": "S1",
+                "status": "pending",
+                "goal": "Summarize physical and genetic interaction evidence from BioGRID",
+                "tool_hint": "get_biogrid_interactions",
+                "domains": ["protein"],
+                "completion_condition": "Return top BioGRID partners, evidence classes, and PMIDs",
+            },
+        ],
+    }
+    active_step = task_state["steps"][0]
+    instructions = workflow._react_step_context_instructions(task_state, active_step)
+    text = "\n".join(instructions)
+    assert "Routing guidance for this step's tool_hint `get_biogrid_interactions`" in text
+    assert "`get_intact_interactions` (IntAct)" in text
+    assert "`get_string_interactions` (STRING)" in text
+    assert "Start with `get_biogrid_interactions`" in text
+
+
+def test_react_step_context_instructions_include_orcs_routing_guidance():
+    task_state = {
+        "objective": "Review published CRISPR screens for EGFR",
+        "steps": [
+            {
+                "id": "S1",
+                "status": "pending",
+                "goal": "Summarize BioGRID ORCS screen evidence for EGFR",
+                "tool_hint": "get_biogrid_orcs_gene_summary",
+                "domains": ["genomics"],
+                "completion_condition": "Return hit counts, phenotypes, cell lines, and representative screens",
+            },
+        ],
+    }
+    active_step = task_state["steps"][0]
+    instructions = workflow._react_step_context_instructions(task_state, active_step)
+    text = "\n".join(instructions)
+    assert "Routing guidance for this step's tool_hint `get_biogrid_orcs_gene_summary`" in text
+    assert "`get_depmap_gene_dependency` (DepMap)" in text
+    assert "`get_gdsc_drug_sensitivity` (GDSC / CancerRxGene)" in text
+    assert "Start with `get_biogrid_orcs_gene_summary`" in text
+
+
+def test_react_step_context_instructions_include_pharmacodb_routing_guidance():
+    task_state = {
+        "objective": "Compare public drug-response evidence for paclitaxel",
+        "steps": [
+            {
+                "id": "S1",
+                "status": "pending",
+                "goal": "Summarize cross-dataset compound response for paclitaxel",
+                "tool_hint": "get_pharmacodb_compound_response",
+                "domains": ["chemistry"],
+                "completion_condition": "Return top datasets, tissues, and sensitive cell lines",
+            },
+        ],
+    }
+    active_step = task_state["steps"][0]
+    instructions = workflow._react_step_context_instructions(task_state, active_step)
+    text = "\n".join(instructions)
+    assert "Routing guidance for this step's tool_hint `get_pharmacodb_compound_response`" in text
+    assert "`get_gdsc_drug_sensitivity` (GDSC / CancerRxGene)" in text
+    assert "`get_prism_repurposing_response` (PRISM Repurposing)" in text
+    assert "Start with `get_pharmacodb_compound_response`" in text

@@ -26,7 +26,7 @@
             reports, and more.
           </p>
           <p>
-            AI Co-Scientist unifies <strong>35 data sources</strong> behind a
+            AI Co-Scientist unifies <strong>53 data sources</strong> behind a
             single conversational interface. Ask a question in plain language and
             the agent plans a multi-step investigation, queries the right
             databases, synthesizes the evidence, and delivers a cited research
@@ -54,6 +54,10 @@
                 <dd>Broad scholarly knowledge graph covering 250M+ works including preprints, conference papers, and datasets. Useful for researcher discovery and citation analysis.</dd>
               </div>
               <div class="source-item">
+                <dt><a href="https://europepmc.org/" target="_blank" rel="noopener">Europe PMC</a></dt>
+                <dd>European life-science literature platform with PubMed records, full text links, preprints, citation counts, grants, and text-mined metadata. Useful when PubMed alone is too narrow.</dd>
+              </div>
+              <div class="source-item">
                 <dt><a href="https://clinicaltrials.gov/" target="_blank" rel="noopener">ClinicalTrials.gov</a></dt>
                 <dd>Registry of 500K+ clinical studies worldwide. Search active, recruiting, and completed trials by condition, intervention, or sponsor.</dd>
               </div>
@@ -76,6 +80,10 @@
                 <dt><a href="https://civicdb.org/" target="_blank" rel="noopener">CIViC</a></dt>
                 <dd>Community-curated clinical interpretations of cancer variants. Expert-reviewed evidence linking specific mutations to diagnosis, prognosis, and treatment response.</dd>
               </div>
+              <div class="source-item">
+                <dt><a href="https://www.clinicalgenome.org/" target="_blank" rel="noopener">ClinGen</a></dt>
+                <dd>Curated gene-disease validity and dosage sensitivity resource. Adds expert-panel classifications and dosage evidence beyond variant-level pathogenicity databases.</dd>
+              </div>
             </dl>
           </div>
 
@@ -96,12 +104,32 @@
                 <dd>Drug-Gene Interaction Database aggregating 40+ sources. Returns druggability categories (kinase, clinically actionable, etc.) and known drug interactions for any gene.</dd>
               </div>
               <div class="source-item">
+                <dt><a href="https://www.guidetopharmacology.org/" target="_blank" rel="noopener">Guide to Pharmacology</a></dt>
+                <dd>Curated target-ligand pharmacology from IUPHAR/BPS. Useful for mechanism-of-action summaries, action types, affinity evidence, and a cleaner curated pharmacology layer than general chemistry databases alone.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.cancerrxgene.org/" target="_blank" rel="noopener">GDSC / CancerRxGene</a></dt>
+                <dd>Genomics of Drug Sensitivity in Cancer pharmacogenomics screens across hundreds of cancer cell lines. Useful for compound sensitivity patterns, tissue-specific response, and in vitro IC50/AUC context.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://depmap.org/repurposing/" target="_blank" rel="noopener">PRISM Repurposing</a></dt>
+                <dd>Broad Institute pooled-cell-line repurposing screen with single-dose log2-fold-change viability readouts across large cancer cell-line panels. Useful for broad viability patterns and fast repurposing-style response scans.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://pharmacodb.ca/" target="_blank" rel="noopener">PharmacoDB</a></dt>
+                <dd>Cross-dataset pharmacogenomics portal harmonizing compound-response data from GDSC, PRISM, CTRPv2, and related public screens. Useful when response needs to be compared across multiple public drug-response resources in one layer.</dd>
+              </div>
+              <div class="source-item">
                 <dt><a href="https://open.fda.gov/apis/drug/event/" target="_blank" rel="noopener">FDA FAERS</a></dt>
                 <dd>Post-marketing adverse event reports from the FDA. Analyze safety signals, compare adverse event profiles across drugs, and identify drug class effects.</dd>
               </div>
               <div class="source-item">
                 <dt><a href="https://www.nlm.nih.gov/research/umls/rxnorm/" target="_blank" rel="noopener">RxNorm</a></dt>
                 <dd>Standardized drug nomenclature from the NLM. Maps between brand names, generics, ingredients, and clinical drug forms.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://dailymed.nlm.nih.gov/dailymed/" target="_blank" rel="noopener">DailyMed</a></dt>
+                <dd>Current FDA Structured Product Labels (SPLs) for US drugs. Useful for boxed warnings, indications, contraindications, and warnings/precautions straight from the label.</dd>
               </div>
             </dl>
           </div>
@@ -119,12 +147,28 @@
                 <dd>Tissue-level gene expression from the Genotype-Tissue Expression project. Median TPM values across 54 human tissues from 948 donors — critical for target safety assessment.</dd>
               </div>
               <div class="source-item">
+                <dt><a href="https://www.proteinatlas.org/" target="_blank" rel="noopener">Human Protein Atlas</a></dt>
+                <dd>Protein-level tissue specificity, single-cell specificity, protein class, and subcellular localization summaries for human genes. Useful for target validation beyond RNA-only evidence.</dd>
+              </div>
+              <div class="source-item">
                 <dt><a href="https://reactome.org/" target="_blank" rel="noopener">Reactome</a></dt>
                 <dd>Curated biological pathways and reactions. Understand the signaling cascades, metabolic pathways, and cellular processes a gene participates in.</dd>
               </div>
               <div class="source-item">
                 <dt><a href="https://string-db.org/" target="_blank" rel="noopener">STRING</a></dt>
                 <dd>Protein-protein interaction networks combining experimental data, text mining, and computational predictions. Identify interaction partners and functional modules.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.ebi.ac.uk/intact/" target="_blank" rel="noopener">IntAct</a></dt>
+                <dd>Curated experimental molecular interactions from EMBL-EBI. Useful when you want publication-backed interaction records and detection methods rather than integrated network predictions.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://thebiogrid.org/" target="_blank" rel="noopener">BioGRID</a></dt>
+                <dd>Large experimental interaction archive covering both physical and genetic interactions. Useful when you want broader publication-backed interaction coverage, throughput context, and partner evidence beyond a narrower curated interaction subset.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.pathwaycommons.org/" target="_blank" rel="noopener">Pathway Commons</a></dt>
+                <dd>Integrated pathway and interaction resource aggregating multiple providers into a single queryable graph. Useful for widening pathway context beyond any one source.</dd>
               </div>
             </dl>
           </div>
@@ -145,8 +189,8 @@
           </div>
 
           <div class="tier">
-            <h3>Genomic Variation</h3>
-            <p class="tier-desc">Population genetics and variant-level interpretation.</p>
+            <h3>Genomic Variation, Phenotypes &amp; Ontologies</h3>
+            <p class="tier-desc">Population genetics, phenotype normalization, and rare-disease grounding.</p>
             <dl class="source-list">
               <div class="source-item">
                 <dt><a href="https://gnomad.broadinstitute.org/" target="_blank" rel="noopener">gnomAD</a></dt>
@@ -167,6 +211,34 @@
               <div class="source-item">
                 <dt><a href="https://myvariant.info/" target="_blank" rel="noopener">MyVariant.info</a></dt>
                 <dd>Aggregated variant annotations pulling from ClinVar, CADD, dbSNP, gnomAD, and COSMIC in a single lookup. Quick comprehensive view of any variant.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://mygene.info/" target="_blank" rel="noopener">MyGene.info</a></dt>
+                <dd>Fast gene identifier normalization service for symbols, aliases, Entrez IDs, Ensembl IDs, and UniProt IDs. Useful for joining evidence across heterogeneous APIs.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.ebi.ac.uk/spot/oxo/about" target="_blank" rel="noopener">OxO</a></dt>
+                <dd>Ontology cross-reference service from EMBL-EBI. Bridges MONDO, EFO, DOID, MeSH, OMIM, UMLS, and related identifier systems for safer cross-database joins.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.ebi.ac.uk/QuickGO/" target="_blank" rel="noopener">QuickGO</a></dt>
+                <dd>Gene Ontology term search and annotation service. Supports GO term discovery plus reviewed GO annotations for gene products with evidence codes and references.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://hpo.jax.org/" target="_blank" rel="noopener">Human Phenotype Ontology (HPO)</a></dt>
+                <dd>Standard phenotype vocabulary for rare disease and clinical genomics. Useful for normalizing phenotype terms like ataxia, microcephaly, and seizures before cross-source joins.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.orpha.net/" target="_blank" rel="noopener">Orphanet / ORDO</a></dt>
+                <dd>Reference rare-disease catalog and ontology with disease definitions, xrefs, inheritance, age of onset, phenotype annotations, and curated disease-gene links.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://monarchinitiative.org/" target="_blank" rel="noopener">Monarch Initiative</a></dt>
+                <dd>Phenotype-centric knowledge graph spanning genes, diseases, phenotypes, and model-organism evidence. Useful for phenotype-to-gene and disease-to-phenotype association queries.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://www.alliancegenome.org/" target="_blank" rel="noopener">Alliance Genome Resources</a></dt>
+                <dd>Integrated cross-species knowledge platform spanning human and model-organism genomes. Useful for orthologs, disease and phenotype summaries, and model-organism disease evidence that complements human-only sources.</dd>
               </div>
             </dl>
           </div>
@@ -214,6 +286,18 @@
               <div class="source-item">
                 <dt><a href="https://www.cbioportal.org/" target="_blank" rel="noopener">cBioPortal</a></dt>
                 <dd>Cancer genomics from the TCGA Pan-Cancer Atlas (32 tumor types, ~10K samples). Mutation frequencies, hotspot protein changes, and mutation type breakdowns by cancer.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://depmap.org/" target="_blank" rel="noopener">DepMap</a></dt>
+                <dd>Cancer Dependency Map target-vulnerability resource. Public releases expose CRISPR/RNAi dependency fractions, pan-dependency/selectivity metrics, and predictive biomarkers for target prioritization.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://orcs.thebiogrid.org/" target="_blank" rel="noopener">BioGRID ORCS</a></dt>
+                <dd>Open Repository of CRISPR Screens from BioGRID. Useful for published screen-level hit status, phenotype labels, cell-line context, methodologies, and score summaries that complement release-level dependency resources.</dd>
+              </div>
+              <div class="source-item">
+                <dt><a href="https://cellxgene.cziscience.com/" target="_blank" rel="noopener">CELLxGENE Discover / Census</a></dt>
+                <dd>Public single-cell dataset catalog and Census ecosystem from CZ CELLxGENE. Useful for discovering datasets by disease, tissue, assay, organism, and annotated cell types.</dd>
               </div>
               <div class="source-item">
                 <dt><a href="https://www.iedb.org/" target="_blank" rel="noopener">IEDB</a></dt>

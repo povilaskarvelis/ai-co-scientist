@@ -10,6 +10,7 @@
   "dependencies": {
     "@google-cloud/bigquery": "^7.9.4",
     "@modelcontextprotocol/sdk": "^1.0.0",
+    "fast-xml-parser": "^4.5.4",
     "zod": "^3.23.0"
   }
 }

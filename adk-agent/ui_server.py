@@ -138,6 +138,18 @@ def _compact_text(value: str, *, max_chars: int = 180) -> str:
     return f"{text[: max_chars - 3].rstrip()}..."
 
 
+_TRANSIENT_WORKFLOW_RESPONSE_PATTERNS = (
+    re.compile(r"^_?\s*rate limit hit\s+[—-]\s+waited\s+\d+s,\s+retrying[.…_ ]*$", re.IGNORECASE),
+)
+
+
+def _is_transient_workflow_response(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return False
+    return any(pattern.match(normalized) for pattern in _TRANSIENT_WORKFLOW_RESPONSE_PATTERNS)
+
+
 def _parse_step_event_text(text: str) -> dict:
     """Extract structured info from step_executor rendered markdown."""
     info: dict = {}
@@ -658,6 +670,36 @@ class UiRuntime:
 
         return await main_loop.run_in_executor(self._thread_pool, _thread_target)
 
+    async def _run_workflow_turn_filtered(
+        self,
+        conversation_id: str,
+        prompt: str,
+        *,
+        run_id: str,
+        max_transient_retries: int = 3,
+    ) -> tuple[str, str]:
+        """Retry turns when the only returned content is a transient status line."""
+        last_response = ("", "")
+        for attempt in range(max_transient_retries + 1):
+            response_text, responding_author = await self._run_workflow_turn(
+                conversation_id,
+                prompt,
+                run_id=run_id,
+            )
+            last_response = (response_text, responding_author)
+            if not _is_transient_workflow_response(response_text):
+                return response_text, responding_author
+            await self._append_progress_event(
+                run_id,
+                phase="execute",
+                event_type="model.retry",
+                status="progress",
+                human_line="Rate limit hit; waiting for the workflow to resume before surfacing output.",
+            )
+            if attempt < max_transient_retries:
+                await asyncio.sleep(0.2)
+        return last_response
+
     async def _workflow_turn_inner(
         self,
         cs: ConversationSession,
@@ -767,6 +809,8 @@ class UiRuntime:
                 if isinstance(getattr(part, "text", None), str)
             ).strip()
             if not text:
+                continue
+            if _is_transient_workflow_response(text):
                 continue
             if not author:
                 continue
@@ -1109,7 +1153,7 @@ class UiRuntime:
             planner_failed = False
             plan_pending = False
 
-            response_text, responding_author = await self._run_workflow_turn(
+            response_text, responding_author = await self._run_workflow_turn_filtered(
                 conv_id, query, run_id=run_id,
             )
 
@@ -1163,7 +1207,7 @@ class UiRuntime:
                             human_line=f"Plan generation failed (attempt {plan_attempt - 1}), retrying...",
                             task_id=task_id,
                         )
-                        response_text, responding_author = await self._run_workflow_turn(
+                        response_text, responding_author = await self._run_workflow_turn_filtered(
                             conv_id, query, run_id=run_id,
                         )
                         wf_state = await self._read_workflow_state(conv_id)
@@ -1287,7 +1331,7 @@ class UiRuntime:
 
             max_continue_loops = 100
             for loop_idx in range(max_continue_loops):
-                response_text, _ = await self._run_workflow_turn(
+                response_text, _ = await self._run_workflow_turn_filtered(
                     conv_id, "approve", run_id=run_id,
                 )
 
@@ -1416,7 +1460,7 @@ class UiRuntime:
                 task_id=task_id,
             )
 
-            response_text, _ = await self._run_workflow_turn(
+            response_text, _ = await self._run_workflow_turn_filtered(
                 conv_id, prompt, run_id=run_id,
             )
 

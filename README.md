@@ -6,7 +6,7 @@ An agentic AI research assistant that synthesizes evidence across biomedical dat
 
 The AI Co-Scientist helps biomedical researchers evaluate therapeutic targets and research directions before human trials by:
 
-- **Synthesizing evidence across 35 databases** — genomics, literature, clinical trials, neuroscience, protein structure, pathways, safety, and more
+- **Synthesizing evidence across 57 databases and services** — genomics, transcriptomics, literature, clinical trials, neuroscience, protein structure, pathways, safety, ontologies, rare-disease knowledge, translational model-organism evidence, single-cell atlases, pharmacogenomics, functional screening, curated interaction evidence, and more
 - **Generating query-specific execution plans** with explicit tool and data-source proposals
 - **Requiring human plan approval or revision** before evidence tools run
 - **Running iterative evidence-gathering loops** via a ReAct (Reason → Act → Observe) cycle
@@ -17,21 +17,25 @@ The AI Co-Scientist helps biomedical researchers evaluate therapeutic targets an
 
 | Category | Sources |
 |----------|---------|
-| **Genomics & Variants** | Open Targets Platform, gnomAD, 1000 Genomes, Ensembl VEP, MyVariant.info |
+| **Genomics, Transcriptomics & Variants** | Open Targets Platform, gnomAD, 1000 Genomes, Gene Expression Omnibus (GEO), Ensembl VEP, MyVariant.info, MyGene.info |
+| **Identifiers, Ontologies & Phenotypes** | OxO, QuickGO, Human Phenotype Ontology (HPO), Orphanet / ORDO, Monarch Initiative |
+| **Model Organisms & Translational Evidence** | Alliance Genome Resources |
 | **Clinical Trials** | ClinicalTrials.gov |
-| **Literature & Researchers** | PubMed, OpenAlex |
-| **Protein Structure & Function** | AlphaFold, RCSB PDB, UniProt |
-| **Pathways & Interactions** | Reactome, STRING |
+| **Literature & Researchers** | PubMed, OpenAlex, Europe PMC |
+| **Protein Structure & Function** | AlphaFold, RCSB PDB, UniProt, Human Protein Atlas |
+| **Pathways & Interactions** | Reactome, STRING, Pathway Commons, IntAct, BioGRID |
 | **Chemistry & Bioactivity** | ChEMBL, PubChem, SureChEMBL |
-| **Safety & Regulatory** | FDA FAERS, RxNorm |
+| **Safety & Regulatory** | FDA FAERS, RxNorm, DailyMed |
+| **Drug Response & Pharmacogenomics** | GDSC / CancerRxGene, PRISM Repurposing, PharmacoDB |
 | **Immunology** | IEDB |
 | **Perturbation Signatures** | LINCS L1000 |
-| **Clinical Variant Interpretation** | CIViC, ClinVar |
+| **Clinical Variant Interpretation** | CIViC, ClinVar, ClinGen |
 | **Cancer Genomics** | cBioPortal |
-| **Target Discovery & Druggability** | GWAS Catalog, DGIdb, GTEx |
+| **Target Discovery & Druggability** | GWAS Catalog, DGIdb, GTEx, DepMap, Guide to Pharmacology, BioGRID ORCS |
+| **Single-Cell Atlases** | CELLxGENE Discover / Census |
 | **Neuroscience Atlases & Knowledge Graphs** | Allen Brain Atlas, EBRAINS Knowledge Graph, CONP, Neurobagel, OpenNeuro, DANDI, NEMAR, Brain-CODE, ENIGMA |
 
-This stack combines live REST APIs (literature, trials, protein/pathway, neuroscience) with BigQuery public datasets (genomics, chemistry, safety, perturbation, and patent-derived chemistry).
+This stack combines live REST APIs (literature, trials, identifiers/ontologies, protein/pathway, single-cell, neuroscience) with BigQuery public datasets (genomics, chemistry, safety, perturbation, and patent-derived chemistry).
 
 ## Architecture
 
@@ -199,22 +203,37 @@ The reasoning trace captures the full decision chain per step and is stored alon
 | Category | Tools | Source |
 |----------|-------|--------|
 | **Clinical Trials** | `search_clinical_trials`, `get_clinical_trial`, `summarize_clinical_trials_landscape` | ClinicalTrials.gov |
-| **Literature** | `search_pubmed`, `search_pubmed_advanced`, `get_pubmed_abstract` | PubMed (NCBI E-utilities) |
+| **Literature** | `search_pubmed`, `search_pubmed_advanced`, `get_pubmed_abstract`, `get_paper_fulltext` | PubMed / PMC (NCBI E-utilities) |
+| **Literature Enrichment** | `search_europe_pmc_literature` | Europe PMC (preprints, citation counts, open-access metadata, broader article coverage) |
+| **Transcriptomics** | `search_geo_datasets`, `get_geo_dataset` | NCBI Gene Expression Omnibus (GEO; series, samples, platforms, curated datasets) |
 | **Researcher Discovery** | `search_openalex_works`, `search_openalex_authors`, `rank_researchers_by_activity`, `get_researcher_contact_candidates` | OpenAlex |
+| **Gene ID Normalization** | `resolve_gene_identifiers` | MyGene.info |
+| **Ontology Crosswalks** | `map_ontology_terms_oxo` | EBI OxO |
+| **Phenotypes & Rare Disease** | `search_hpo_terms`, `get_orphanet_disease_profile`, `query_monarch_associations` | HPO via EBI OLS, Orphanet / ORDO, Monarch Initiative |
+| **Translational Model Evidence** | `get_alliance_genome_gene_profile` | Alliance Genome Resources (orthologs, disease/phenotype summaries, and disease models across model-organism resources) |
+| **Gene Ontology** | `search_quickgo_terms`, `get_quickgo_annotations` | QuickGO |
 | **Protein Annotations** | `search_uniprot_proteins`, `get_uniprot_protein_profile` | UniProt REST |
-| **Pathways & Networks** | `search_reactome_pathways`, `get_string_interactions` | Reactome, STRING |
+| **Pathways & Networks** | `search_reactome_pathways`, `get_string_interactions`, `get_intact_interactions`, `get_biogrid_interactions`, `search_pathway_commons_top_pathways` | Reactome, STRING, IntAct, BioGRID, Pathway Commons |
 | **Variant Predictions** | `annotate_variants_vep` | Ensembl VEP (SIFT, PolyPhen, AlphaMissense) |
 | **Variant Annotations** | `get_variant_annotations` | MyVariant.info (ClinVar, CADD, dbSNP, gnomAD, COSMIC) |
 | **Clinical Variants** | `search_civic_variants`, `search_civic_genes` | CIViC (cancer variant interpretations) |
+| **Curated Gene Curation** | `get_clingen_gene_curation` | ClinGen (gene-disease validity, dosage sensitivity) |
 | **Protein Structures** | `get_alphafold_structure` | AlphaFold API (pLDDT confidence, PDB/CIF files) |
 | **GWAS Associations** | `search_gwas_associations` | EBI GWAS Catalog (trait-variant associations, p-values, odds ratios) |
 | **Drug-Gene Interactions** | `search_drug_gene_interactions` | DGIdb (druggability categories, approved/experimental drugs) |
+| **Curated Pharmacology** | `get_guidetopharmacology_target` | Guide to Pharmacology (curated target-ligand interactions, action types, affinity evidence) |
 | **Tissue Expression** | `get_gene_tissue_expression` | GTEx v8 (median TPM across 54 human tissues) |
+| **Protein Atlas** | `get_human_protein_atlas_gene` | Human Protein Atlas (tissue specificity, single-cell specificity, subcellular localization, protein class) |
+| **Dependency & Vulnerability** | `get_depmap_gene_dependency` | DepMap (CRISPR/RNAi dependency fractions, pan-dependency/selectivity, predictive features) |
+| **Published CRISPR Screens** | `get_biogrid_orcs_gene_summary` | BioGRID ORCS (screen-level hit status, phenotypes, cell lines, methodologies, and score summaries across published CRISPR screens) |
+| **Drug Response** | `get_gdsc_drug_sensitivity`, `get_prism_repurposing_response`, `get_pharmacodb_compound_response` | GDSC / CancerRxGene (compound sensitivity across cancer cell lines, IC50/AUC patterns, tissue-level pharmacogenomics); Broad PRISM Repurposing (single-dose log2-fold-change viability across pooled cell lines); PharmacoDB (harmonized cross-dataset response across GDSC, PRISM, CTRPv2, and related public screens) |
 | **Experimental Structures** | `search_protein_structures` | RCSB PDB (X-ray, cryo-EM structures, resolution, ligands) |
 | **Cancer Mutations** | `get_cancer_mutation_profile` | cBioPortal (TCGA Pan-Cancer mutation frequencies, hotspots) |
 | **Bioactivity** | `get_chembl_bioactivities` | ChEMBL API (IC50/Ki/Kd, target selectivity, assay metadata) |
 | **Chemical Compounds** | `get_pubchem_compound` | PubChem (116M+ compounds, molecular properties, SMILES, drug-likeness) |
 | **Safety Signals** | `search_fda_adverse_events` | openFDA FAERS (post-marketing adverse event reports) |
+| **Drug Labels** | `get_dailymed_drug_label` | DailyMed SPL labels (boxed warnings, indications, contraindications, warnings/precautions) |
+| **Single-Cell Dataset Discovery** | `search_cellxgene_datasets` | CELLxGENE Discover / Census public metadata (cell types, tissues, diseases, assay, organism) |
 | **Brain Atlases** | `search_aba_genes`, `search_aba_structures`, `get_aba_gene_expression`, `search_aba_differential_expression` | Allen Brain Atlas (structure ontology, ISH expression, differential enrichment) |
 | **Neuroscience Knowledge Graph** | `search_ebrains_kg`, `get_ebrains_kg_document` | EBRAINS KG (datasets, models, software, contributors, projects) |
 | **Neuroscience Datasets (CONP)** | `search_conp_datasets`, `get_conp_dataset_details` | CONP datasets via `conpdatasets` GitHub catalog |
@@ -265,6 +284,7 @@ All accessed via `list_bigquery_tables` and `run_bigquery_select_query` with rea
 - **Source citations** — final reports cite human-readable database names (PubMed, ClinicalTrials.gov, etc.), never raw tool names or JSON URLs.
 - **Research history** — up to 10 prior research cycles are archived with full state; rollback restores any previous cycle.
 - **BigQuery guardrails** — read-only queries with configurable max rows (default 200, hard cap 1000) and bytes-billed limits.
+- **Source precedence policy** — overlapping tools are given explicit routing guidance so the planner/executor prefer the right source for each evidence type (for example IntAct vs STRING, DailyMed vs FAERS, PubMed vs Europe PMC).
 
 ## Example Queries
 
@@ -411,7 +431,8 @@ The deploy script builds a container image via Cloud Build, then deploys to Clou
 
 ### Live APIs
 - **[ClinicalTrials.gov](https://clinicaltrials.gov/)** — Clinical trial registry and results
-- **[PubMed / NCBI](https://pubmed.ncbi.nlm.nih.gov/)** — Biomedical literature and abstracts
+- **[PubMed / NCBI](https://pubmed.ncbi.nlm.nih.gov/)** — Biomedical literature, abstracts, and PMC-linked open-access full text
+- **[Gene Expression Omnibus (GEO)](https://www.ncbi.nlm.nih.gov/geo/)** — Functional genomics records across gene expression, microarray, and sequencing studies
 - **[OpenAlex](https://openalex.org/)** — Scholarly works, authors, and citation data
 - **[UniProt](https://www.uniprot.org/)** — Protein sequence, function, and annotation
 - **[Reactome](https://reactome.org/)** — Curated biological pathway database

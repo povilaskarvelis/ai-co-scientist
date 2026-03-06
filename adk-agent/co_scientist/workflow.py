@@ -119,14 +119,27 @@ KNOWN_MCP_TOOLS = [
     "search_pubmed",
     "search_pubmed_advanced",
     "get_pubmed_abstract",
+    "get_paper_fulltext",
+    "search_geo_datasets",
+    "get_geo_dataset",
     "search_openalex_works",
     "search_openalex_authors",
     "rank_researchers_by_activity",
     "get_researcher_contact_candidates",
+    "search_europe_pmc_literature",
+    "resolve_gene_identifiers",
+    "map_ontology_terms_oxo",
+    "search_hpo_terms",
+    "get_orphanet_disease_profile",
+    "query_monarch_associations",
+    "search_quickgo_terms",
+    "get_quickgo_annotations",
     "search_uniprot_proteins",
     "get_uniprot_protein_profile",
     "search_reactome_pathways",
     "get_string_interactions",
+    "get_intact_interactions",
+    "get_biogrid_interactions",
     "get_alphafold_structure",
     "search_protein_structures",
     "search_drug_gene_interactions",
@@ -136,6 +149,18 @@ KNOWN_MCP_TOOLS = [
     "get_variant_annotations",
     "search_gwas_associations",
     "get_gene_tissue_expression",
+    "get_human_protein_atlas_gene",
+    "get_depmap_gene_dependency",
+    "get_biogrid_orcs_gene_summary",
+    "get_gdsc_drug_sensitivity",
+    "get_prism_repurposing_response",
+    "get_pharmacodb_compound_response",
+    "search_cellxgene_datasets",
+    "search_pathway_commons_top_pathways",
+    "get_guidetopharmacology_target",
+    "get_dailymed_drug_label",
+    "get_clingen_gene_curation",
+    "get_alliance_genome_gene_profile",
     "get_cancer_mutation_profile",
     "get_pubchem_compound",
     "get_chembl_bioactivities",
@@ -164,27 +189,44 @@ KNOWN_MCP_TOOLS = [
 
 TOOL_DOMAINS: dict[str, list[str]] = {
     "literature": [
-        "search_pubmed", "search_pubmed_advanced", "get_pubmed_abstract",
+        "search_pubmed", "search_pubmed_advanced", "get_pubmed_abstract", "get_paper_fulltext",
+        "search_europe_pmc_literature",
         "search_openalex_works", "search_openalex_authors",
         "rank_researchers_by_activity", "get_researcher_contact_candidates",
     ],
     "clinical": [
         "search_clinical_trials", "get_clinical_trial",
         "summarize_clinical_trials_landscape", "search_fda_adverse_events",
+        "get_dailymed_drug_label",
     ],
     "protein": [
+        "get_human_protein_atlas_gene",
         "search_uniprot_proteins", "get_uniprot_protein_profile",
-        "search_reactome_pathways", "get_string_interactions",
+        "search_reactome_pathways", "get_string_interactions", "get_intact_interactions",
+        "get_biogrid_interactions",
+        "search_pathway_commons_top_pathways", "get_guidetopharmacology_target",
         "get_alphafold_structure", "search_protein_structures",
         "search_drug_gene_interactions",
     ],
     "genomics": [
+        "resolve_gene_identifiers", "map_ontology_terms_oxo",
+        "search_hpo_terms", "get_orphanet_disease_profile", "query_monarch_associations",
+        "search_quickgo_terms", "get_quickgo_annotations",
         "annotate_variants_vep", "search_civic_variants", "search_civic_genes",
         "get_variant_annotations", "search_gwas_associations",
-        "get_gene_tissue_expression", "get_cancer_mutation_profile",
+        "get_gene_tissue_expression", "get_depmap_gene_dependency",
+        "get_biogrid_orcs_gene_summary",
+        "get_gdsc_drug_sensitivity",
+        "get_prism_repurposing_response", "get_pharmacodb_compound_response",
+        "search_cellxgene_datasets", "get_clingen_gene_curation", "get_alliance_genome_gene_profile",
+        "get_cancer_mutation_profile",
+        "search_geo_datasets", "get_geo_dataset",
     ],
     "chemistry": [
         "get_pubchem_compound", "get_chembl_bioactivities",
+        "get_guidetopharmacology_target", "get_dailymed_drug_label",
+        "get_gdsc_drug_sensitivity", "get_prism_repurposing_response",
+        "get_pharmacodb_compound_response",
     ],
     "neuroscience": [
         "search_aba_genes", "search_aba_structures",
@@ -222,14 +264,39 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "search_pubmed": "Search PubMed literature (returns PMIDs, titles, authors)",
     "search_pubmed_advanced": "Advanced PubMed search with field-specific queries (MeSH, author, journal)",
     "get_pubmed_abstract": "Fetch full abstract for a PMID",
+    "get_paper_fulltext": "Fetch PMC full text when available using a PMID, PMCID, or DOI",
+    "search_geo_datasets": "Search GEO (Gene Expression Omnibus) for transcriptomics and functional genomics records by disease, gene, perturbation, tissue, or accession. Returns GSE/GSM/GPL/GDS accessions for follow-up",
+    "get_geo_dataset": "Get detailed GEO metadata for a specific accession or GEO UID, including organism, study type, sample count, PubMed links, and summary text",
     "search_openalex_works": "Search OpenAlex for papers, preprints, and citations (returns DOIs)",
     "search_openalex_authors": "Find researchers and their publication profiles",
     "rank_researchers_by_activity": "Rank authors by recent publication activity",
     "get_researcher_contact_candidates": "Get contact/affiliation info for researchers",
+    "search_europe_pmc_literature": "Search Europe PMC for papers, preprints, citation counts, and open-access metadata",
+    "resolve_gene_identifiers": "Resolve gene symbols, aliases, Entrez IDs, and Ensembl IDs via MyGene.info for identifier normalization",
+    "map_ontology_terms_oxo": "Map ontology CURIEs across MONDO/EFO/DOID/MeSH/OMIM/UMLS and other prefixes using EBI OxO cross-references",
+    "search_hpo_terms": "Search Human Phenotype Ontology terms via OLS for phenotype-term normalization",
+    "get_orphanet_disease_profile": "Retrieve Orphanet / ORDO rare-disease profiles with xrefs, phenotypes, and curated disease-gene links",
+    "query_monarch_associations": "Query Monarch phenotype- and rare-disease-centric associations such as phenotype-to-gene, disease-to-gene, and disease-to-phenotype",
+    "search_quickgo_terms": "Search Gene Ontology terms in QuickGO by text and aspect",
+    "get_quickgo_annotations": "Get GO annotations for a gene product via QuickGO, resolving gene symbols to UniProtKB when needed",
     "search_uniprot_proteins": "Search UniProt for protein entries",
     "get_uniprot_protein_profile": "Detailed protein profile (isoforms, PTMs, function)",
     "search_reactome_pathways": "Search biological pathway hierarchies",
     "get_string_interactions": "Get protein-protein interaction networks from STRING",
+    "get_intact_interactions": "Get curated experimental molecular interactions from IntAct with partners, interaction types, detection methods, and publication support",
+    "get_biogrid_interactions": "Get broader BioGRID experimental interaction evidence with physical/genetic classes, throughput tags, partners, and PMIDs",
+    "get_human_protein_atlas_gene": "Get Human Protein Atlas summaries for tissue specificity, single-cell specificity, protein class, and subcellular localization",
+    "get_depmap_gene_dependency": "Summarize DepMap gene dependency metrics (CRISPR/RNAi dependency fractions, pan-dependency/selectivity, predictive features)",
+    "get_biogrid_orcs_gene_summary": "Summarize BioGRID ORCS published CRISPR screen evidence for a gene, including hit status, phenotypes, cell lines, and representative screens",
+    "get_gdsc_drug_sensitivity": "Summarize GDSC / CancerRxGene compound sensitivity profiles across cell lines and tissues using IC50/AUC pharmacogenomic screens",
+    "get_prism_repurposing_response": "Summarize Broad PRISM repurposing primary-screen response using single-dose log2-fold-change viability across pooled cancer cell lines",
+    "get_pharmacodb_compound_response": "Summarize PharmacoDB cross-dataset compound-response evidence across public pharmacogenomic screens such as GDSC, PRISM, and CTRPv2",
+    "search_cellxgene_datasets": "Search public CELLxGENE Discover/Census-backed single-cell datasets by cell type, tissue, disease, assay, and organism",
+    "search_pathway_commons_top_pathways": "Search integrated top pathways in Pathway Commons across multiple pathway providers",
+    "get_guidetopharmacology_target": "Get curated target-ligand interactions and pharmacology summaries from Guide to Pharmacology",
+    "get_dailymed_drug_label": "Summarize key DailyMed SPL label sections such as boxed warnings, indications, contraindications, and warnings",
+    "get_clingen_gene_curation": "Summarize ClinGen gene-disease validity and dosage sensitivity curations for a gene",
+    "get_alliance_genome_gene_profile": "Summarize Alliance Genome Resources model-organism and translational evidence for a gene, including orthologs, disease/phenotype counts, and disease models",
     "get_chembl_bioactivities": "Get bioactivity data (IC50, Ki, Kd) for a drug from ChEMBL — selectivity profiling",
     "search_fda_adverse_events": "Search FDA FAERS for post-marketing adverse event reports by drug name",
     "search_aba_genes": "Search Allen Brain Atlas for genes by name or acronym (mouse, human, developing mouse)",
@@ -255,6 +322,223 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "check_gpqa_access": "Check access to GPQA benchmark",
 }
 
+TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
+    "search_pubmed": {
+        "overlap_group": "literature_search",
+        "preferred_for": "default biomedical literature search, PMID harvesting, and MeSH-friendly follow-up",
+        "fallback_tools": ["search_europe_pmc_literature", "search_openalex_works"],
+    },
+    "search_europe_pmc_literature": {
+        "overlap_group": "literature_search",
+        "preferred_for": "preprints, Europe PMC citation metadata, and open-access status",
+        "fallback_tools": ["search_pubmed", "search_openalex_works"],
+    },
+    "search_openalex_works": {
+        "overlap_group": "literature_search",
+        "preferred_for": "broader citation graph context, institution/researcher discovery, and non-PubMed coverage",
+        "fallback_tools": ["search_pubmed", "search_europe_pmc_literature"],
+    },
+    "search_reactome_pathways": {
+        "overlap_group": "pathway_context",
+        "preferred_for": "specific curated pathway titles and canonical Reactome pathway hierarchy",
+        "fallback_tools": ["search_pathway_commons_top_pathways"],
+    },
+    "search_pathway_commons_top_pathways": {
+        "overlap_group": "pathway_context",
+        "preferred_for": "integrated pathway context across multiple pathway providers",
+        "fallback_tools": ["search_reactome_pathways", "get_string_interactions"],
+    },
+    "get_string_interactions": {
+        "overlap_group": "molecular_interactions",
+        "preferred_for": "broad protein-network neighborhoods and integrated interaction evidence",
+        "fallback_tools": ["get_intact_interactions", "get_biogrid_interactions", "search_pathway_commons_top_pathways"],
+    },
+    "get_intact_interactions": {
+        "overlap_group": "molecular_interactions",
+        "preferred_for": "curated experimental interaction records with detection methods and PMIDs",
+        "fallback_tools": ["get_biogrid_interactions", "get_string_interactions", "search_pathway_commons_top_pathways"],
+    },
+    "get_biogrid_interactions": {
+        "overlap_group": "molecular_interactions",
+        "preferred_for": "broader experimental physical/genetic interaction coverage, throughput tags, and BioGRID partner evidence",
+        "fallback_tools": ["get_intact_interactions", "get_string_interactions", "search_pathway_commons_top_pathways"],
+    },
+    "get_guidetopharmacology_target": {
+        "overlap_group": "compound_pharmacology",
+        "preferred_for": "curated target-ligand summaries, mechanism/action-type evidence, and representative ligands",
+        "fallback_tools": ["get_chembl_bioactivities", "search_drug_gene_interactions", "get_pubchem_compound"],
+    },
+    "get_chembl_bioactivities": {
+        "overlap_group": "compound_pharmacology",
+        "preferred_for": "quantitative potency, selectivity, and assay-level bioactivity data",
+        "fallback_tools": ["get_guidetopharmacology_target", "get_pubchem_compound", "search_drug_gene_interactions"],
+    },
+    "search_drug_gene_interactions": {
+        "overlap_group": "compound_pharmacology",
+        "preferred_for": "broad druggability categories and known drug-gene interaction coverage",
+        "fallback_tools": ["get_guidetopharmacology_target", "get_chembl_bioactivities"],
+    },
+    "get_pubchem_compound": {
+        "overlap_group": "compound_pharmacology",
+        "preferred_for": "compound identity, synonyms, and chemistry/property summaries",
+        "fallback_tools": ["get_chembl_bioactivities", "get_guidetopharmacology_target"],
+    },
+    "get_dailymed_drug_label": {
+        "overlap_group": "drug_safety_regulatory",
+        "preferred_for": "current US label language such as boxed warnings, indications, contraindications, and precautions",
+        "fallback_tools": ["search_fda_adverse_events"],
+    },
+    "search_fda_adverse_events": {
+        "overlap_group": "drug_safety_regulatory",
+        "preferred_for": "post-marketing adverse-event signals rather than label text",
+        "fallback_tools": ["get_dailymed_drug_label"],
+    },
+    "get_variant_annotations": {
+        "overlap_group": "variant_evidence",
+        "preferred_for": "aggregate variant annotations across ClinVar, dbSNP, gnomAD, CADD, and COSMIC",
+        "fallback_tools": ["annotate_variants_vep", "search_civic_variants", "get_clingen_gene_curation"],
+    },
+    "annotate_variants_vep": {
+        "overlap_group": "variant_evidence",
+        "preferred_for": "functional consequence and pathogenicity prediction scores such as SIFT, PolyPhen, and AlphaMissense",
+        "fallback_tools": ["get_variant_annotations", "search_civic_variants"],
+    },
+    "search_civic_variants": {
+        "overlap_group": "variant_evidence",
+        "preferred_for": "oncology-specific clinical variant interpretations",
+        "fallback_tools": ["search_civic_genes", "get_variant_annotations", "get_clingen_gene_curation"],
+    },
+    "search_civic_genes": {
+        "overlap_group": "variant_evidence",
+        "preferred_for": "oncology gene-level CIViC context when the exact variant is not yet known",
+        "fallback_tools": ["search_civic_variants", "get_variant_annotations"],
+    },
+    "get_clingen_gene_curation": {
+        "overlap_group": "variant_evidence",
+        "preferred_for": "expert-curated gene-disease validity and dosage sensitivity at the gene level",
+        "fallback_tools": ["get_variant_annotations", "search_civic_genes"],
+    },
+    "get_gene_tissue_expression": {
+        "overlap_group": "expression_context",
+        "preferred_for": "bulk tissue RNA expression across human tissues",
+        "fallback_tools": ["get_human_protein_atlas_gene", "search_cellxgene_datasets"],
+    },
+    "get_human_protein_atlas_gene": {
+        "overlap_group": "expression_context",
+        "preferred_for": "protein-level tissue specificity, subcellular localization, and atlas-style single-cell summaries",
+        "fallback_tools": ["get_gene_tissue_expression", "search_cellxgene_datasets"],
+    },
+    "search_cellxgene_datasets": {
+        "overlap_group": "expression_context",
+        "preferred_for": "discovering relevant single-cell datasets by tissue, disease, assay, or cell type",
+        "fallback_tools": ["get_human_protein_atlas_gene", "get_gene_tissue_expression"],
+    },
+    "get_depmap_gene_dependency": {
+        "overlap_group": "target_vulnerability",
+        "preferred_for": "gene dependency and target vulnerability across cancer cell lines",
+        "fallback_tools": ["get_biogrid_orcs_gene_summary", "get_gdsc_drug_sensitivity"],
+    },
+    "get_biogrid_orcs_gene_summary": {
+        "overlap_group": "target_vulnerability",
+        "preferred_for": "published CRISPR screen evidence with phenotype, cell-line, and screen-level context",
+        "fallback_tools": ["get_depmap_gene_dependency", "get_gdsc_drug_sensitivity"],
+    },
+    "get_gdsc_drug_sensitivity": {
+        "overlap_group": "target_vulnerability",
+        "preferred_for": "GDSC / CancerRxGene compound sensitivity and pharmacogenomic response across cancer cell lines",
+        "fallback_tools": ["get_prism_repurposing_response", "get_pharmacodb_compound_response", "get_guidetopharmacology_target"],
+    },
+    "get_prism_repurposing_response": {
+        "overlap_group": "target_vulnerability",
+        "preferred_for": "Broad PRISM repurposing primary-screen single-dose log2-fold-change viability across pooled cell lines",
+        "fallback_tools": ["get_gdsc_drug_sensitivity", "get_pharmacodb_compound_response", "get_guidetopharmacology_target"],
+    },
+    "get_pharmacodb_compound_response": {
+        "overlap_group": "target_vulnerability",
+        "preferred_for": "cross-dataset compound-response context across PharmacoDB datasets such as PRISM, GDSC, CTRPv2, and related public screens",
+        "fallback_tools": ["get_gdsc_drug_sensitivity", "get_prism_repurposing_response", "get_guidetopharmacology_target"],
+    },
+    "search_hpo_terms": {
+        "overlap_group": "phenotype_rare_disease",
+        "preferred_for": "phenotype-term normalization and choosing the right HPO concept before disease or graph queries",
+        "fallback_tools": ["get_orphanet_disease_profile", "query_monarch_associations"],
+    },
+    "get_orphanet_disease_profile": {
+        "overlap_group": "phenotype_rare_disease",
+        "preferred_for": "rare-disease profiles, disease xrefs, curated phenotype sets, and curated disease-gene links",
+        "fallback_tools": ["search_hpo_terms", "query_monarch_associations"],
+    },
+    "query_monarch_associations": {
+        "overlap_group": "phenotype_rare_disease",
+        "preferred_for": "phenotype-driven gene/disease association reasoning and graph-style rare-disease exploration",
+        "fallback_tools": ["search_hpo_terms", "get_orphanet_disease_profile"],
+    },
+    "get_alliance_genome_gene_profile": {
+        "overlap_group": "translational_model_evidence",
+        "preferred_for": "model-organism evidence, ortholog context, and Alliance-wide translational summaries for a gene",
+        "fallback_tools": ["get_clingen_gene_curation", "query_monarch_associations", "get_orphanet_disease_profile"],
+    },
+}
+
+SOURCE_PRECEDENCE_RULES: list[dict[str, Any]] = [
+    {
+        "topic": "Literature search",
+        "tools": ["search_pubmed", "search_europe_pmc_literature", "search_openalex_works"],
+        "summary": "Use `search_pubmed` by default for biomedical papers and PMIDs; use `search_europe_pmc_literature` when preprints, citation metadata, or open-access status matter; use `search_openalex_works` for broader citation graph or researcher context.",
+    },
+    {
+        "topic": "Pathway context",
+        "tools": ["search_reactome_pathways", "search_pathway_commons_top_pathways"],
+        "summary": "Use `search_reactome_pathways` for specific curated pathway titles; use `search_pathway_commons_top_pathways` when you want integrated pathway context across multiple providers.",
+    },
+    {
+        "topic": "Interaction evidence",
+        "tools": ["get_intact_interactions", "get_biogrid_interactions", "get_string_interactions", "search_pathway_commons_top_pathways"],
+        "summary": "Use `get_intact_interactions` for deeply curated molecular interaction records with detection methods and PMIDs; use `get_biogrid_interactions` for broader experimental physical/genetic interaction coverage and throughput context; use `get_string_interactions` for broader network neighborhoods; use `search_pathway_commons_top_pathways` when the goal is pathway-level context rather than pairwise interactions.",
+    },
+    {
+        "topic": "Compound pharmacology",
+        "tools": ["get_guidetopharmacology_target", "get_chembl_bioactivities", "search_drug_gene_interactions", "get_pubchem_compound"],
+        "summary": "Use `get_guidetopharmacology_target` for curated target-ligand summaries; use `get_chembl_bioactivities` for quantitative potency/selectivity; use `search_drug_gene_interactions` for broad druggability coverage; use `get_pubchem_compound` for compound identity and properties.",
+    },
+    {
+        "topic": "Drug label vs safety signals",
+        "tools": ["get_dailymed_drug_label", "search_fda_adverse_events"],
+        "summary": "Use `get_dailymed_drug_label` for current US label language; use `search_fda_adverse_events` for post-marketing adverse-event signals rather than regulatory label text.",
+    },
+    {
+        "topic": "Variant evidence",
+        "tools": ["get_variant_annotations", "annotate_variants_vep", "search_civic_variants", "search_civic_genes", "get_clingen_gene_curation"],
+        "summary": "Use `get_variant_annotations` for aggregate annotation, `annotate_variants_vep` for prediction scores, `search_civic_variants`/`search_civic_genes` for oncology interpretation, and `get_clingen_gene_curation` for gene-level expert curation.",
+    },
+    {
+        "topic": "Expression context",
+        "tools": ["get_gene_tissue_expression", "get_human_protein_atlas_gene", "search_cellxgene_datasets"],
+        "summary": "Use `get_gene_tissue_expression` for bulk tissue RNA, `get_human_protein_atlas_gene` for protein localization and atlas summaries, and `search_cellxgene_datasets` when the task is finding relevant single-cell datasets rather than returning expression values directly.",
+    },
+    {
+        "topic": "Functional screening vs drug response",
+        "tools": [
+            "get_depmap_gene_dependency",
+            "get_biogrid_orcs_gene_summary",
+            "get_gdsc_drug_sensitivity",
+            "get_prism_repurposing_response",
+            "get_pharmacodb_compound_response",
+        ],
+        "summary": "Use `get_depmap_gene_dependency` for release-level gene essentiality and vulnerability metrics; use `get_biogrid_orcs_gene_summary` for published CRISPR screens with phenotype and cell-line context; use `get_gdsc_drug_sensitivity` for GDSC / CancerRxGene response; use `get_prism_repurposing_response` for Broad PRISM single-dose repurposing response; use `get_pharmacodb_compound_response` for harmonized cross-dataset drug-response context across public screens.",
+    },
+    {
+        "topic": "Phenotype and rare-disease reasoning",
+        "tools": ["search_hpo_terms", "get_orphanet_disease_profile", "query_monarch_associations"],
+        "summary": "Use `search_hpo_terms` for phenotype-term normalization, `get_orphanet_disease_profile` for rare-disease profiles and curated phenotype/gene summaries, and `query_monarch_associations` for phenotype-driven or graph-style disease/gene association reasoning.",
+    },
+    {
+        "topic": "Translational model-organism evidence",
+        "tools": ["get_alliance_genome_gene_profile", "get_clingen_gene_curation", "get_orphanet_disease_profile", "query_monarch_associations"],
+        "summary": "Use `get_alliance_genome_gene_profile` for orthologs, disease models, and model-organism translational context; use `get_clingen_gene_curation` for expert human gene-disease validity; use `get_orphanet_disease_profile` and `query_monarch_associations` for rare-disease and phenotype-centric reasoning.",
+    },
+]
+
 TOOL_SOURCE_NAMES: dict[str, str] = {
     # Generic BQ tool names (fallback when no dataset hint is available)
     "list_bigquery_tables": "BigQuery",
@@ -273,6 +557,14 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     # Variant annotation APIs
     "annotate_variants_vep": "Ensembl VEP",
     "get_variant_annotations": "MyVariant.info",
+    "resolve_gene_identifiers": "MyGene.info",
+    "map_ontology_terms_oxo": "EBI OxO",
+    "search_hpo_terms": "Human Phenotype Ontology",
+    "get_orphanet_disease_profile": "Orphanet / ORDO",
+    "query_monarch_associations": "Monarch Initiative",
+    "get_alliance_genome_gene_profile": "Alliance Genome Resources",
+    "search_quickgo_terms": "QuickGO",
+    "get_quickgo_annotations": "QuickGO",
     # CIViC (clinical variant interpretations)
     "search_civic_variants": "CIViC",
     "search_civic_genes": "CIViC",
@@ -284,6 +576,20 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     "search_drug_gene_interactions": "DGIdb",
     # GTEx (tissue expression)
     "get_gene_tissue_expression": "GTEx",
+    # Human Protein Atlas (protein/tissue/single-cell summaries)
+    "get_human_protein_atlas_gene": "Human Protein Atlas",
+    # DepMap (gene dependency and vulnerability)
+    "get_depmap_gene_dependency": "DepMap",
+    # BioGRID ORCS (published CRISPR screens)
+    "get_biogrid_orcs_gene_summary": "BioGRID ORCS",
+    # GDSC / CancerRxGene (drug sensitivity pharmacogenomics)
+    "get_gdsc_drug_sensitivity": "GDSC / CancerRxGene",
+    # PRISM Repurposing (Broad single-dose viability)
+    "get_prism_repurposing_response": "PRISM Repurposing",
+    # PharmacoDB (cross-dataset pharmacogenomics)
+    "get_pharmacodb_compound_response": "PharmacoDB",
+    # CELLxGENE Discover / Census metadata search
+    "search_cellxgene_datasets": "CELLxGENE Discover / Census",
     # RCSB PDB (experimental protein structures)
     "search_protein_structures": "RCSB PDB",
     # cBioPortal (cancer mutation profiles)
@@ -326,6 +632,10 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     "search_pubmed": "PubMed",
     "search_pubmed_advanced": "PubMed",
     "get_pubmed_abstract": "PubMed",
+    "get_paper_fulltext": "PubMed Central",
+    # GEO (NCBI Gene Expression Omnibus)
+    "search_geo_datasets": "Gene Expression Omnibus",
+    "get_geo_dataset": "Gene Expression Omnibus",
     # Remaining MCP tools (live APIs with no BQ equivalent)
     "benchmark_dataset_overview": "Benchmark Datasets",
     "check_gpqa_access": "GPQA",
@@ -336,8 +646,15 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     "search_openalex_authors": "OpenAlex",
     "rank_researchers_by_activity": "OpenAlex",
     "get_researcher_contact_candidates": "OpenAlex",
+    "search_europe_pmc_literature": "Europe PMC",
     "search_reactome_pathways": "Reactome",
+    "search_pathway_commons_top_pathways": "Pathway Commons",
+    "get_guidetopharmacology_target": "Guide to Pharmacology",
+    "get_dailymed_drug_label": "DailyMed",
+    "get_clingen_gene_curation": "ClinGen",
     "get_string_interactions": "STRING",
+    "get_intact_interactions": "IntAct",
+    "get_biogrid_interactions": "BioGRID",
     "search_uniprot_proteins": "UniProt",
     "get_uniprot_protein_profile": "UniProt",
 }
@@ -351,6 +668,9 @@ __TOOL_CATALOG__
 
 Tool domains (used to focus the executor on the most relevant tools for each step):
 __DOMAIN_CATALOG__
+
+Source precedence rules for overlapping tools:
+__ROUTING_POLICY__
 
 Rules:
 - Build a concrete execution plan before any evidence collection begins.
@@ -368,7 +688,7 @@ Rules:
 Citation requirement:
 - A final report without citations is incomplete. Every plan MUST include at least one step
   whose tool_hint is a source that returns individual citable identifiers:
-  search_pubmed, search_pubmed_advanced, get_pubmed_abstract, search_openalex_works,
+  search_pubmed, search_pubmed_advanced, get_pubmed_abstract, get_paper_fulltext, search_openalex_works,
   search_clinical_trials.
 - If ALL steps use only aggregate or structured-data tools (run_bigquery_select_query,
   list_bigquery_tables, summarize_clinical_trials_landscape, search_reactome_pathways,
@@ -412,6 +732,9 @@ Follow a strict Reason-Act-Observe cycle:
 
 Available MCP tools:
 __TOOL_CATALOG__
+
+Source precedence rules for overlapping tools:
+__ROUTING_POLICY__
 
 Rules:
 - Focus ONLY on the current step provided in the execution context.
@@ -2086,9 +2409,14 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
     )
 
     step_domains = active_step.get("domains") or []
-    focused_tools = _resolve_step_tools(step_domains)
+    tool_hint = str(active_step.get("tool_hint", "")).strip()
+    focused_tools = _prioritize_tools_for_step(
+        _resolve_step_tools(step_domains),
+        tool_hint,
+    )
 
     focused_catalog = _format_tool_catalog(focused_tools)
+    routing_guidance = _format_step_routing_guidance(tool_hint, focused_tools)
 
     payload = {
         "schema": "react_step_context.v1",
@@ -2116,6 +2444,8 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
             "Prefer tools from this focused list. You may use other available tools "
             "if the focused set is insufficient, but start here."
         )
+    if routing_guidance:
+        instructions.append(routing_guidance)
 
     instructions.append(
         f"Execute ONLY step {active_step.get('id')}. "
@@ -2539,6 +2869,7 @@ def _on_tool_error(
 
     fallback_hints = {
         "search_openalex_works": "Try search_pubmed or search_pubmed_advanced instead.",
+        "get_paper_fulltext": "Try get_pubmed_abstract for abstract-only access, or search_openalex_works for alternate open-access links.",
         "search_pubmed": "Try search_openalex_works or search_pubmed_advanced instead.",
         "search_pubmed_advanced": "Try search_pubmed or search_openalex_works instead.",
         "search_clinical_trials": "Try summarize_clinical_trials_landscape or run_bigquery_select_query instead.",
@@ -2957,13 +3288,19 @@ BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_ta
   Start every structured data lookup with BigQuery. Use `list_bigquery_tables` to discover tables, \
 and `list_bigquery_tables(dataset="...", table="...")` to inspect column schemas before writing queries.
   Write Standard SQL via `run_bigquery_select_query`. Use non-BigQuery MCP tools for:
-    - Literature search: search_pubmed, search_pubmed_advanced, get_pubmed_abstract (PubMed/NCBI)
+    - Literature search: search_pubmed, search_pubmed_advanced, get_pubmed_abstract, get_paper_fulltext (PubMed/NCBI/PMC)
     - Literature search: search_openalex_works (OpenAlex — broader coverage, preprints)
+    - Literature enrichment with preprints and citation metadata: search_europe_pmc_literature (Europe PMC)
     - Clinical trials: search_clinical_trials, get_clinical_trial, summarize_clinical_trials_landscape
     - Researcher discovery: search_openalex_authors, rank_researchers_by_activity
+    - Gene identifier normalization: resolve_gene_identifiers (MyGene.info)
+    - Ontology cross-mapping: map_ontology_terms_oxo (EBI OxO — MONDO/EFO/DOID/MeSH/OMIM/UMLS)
+    - Gene Ontology lookup and annotations: search_quickgo_terms, get_quickgo_annotations (QuickGO)
     - Protein profiles: search_uniprot_proteins, get_uniprot_protein_profile
     - Pathways: search_reactome_pathways
     - Protein interactions: get_string_interactions
+    - Curated experimental molecular interactions: get_intact_interactions (IntAct)
+    - Broader experimental physical/genetic interaction evidence: get_biogrid_interactions (BioGRID)
     - Variant effect predictions (SIFT, PolyPhen, AlphaMissense): annotate_variants_vep (Ensembl VEP)
     - Aggregated variant annotations (ClinVar, CADD, dbSNP, gnomAD, COSMIC): get_variant_annotations (MyVariant.info)
     - Clinical variant interpretations in oncology: search_civic_variants, search_civic_genes (CIViC)
@@ -2971,6 +3308,18 @@ and `list_bigquery_tables(dataset="...", table="...")` to inspect column schemas
     - GWAS trait-variant associations: search_gwas_associations (GWAS Catalog — p-values, odds ratios, mapped genes)
     - Drug-gene interactions & druggability: search_drug_gene_interactions (DGIdb — approved/experimental drugs)
     - Tissue-level gene expression: get_gene_tissue_expression (GTEx v8 — median TPM across 54 tissues)
+    - Protein-level tissue, single-cell, and localization summaries: get_human_protein_atlas_gene (Human Protein Atlas)
+    - Cancer-cell dependency and target vulnerability: get_depmap_gene_dependency (DepMap)
+    - Published CRISPR screen evidence with phenotype/cell-line context: get_biogrid_orcs_gene_summary (BioGRID ORCS)
+    - Compound sensitivity and pharmacogenomics: get_gdsc_drug_sensitivity (GDSC / CancerRxGene)
+    - Broad repurposing single-dose response: get_prism_repurposing_response (PRISM Repurposing)
+    - Cross-dataset public pharmacogenomics: get_pharmacodb_compound_response (PharmacoDB)
+    - Single-cell dataset discovery by cell type/tissue/disease: search_cellxgene_datasets (CELLxGENE Discover / Census metadata)
+    - Integrated top pathways across multiple pathway providers: search_pathway_commons_top_pathways (Pathway Commons)
+    - Curated target-ligand pharmacology: get_guidetopharmacology_target (Guide to Pharmacology)
+    - Current US drug label sections and boxed warnings: get_dailymed_drug_label (DailyMed)
+    - Curated gene-disease validity and dosage sensitivity: get_clingen_gene_curation (ClinGen)
+    - Model-organism orthologs and translational gene context: get_alliance_genome_gene_profile (Alliance Genome Resources)
     - Experimental protein structures: search_protein_structures (RCSB PDB — resolution, method, ligands)
     - Cancer mutation profiles: get_cancer_mutation_profile (cBioPortal — TCGA pan-cancer mutation frequencies)
     - Drug bioactivity & selectivity: get_chembl_bioactivities (ChEMBL API — IC50/Ki/Kd by target, kinase selectivity profiling. Prefer over BigQuery ebi_chembl for bioactivity lookups)
@@ -2996,14 +3345,30 @@ Before writing queries:
   Column names are often singular (e.g. "target" not "targets") \
   and use IDs rather than human-readable names (e.g. targetId is an Ensembl ID like "ENSG00000012048", \
   diseaseId is an EFO ID like "EFO_0001075"). Look up IDs from reference tables first.
-Fall back to non-BQ tools for: literature search (search_pubmed, search_openalex_works), \
+Fall back to non-BQ tools for: literature search (search_pubmed, get_paper_fulltext, search_openalex_works), \
+Europe PMC literature/preprints/citations (search_europe_pmc_literature), \
 ClinicalTrials.gov, UniProt, Reactome pathways, STRING interactions, \
+IntAct experimental interactions (get_intact_interactions), \
+BioGRID experimental interactions (get_biogrid_interactions), \
+gene identifier normalization (resolve_gene_identifiers via MyGene.info), \
+ontology cross-mapping (map_ontology_terms_oxo via EBI OxO), \
+GO ontology lookup and annotations (search_quickgo_terms, get_quickgo_annotations via QuickGO), \
 variant effect predictions (annotate_variants_vep for SIFT/PolyPhen/AlphaMissense), \
 aggregated variant annotations (get_variant_annotations for ClinVar/CADD/dbSNP/gnomAD/COSMIC), \
 clinical variant interpretations (search_civic_variants, search_civic_genes for CIViC), \
 protein structure predictions (get_alphafold_structure for pLDDT), \
 GWAS associations (search_gwas_associations), drug-gene interactions (search_drug_gene_interactions), \
-tissue expression (get_gene_tissue_expression), experimental structures (search_protein_structures), \
+tissue expression (get_gene_tissue_expression), protein atlas summaries (get_human_protein_atlas_gene), \
+target dependency / vulnerability (get_depmap_gene_dependency), \
+published CRISPR screen summaries (get_biogrid_orcs_gene_summary), \
+drug sensitivity / pharmacogenomics (get_gdsc_drug_sensitivity), \
+PRISM repurposing response (get_prism_repurposing_response), \
+PharmacoDB cross-dataset pharmacogenomics (get_pharmacodb_compound_response), \
+single-cell dataset discovery (search_cellxgene_datasets), ClinGen curations (get_clingen_gene_curation), \
+Alliance Genome Resources translational summaries (get_alliance_genome_gene_profile), \
+Pathway Commons pathway search (search_pathway_commons_top_pathways), \
+Guide to Pharmacology curated target-ligand summaries (get_guidetopharmacology_target), \
+DailyMed label summaries (get_dailymed_drug_label), experimental structures (search_protein_structures), \
 cancer mutations (get_cancer_mutation_profile), \
 drug bioactivity and selectivity (get_chembl_bioactivities — prefer over BigQuery ebi_chembl), \
 chemical compound data (get_pubchem_compound), \
@@ -3017,6 +3382,70 @@ def _format_tool_catalog(tool_hints: list[str]) -> str:
         desc = TOOL_DESCRIPTIONS.get(name)
         lines.append(f"- {name} — {desc}" if desc else f"- {name}")
     return "\n".join(lines) or "- No tools available."
+
+
+def _format_source_precedence_rules(tool_hints: list[str]) -> str:
+    active_tools = set(tool_hints)
+    lines = []
+    for rule in SOURCE_PRECEDENCE_RULES:
+        rule_tools = [tool for tool in rule.get("tools", []) if tool in active_tools]
+        if len(rule_tools) < 2:
+            continue
+        lines.append(f"- {rule['topic']}: {rule['summary']}")
+    return "\n".join(lines) or "- No special overlap rules configured for the current tool set."
+
+
+def _prioritize_tools_for_step(tool_names: list[str], tool_hint: str) -> list[str]:
+    ordered = _dedupe_str_list(tool_names, limit=120)
+    hint = str(tool_hint or "").strip()
+    if not hint or hint not in ordered:
+        return ordered
+
+    prioritized = [hint]
+    fallback_tools = TOOL_ROUTING_METADATA.get(hint, {}).get("fallback_tools", [])
+    prioritized.extend(str(name).strip() for name in fallback_tools if str(name).strip())
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for name in prioritized + ordered:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        result.append(name)
+    return result
+
+
+def _format_step_routing_guidance(tool_hint: str, available_tools: list[str]) -> str:
+    hint = str(tool_hint or "").strip()
+    meta = TOOL_ROUTING_METADATA.get(hint)
+    if not meta:
+        return ""
+
+    preferred_for = str(meta.get("preferred_for", "")).strip()
+    fallback_tools = [
+        tool for tool in meta.get("fallback_tools", [])
+        if tool in set(available_tools)
+    ]
+    source_label = _resolve_source_label(hint)
+    fallback_labels = [
+        f"`{tool}` ({_resolve_source_label(tool)})"
+        for tool in fallback_tools
+    ]
+
+    parts = [
+        f"Routing guidance for this step's tool_hint `{hint}` ({source_label}):",
+        f"- Start with `{hint}` for {preferred_for}."
+        if preferred_for else f"- Start with `{hint}` before trying overlapping tools.",
+    ]
+    if fallback_labels:
+        parts.append(
+            "- Only fall back if the requested evidence type is unavailable or insufficient. "
+            f"Preferred fallbacks: {', '.join(fallback_labels)}."
+        )
+    parts.append(
+        "- Do not substitute a nearby overlapping source unless it better matches the step's requested evidence type."
+    )
+    return "\n".join(parts)
 
 
 def _resolve_step_tools(domains: list[str] | None, *, available_tools: set[str] | None = None) -> list[str]:
@@ -3047,6 +3476,7 @@ def _resolve_step_tools(domains: list[str] | None, *, available_tools: set[str] 
 
 def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
     tool_catalog = _format_tool_catalog(tool_hints)
+    routing_policy = _format_source_precedence_rules(tool_hints)
     if prefer_bigquery:
         bq_policy = BQ_EXECUTOR_POLICY
     else:
@@ -3055,6 +3485,7 @@ def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: 
     return (
         STEP_EXECUTOR_INSTRUCTION_TEMPLATE
         .replace("__TOOL_CATALOG__", tool_catalog)
+        .replace("__ROUTING_POLICY__", routing_policy)
         .replace("__BQ_POLICY__", bq_policy)
     )
 
@@ -3072,6 +3503,7 @@ def _format_domain_catalog() -> str:
 def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
     tool_catalog = _format_tool_catalog(tool_hints)
     domain_catalog = _format_domain_catalog()
+    routing_policy = _format_source_precedence_rules(tool_hints)
     if prefer_bigquery:
         bq_policy = (
             "- BigQuery-first policy:\n"
@@ -3079,13 +3511,31 @@ def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) 
             "\n- tool_hint for BigQuery steps: use the specific dataset name (e.g. open_targets_platform,"
             " gnomad, ebi_chembl)"
             " rather than run_bigquery_select_query, so the plan clearly shows which source is being accessed.\n"
+            "- For gene symbol / alias / Ensembl / Entrez normalization, use resolve_gene_identifiers (MyGene.info).\n"
+            "- For ontology crosswalks across MONDO/EFO/DOID/MeSH/OMIM/UMLS, use map_ontology_terms_oxo (EBI OxO).\n"
+            "- For GO term search and GO annotations, use search_quickgo_terms and get_quickgo_annotations (QuickGO).\n"
+            "- For literature search that needs preprints or Europe PMC citation metadata, use search_europe_pmc_literature (Europe PMC).\n"
             "- For variant pathogenicity predictions, use annotate_variants_vep (Ensembl VEP — SIFT, PolyPhen, AlphaMissense).\n"
             "- For aggregated variant annotations (ClinVar, CADD, dbSNP, gnomAD, COSMIC), use get_variant_annotations (MyVariant.info).\n"
             "- For clinical variant interpretations in oncology, use search_civic_variants or search_civic_genes (CIViC).\n"
             "- For protein structure predictions and confidence scores, use get_alphafold_structure (AlphaFold API).\n"
             "- For GWAS trait-variant associations and genetic evidence, use search_gwas_associations (GWAS Catalog).\n"
             "- For druggability assessment and known drug-gene interactions, use search_drug_gene_interactions (DGIdb).\n"
+            "- For curated experimental interaction evidence, use get_intact_interactions (IntAct).\n"
+            "- For broader experimental physical/genetic interaction coverage and throughput context, use get_biogrid_interactions (BioGRID).\n"
+            "- For curated target-ligand pharmacology and mechanism summaries, use get_guidetopharmacology_target (Guide to Pharmacology).\n"
+            "- For current US label warnings, contraindications, and indications, use get_dailymed_drug_label (DailyMed).\n"
             "- For tissue-level gene expression and target safety, use get_gene_tissue_expression (GTEx).\n"
+            "- For protein-level tissue specificity, single-cell specificity, and subcellular localization, use get_human_protein_atlas_gene (Human Protein Atlas).\n"
+            "- For target dependency and cancer-cell vulnerability, use get_depmap_gene_dependency (DepMap).\n"
+            "- For published CRISPR screen evidence with phenotype and cell-line context, use get_biogrid_orcs_gene_summary (BioGRID ORCS).\n"
+            "- For compound sensitivity and cancer pharmacogenomics, use get_gdsc_drug_sensitivity (GDSC / CancerRxGene).\n"
+            "- For Broad single-dose repurposing response across pooled cell lines, use get_prism_repurposing_response (PRISM Repurposing).\n"
+            "- For harmonized cross-dataset pharmacogenomics across public screens, use get_pharmacodb_compound_response (PharmacoDB).\n"
+            "- For single-cell dataset discovery by disease, tissue, cell type, assay, and organism, use search_cellxgene_datasets (CELLxGENE Discover / Census metadata).\n"
+            "- For integrated pathway context across multiple pathway databases, use search_pathway_commons_top_pathways (Pathway Commons).\n"
+            "- For curated gene-disease validity and dosage sensitivity, use get_clingen_gene_curation (ClinGen).\n"
+            "- For model-organism orthologs, disease models, and translational gene summaries, use get_alliance_genome_gene_profile (Alliance Genome Resources).\n"
             "- For experimental protein structures (X-ray, cryo-EM), use search_protein_structures (RCSB PDB).\n"
             "- For cancer mutation frequencies across tumor types, use get_cancer_mutation_profile (cBioPortal).\n"
             "- For drug bioactivity, IC50/Ki/Kd values, and kinase selectivity profiling, use get_chembl_bioactivities (ChEMBL API — prefer over BigQuery ebi_chembl).\n"
@@ -3099,6 +3549,7 @@ def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) 
         PLANNER_INSTRUCTION_TEMPLATE
         .replace("__TOOL_CATALOG__", tool_catalog)
         .replace("__DOMAIN_CATALOG__", domain_catalog)
+        .replace("__ROUTING_POLICY__", routing_policy)
         .replace("__BQ_POLICY__", bq_policy)
     )
 
