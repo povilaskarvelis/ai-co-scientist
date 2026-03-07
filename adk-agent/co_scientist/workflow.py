@@ -357,6 +357,7 @@ Then provide a subsection for EACH step with a status indicator in the heading (
 - Key findings (with specific identifiers (PMID, DOI, NCT numbers) inline).
 - Significance: why these findings matter for the research question.
 - Limitations: any uncertainties or limitations specific to that step.
+Data source, Key findings, Significance, and Limitations should be seperate bullet points.
 Mark failed/blocked steps clearly with what went wrong.
 
 ## Limitations
@@ -1883,6 +1884,29 @@ def _first_sentence(text: str, *, max_chars: int = 280) -> str:
     return sentence
 
 
+def _sanitize_step_highlight_text(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    while lines and re.match(
+        r"^(?:#{1,6}\s*)?(?:S\d+\s*[·-]\s*(?:completed|blocked|failed|pending)\s+Goal:|Step\s+\d+:)",
+        lines[0],
+        flags=re.IGNORECASE,
+    ):
+        lines.pop(0)
+    cleaned = " ".join(lines).strip()
+    if not cleaned:
+        cleaned = raw
+    cleaned = re.sub(
+        r"^(?:#{1,6}\s*)?(?:S\d+\s*[·-]\s*(?:completed|blocked|failed|pending)\s+)?Goal:\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    return cleaned
+
+
 def _step_highlight_priority(step: dict[str, Any], summary: str) -> float:
     goal = _normalize_user_text(str(step.get("goal", "")).strip())
     summary_text = _normalize_user_text(summary)
@@ -1939,9 +1963,9 @@ def _build_step_result_highlights(task_state: dict[str, Any], *, limit: int = 4)
     for idx, step in enumerate(task_state.get("steps", [])):
         if str(step.get("status", "")).strip() != "completed":
             continue
-        summary = _first_sentence(str(step.get("result_summary", "")).strip())
+        summary = _first_sentence(_sanitize_step_highlight_text(str(step.get("result_summary", "")).strip()))
         if not summary:
-            summary = _first_sentence(str(step.get("step_progress_note", "")).strip())
+            summary = _first_sentence(_sanitize_step_highlight_text(str(step.get("step_progress_note", "")).strip()))
         if not summary:
             continue
         normalized = _normalize_user_text(summary)
@@ -3455,6 +3479,43 @@ def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> s
     return linked + refs_tail
 
 
+def _expand_reference_only_body_lines(text: str, lit_ids: list[str]) -> str:
+    if not text or not lit_ids:
+        return text
+
+    refs_split = re.split(r"(?m)^## References\b", text, maxsplit=1)
+    body = refs_split[0]
+    refs_tail = ("\n## References" + refs_split[1]) if len(refs_split) > 1 else ""
+    citation_cache: dict[int, str] = {}
+    citation_only_re = re.compile(r"^(\s*(?:[-*]\s+)?)\[(\d+)\](?:\(#ref-\2\))?\s*$")
+
+    def _citation_text(ref_number: int) -> str:
+        cached = citation_cache.get(ref_number)
+        if cached is not None:
+            return cached
+        if ref_number < 1 or ref_number > len(lit_ids):
+            return ""
+        formatted = _format_reference_apa(ref_number, lit_ids[ref_number - 1])
+        formatted = re.sub(rf'^<a id="ref-{ref_number}"></a>\s*', "", formatted).strip()
+        formatted = re.sub(rf"^{ref_number}\.\s*", "", formatted).strip()
+        citation_cache[ref_number] = formatted
+        return formatted
+
+    expanded_lines: list[str] = []
+    for raw_line in body.splitlines():
+        match = citation_only_re.match(raw_line)
+        if not match:
+            expanded_lines.append(raw_line)
+            continue
+        citation_text = _citation_text(int(match.group(2)))
+        if not citation_text:
+            expanded_lines.append(raw_line)
+            continue
+        expanded_lines.append(f"{match.group(1) or '- '}{citation_text}")
+
+    return "\n".join(expanded_lines) + refs_tail
+
+
 # ---------------------------------------------------------------------------
 # Evidence & Methodology helpers (used by _render_final_synthesis_markdown)
 # ---------------------------------------------------------------------------
@@ -3612,6 +3673,22 @@ STEP_SECTION_HEADING_RE = re.compile(
     r"^(?:###\s*)?(Step\s+\d+:\s+.+?)(?:\s*[—-]\s*(COMPLETED|FAILED|PENDING|BLOCKED))?\s*$",
     flags=re.IGNORECASE,
 )
+STEP_FIELD_LABEL_PATTERN = r"(?:Data Source|Data source|Key Findings|Key findings|Significance|Limitations|Limiatations)"
+
+
+def _clean_step_field_text(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = cleaned.replace("**", "")
+    cleaned = re.sub(r"^\*+\s*", "", cleaned)
+    cleaned = re.sub(r"^\-\s*", "", cleaned)
+    cleaned = re.sub(r"\s+\*\s+", " ", cleaned)
+    cleaned = re.sub(r"\s*\*+$", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not re.search(r"[A-Za-z0-9]", cleaned):
+        return ""
+    return cleaned
 
 
 def _normalize_evidence_step_block(lines: list[str]) -> str:
@@ -3641,7 +3718,33 @@ def _normalize_evidence_step_block(lines: list[str]) -> str:
     preamble: list[str] = []
     active_field = ""
 
-    for raw_line in lines[1:]:
+    body_text = "\n".join(str(line or "").rstrip() for line in lines[1:])
+    body_text = re.sub(
+        rf"\*+\s*({STEP_FIELD_LABEL_PATTERN})\s*:\s*\*+",
+        r"\1:",
+        body_text,
+        flags=re.IGNORECASE,
+    )
+    body_text = re.sub(
+        rf"\*+\s*({STEP_FIELD_LABEL_PATTERN})\s*:",
+        r"\1:",
+        body_text,
+        flags=re.IGNORECASE,
+    )
+    body_text = re.sub(
+        rf"({STEP_FIELD_LABEL_PATTERN})\s*:\s*\*+",
+        r"\1:",
+        body_text,
+        flags=re.IGNORECASE,
+    )
+    body_text = re.sub(
+        rf"(?<!\n)(?=(?:{STEP_FIELD_LABEL_PATTERN}):)",
+        "\n",
+        body_text,
+        flags=re.IGNORECASE,
+    )
+
+    for raw_line in body_text.splitlines():
         stripped = str(raw_line or "").strip()
         if not stripped:
             continue
@@ -3650,14 +3753,18 @@ def _normalize_evidence_step_block(lines: list[str]) -> str:
             label_key = field_map.get(field_match.group(1).strip().lower())
             if label_key:
                 active_field = label_key
-                value = field_match.group(2).strip()
+                value = _clean_step_field_text(field_match.group(2))
                 if value:
                     fields[label_key].append(value)
                 continue
         if active_field:
-            fields[active_field].append(re.sub(r"^[-*]\s+", "", stripped))
+            cleaned_value = _clean_step_field_text(stripped)
+            if cleaned_value:
+                fields[active_field].append(cleaned_value)
         else:
-            preamble.append(stripped)
+            cleaned_value = _clean_step_field_text(stripped)
+            if cleaned_value:
+                preamble.append(cleaned_value)
 
     if preamble:
         rendered.append(" ".join(preamble))
@@ -4129,6 +4236,7 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
 
     body_so_far = "\n".join(lines)
     body_so_far = _hyperlink_inline_ids(body_so_far, ref_map)
+    body_so_far = _expand_reference_only_body_lines(body_so_far, lit_ids)
     lines = body_so_far.split("\n")
 
     # Next Steps (after References so _strip_next_steps_section in ui_server preserves References)

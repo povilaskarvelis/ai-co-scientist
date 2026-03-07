@@ -1220,3 +1220,178 @@ Limitations: Manufacturer-specific labels may differ in wording.
     assert "- Tovorafenib has accelerated approval for relapsed or refractory pediatric low-grade glioma with BRAF alteration." in final_markdown
     assert "**Significance:** This clarifies which uses are on-label versus investigational." in final_markdown
     assert "**Limitations:** Manufacturer-specific labels may differ in wording." in final_markdown
+
+
+def test_postprocess_normalizes_inline_step_fields_from_single_paragraph():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Evaluate LRRK2 target conviction",
+        "success_criteria": ["Summarize target evidence"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Resolve gene identifiers",
+                "tool_hint": "resolve_gene_identifiers",
+                "domains": ["genomics"],
+                "completion_condition": "Return canonical IDs",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Evaluate LRRK2 target conviction",
+    )
+    raw_markdown = """# AI Co-Scientist Report
+
+## Summary
+
+This is a vague model summary.
+
+## Evidence and Methodology
+
+Overview paragraph.
+
+Step 1: Resolve LRRK2 gene identifiers — COMPLETED
+Data source: MyGene.info Key findings: The human LRRK2 gene was resolved to Entrez ID 120892 and Ensembl ID ENSG00000188906. Significance: This ensured consistent identifier grounding across sources. * Limitations: None.
+"""
+
+    final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
+
+    assert "### Step 1: Resolve LRRK2 gene identifiers — COMPLETED" in final_markdown
+    assert "**Data Source:** MyGene.info" in final_markdown
+    assert "**Key Findings:**" in final_markdown
+    assert "- The human LRRK2 gene was resolved to Entrez ID 120892 and Ensembl ID ENSG00000188906." in final_markdown
+    assert "**Significance:** This ensured consistent identifier grounding across sources." in final_markdown
+    assert "**Limitations:** None." in final_markdown
+
+
+def test_postprocess_ignores_orphan_asterisks_and_bold_field_wrappers_in_step_blocks():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Evaluate LRRK2 target conviction",
+        "success_criteria": ["Summarize target evidence"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Resolve gene identifiers",
+                "tool_hint": "resolve_gene_identifiers",
+                "domains": ["genomics"],
+                "completion_condition": "Return canonical IDs",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Evaluate LRRK2 target conviction",
+    )
+    raw_markdown = """# AI Co-Scientist Report
+
+## Summary
+
+This is a vague model summary.
+
+## Evidence and Methodology
+
+Overview paragraph.
+
+Step 1: Resolve LRRK2 gene identifiers — COMPLETED
+**Data Source:** MyGene.info
+**Key Findings:** The human LRRK2 gene was resolved.
+*
+**Significance:** This ensured consistent identifier grounding. *
+**Limitations:** None.
+"""
+
+    final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
+
+    assert "**Data Source:** MyGene.info" in final_markdown
+    assert "- The human LRRK2 gene was resolved." in final_markdown
+    assert "**Significance:** This ensured consistent identifier grounding." in final_markdown
+    assert "**Limitations:** None." in final_markdown
+    assert "\n- *\n" not in final_markdown
+    assert "* *" not in final_markdown
+    assert "**Data Source:** **" not in final_markdown
+
+
+def test_postprocess_expands_reference_only_key_finding_bullets(monkeypatch):
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Assess KRAS G12C literature support",
+        "success_criteria": ["Summarize key literature"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Compile literature support",
+                "tool_hint": "search_pubmed",
+                "domains": ["literature"],
+                "completion_condition": "Return supporting papers",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Assess KRAS G12C literature support",
+    )
+
+    def _fake_reference(ref_number, eid):
+        return f'<a id="ref-{ref_number}"></a>{ref_number}. Citation for {eid}'
+
+    monkeypatch.setattr(workflow, "_format_reference_apa", _fake_reference)
+
+    raw_markdown = """# AI Co-Scientist Report
+
+## Summary
+
+This is a vague model summary.
+
+## Evidence and Methodology
+
+Overview paragraph.
+
+Step 7: Compile supporting literature — COMPLETED
+Data Source: PubMed, OpenAlex
+Key Findings:
+PMID:12345678
+DOI:10.1000/test-doi
+Significance: These papers support the reported efficacy and resistance findings.
+"""
+
+    final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
+
+    assert "- Citation for PMID:12345678" in final_markdown
+    assert "- Citation for DOI:10.1000/test-doi" in final_markdown
+    assert "\n- [1]\n" not in final_markdown
+    assert "\n- [2]\n" not in final_markdown
+
+
+def test_step_result_highlights_strip_step_metadata_prefixes():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Evaluate LRRK2 target conviction",
+        "success_criteria": ["Summarize key evidence"],
+        "steps": [
+            {
+                "id": "S6",
+                "goal": "Search ClinicalTrials.gov for LRRK2 therapies",
+                "tool_hint": "search_clinical_trials",
+                "domains": ["clinical"],
+                "completion_condition": "Return trial evidence",
+            },
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Evaluate LRRK2 target conviction",
+    )
+    task_state["steps"][0]["status"] = "completed"
+    task_state["steps"][0]["result_summary"] = (
+        "### S6 · completed Goal: Search ClinicalTrials.gov for LRRK2-targeting therapies.\n"
+        "A clinical study of the LRRK2 inhibitor BIIB122 demonstrated general tolerability with no serious adverse events."
+    )
+    task_state["steps"][0]["tools_called"] = ["search_clinical_trials"]
+
+    highlights = workflow._build_step_result_highlights(task_state)
+
+    assert highlights
+    assert highlights[0]["summary"].startswith("A clinical study of the LRRK2 inhibitor BIIB122")
+    assert "S6 · completed Goal" not in highlights[0]["summary"]

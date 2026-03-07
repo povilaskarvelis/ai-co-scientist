@@ -16,6 +16,9 @@ const state = {
   reportStatusTaskId: null,
   reportStatusText: "",
   reportStatusError: false,
+  renderedReportTaskId: "",
+  renderedReportTitle: "",
+  renderedReportMarkdown: "",
   debugOpen: false,
   debugByTaskId: {},
   activityExpandedByTask: {},
@@ -731,19 +734,21 @@ function patchActivityCardElement(card, snapshot) {
   if (!card || !snapshot) return;
   const expanded = isActivityExpanded(snapshot.taskId);
   const planApproved = snapshot.planApproved !== false;
-  card.className = activityCardClassNames(snapshot.status, expanded, planApproved);
-  card.dataset.taskId = snapshot.taskId;
-  card.setAttribute("aria-expanded", expanded ? "true" : "false");
+  const classNames = activityCardClassNames(snapshot.status, expanded, planApproved);
+  if (card.className !== classNames) card.className = classNames;
+  if (card.dataset.taskId !== snapshot.taskId) card.dataset.taskId = snapshot.taskId;
+  const ariaExpanded = expanded ? "true" : "false";
+  if (card.getAttribute("aria-expanded") !== ariaExpanded) card.setAttribute("aria-expanded", ariaExpanded);
 
   const titleEl = card.querySelector(".activity-title");
-  if (titleEl) titleEl.textContent = snapshot.title;
+  if (titleEl && titleEl.textContent !== snapshot.title) titleEl.textContent = snapshot.title;
   const summaryEl = card.querySelector(".activity-summary");
-  if (summaryEl) summaryEl.textContent = snapshot.summary;
+  if (summaryEl && summaryEl.textContent !== snapshot.summary) summaryEl.textContent = snapshot.summary;
   const previewEl = card.querySelector(".activity-preview");
-  if (previewEl) previewEl.textContent = snapshot.preview;
+  if (previewEl && previewEl.textContent !== snapshot.preview) previewEl.textContent = snapshot.preview;
   const detailsEl = card.querySelector(".activity-details");
   if (detailsEl) {
-    detailsEl.innerHTML = snapshot.detailsHtml;
+    if (detailsEl.innerHTML !== snapshot.detailsHtml) detailsEl.innerHTML = snapshot.detailsHtml;
     detailsEl.classList.toggle("hidden", !expanded);
   }
 }
@@ -1035,6 +1040,70 @@ function currentDebugTaskId() {
   return String(iteration?.task?.task_id || "").trim();
 }
 
+function clearRenderedReportPanel() {
+  state.renderedReportTaskId = "";
+  state.renderedReportTitle = "";
+  state.renderedReportMarkdown = "";
+  el.reportTitle.textContent = "Research Report";
+  el.reportContent.innerHTML = "";
+}
+
+function setRenderedReportTitle(taskId, title) {
+  const normalizedTaskId = String(taskId || "").trim();
+  const normalizedTitle = String(title || "");
+  if (
+    state.renderedReportTaskId === normalizedTaskId
+    && state.renderedReportTitle === normalizedTitle
+  ) {
+    return;
+  }
+  el.reportTitle.textContent = normalizedTitle || "Research Report";
+  state.renderedReportTaskId = normalizedTaskId;
+  state.renderedReportTitle = normalizedTitle;
+}
+
+function setRenderedReportMarkdown(taskId, markdown, { preserveScroll = true } = {}) {
+  const normalizedTaskId = String(taskId || "").trim();
+  const normalizedMarkdown = String(markdown || "");
+  const sameTask = preserveScroll && state.renderedReportTaskId === normalizedTaskId;
+  if (sameTask && state.renderedReportMarkdown === normalizedMarkdown) return;
+  const scrollTop = sameTask ? el.reportContent.scrollTop : 0;
+  const scrollLeft = sameTask ? el.reportContent.scrollLeft : 0;
+  el.reportContent.innerHTML = markdownToHtml(normalizedMarkdown);
+  state.renderedReportTaskId = normalizedTaskId;
+  state.renderedReportMarkdown = normalizedMarkdown;
+  if (sameTask) {
+    el.reportContent.scrollTop = scrollTop;
+    el.reportContent.scrollLeft = scrollLeft;
+  }
+}
+
+function setDebugSummaryHtml(taskId, html) {
+  const normalizedTaskId = String(taskId || "").trim();
+  if (
+    String(el.debugSummary.dataset.taskId || "") === normalizedTaskId
+    && el.debugSummary.innerHTML === html
+  ) {
+    return;
+  }
+  el.debugSummary.innerHTML = html;
+  el.debugSummary.dataset.taskId = normalizedTaskId;
+}
+
+function setDebugJsonText(taskId, text) {
+  const normalizedTaskId = String(taskId || "").trim();
+  const sameTask = String(el.debugJson.dataset.taskId || "") === normalizedTaskId;
+  if (sameTask && el.debugJson.textContent === text) return;
+  const scrollTop = sameTask ? el.debugJson.scrollTop : 0;
+  const scrollLeft = sameTask ? el.debugJson.scrollLeft : 0;
+  el.debugJson.textContent = text;
+  el.debugJson.dataset.taskId = normalizedTaskId;
+  if (sameTask) {
+    el.debugJson.scrollTop = scrollTop;
+    el.debugJson.scrollLeft = scrollLeft;
+  }
+}
+
 function countCollectionItems(value) {
   if (Array.isArray(value)) return value.length;
   if (value && typeof value === "object") return Object.keys(value).length;
@@ -1116,18 +1185,23 @@ async function refreshCurrentDebugState({ force = false } = {}) {
   if (existing?.loading) return;
   if (!force && existing && existing.data) return;
 
-  state.debugByTaskId[taskId] = { loading: true, error: "", data: null };
-  renderReportPanel();
+  const hasExistingData = Boolean(existing?.data);
+  state.debugByTaskId[taskId] = hasExistingData
+    ? { loading: true, error: "", data: existing.data }
+    : { loading: true, error: "", data: null };
+  if (!hasExistingData) renderReportPanel();
 
   try {
     const payload = await api(`/api/tasks/${encodeURIComponent(taskId)}/debug/workflow-state`);
     state.debugByTaskId[taskId] = { loading: false, error: "", data: payload };
   } catch (err) {
-    state.debugByTaskId[taskId] = {
-      loading: false,
-      error: String(err?.message || "Failed to load debug state."),
-      data: null,
-    };
+    state.debugByTaskId[taskId] = hasExistingData
+      ? { loading: false, error: "", data: existing.data }
+      : {
+          loading: false,
+          error: String(err?.message || "Failed to load debug state."),
+          data: null,
+        };
   }
 
   renderReportPanel();
@@ -1145,23 +1219,23 @@ function renderReportPanel() {
   el.reportPanel.classList.toggle("hidden", !showPanel);
 
   if (!showPanel) {
-    el.reportTitle.textContent = "Research Report";
-    el.reportContent.innerHTML = "";
+    clearRenderedReportPanel();
     el.exportPdfBtn.classList.add("hidden");
     el.debugToggleBtn.classList.add("hidden");
     el.reportStatus.classList.add("hidden");
     el.reportStatus.classList.remove("error");
     el.debugPanel.classList.add("hidden");
-    el.debugSummary.innerHTML = "";
-    el.debugJson.textContent = "";
+    setDebugSummaryHtml("", "");
+    setDebugJsonText("", "");
     return;
   }
 
   const task = iteration.task || {};
   const taskId = String(task.task_id || "");
   const reportMarkdown = String(iteration?.report?.report_markdown || "").trim();
-  el.reportTitle.textContent = String(task.title || task.user_query || "Research Report");
-  el.reportContent.innerHTML = markdownToHtml(reportMarkdown);
+  const reportTaskChanged = state.renderedReportTaskId !== taskId;
+  setRenderedReportTitle(taskId, String(task.title || task.user_query || "Research Report"));
+  setRenderedReportMarkdown(taskId, reportMarkdown, { preserveScroll: !reportTaskChanged });
   el.exportPdfBtn.classList.toggle("hidden", !taskId);
   el.exportPdfBtn.disabled = state.exportingPdf;
   el.debugToggleBtn.classList.toggle("hidden", !showDebugToggle);
@@ -1174,26 +1248,26 @@ function renderReportPanel() {
 
   el.debugPanel.classList.toggle("hidden", !showDebugPanel);
   if (!showDebugPanel) {
-    el.debugSummary.innerHTML = "";
-    el.debugJson.textContent = "";
+    setDebugSummaryHtml("", "");
+    setDebugJsonText("", "");
     return;
   }
 
-  if (!debugEntry || debugEntry.loading) {
-    el.debugSummary.innerHTML = '<div class="debug-empty">Loading workflow debug state...</div>';
-    el.debugJson.textContent = "";
+  if (!debugEntry || (debugEntry.loading && !debugEntry.data)) {
+    setDebugSummaryHtml(debugTaskId, '<div class="debug-empty">Loading workflow debug state...</div>');
+    setDebugJsonText(debugTaskId, "");
     return;
   }
 
-  if (debugEntry.error) {
-    el.debugSummary.innerHTML = `<div class="debug-empty debug-error">${escapeHtml(debugEntry.error)}</div>`;
-    el.debugJson.textContent = "";
+  if (debugEntry.error && !debugEntry.data) {
+    setDebugSummaryHtml(debugTaskId, `<div class="debug-empty debug-error">${escapeHtml(debugEntry.error)}</div>`);
+    setDebugJsonText(debugTaskId, "");
     return;
   }
 
   const debugPayload = debugEntry.data || {};
-  el.debugSummary.innerHTML = debugSummaryHtml(debugPayload);
-  el.debugJson.textContent = JSON.stringify(debugPayload.state || {}, null, 2);
+  setDebugSummaryHtml(debugTaskId, debugSummaryHtml(debugPayload));
+  setDebugJsonText(debugTaskId, JSON.stringify(debugPayload.state || {}, null, 2));
 }
 
 function renderAll() {
@@ -1371,11 +1445,6 @@ function ensurePollTimerRunning() {
       updateInlineActivityCard(run);
       updateLoadingSpinnerLabel();
       await handleTerminalRunState(run);
-    }
-    if (state.debugOpen) {
-      refreshCurrentDebugState({ force: true }).catch((err) => {
-        setNotice(`Failed to load debug state: ${err.message}`, true);
-      });
     }
     if (state.activeRunIds.size === 0 && state.pollTimer) {
       clearInterval(state.pollTimer);
