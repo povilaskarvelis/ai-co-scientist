@@ -35,7 +35,11 @@ from state_store import SupportsWorkflowStateStore, create_state_store
 from report_pdf import write_markdown_pdf
 from co_scientist.tool_registry import TOOL_SOURCE_NAMES
 from co_scientist.workflow import (
+    MAX_REACT_PARSE_RETRIES,
+    STATE_EXECUTOR_ACTIVE_STEP_ID,
+    STATE_EXECUTOR_LAST_ERROR,
     STATE_PRIOR_RESEARCH,
+    STATE_REACT_PARSE_RETRIES,
     STATE_WORKFLOW_TASK,
     STATE_PLAN_PENDING_APPROVAL,
     create_workflow_agent,
@@ -161,33 +165,42 @@ def _is_transient_workflow_response(text: str) -> bool:
 def _parse_step_event_text(text: str) -> dict:
     """Extract structured info from step_executor rendered markdown."""
     info: dict = {}
+    normalized = str(text or "").strip()
+    if not normalized:
+        return info
+
+    # If the payload contains multiple rendered steps, use the latest one.
+    step_matches = list(re.finditer(r"^###?\s+S\d+\s*[·\-]\s*`?\w+`?", normalized, flags=re.MULTILINE))
+    if step_matches:
+        normalized = normalized[step_matches[-1].start():].strip()
+
     # Step ID and status: "### S1 · `completed`"
-    m = re.search(r"###?\s+(S\d+)\s*[·\-]\s*`?(\w+)`?", text)
+    m = re.search(r"###?\s+(S\d+)\s*[·\-]\s*`?(\w+)`?", normalized)
     if m:
         info["step_id"] = m.group(1)
         info["status"] = m.group(2)
     # Goal: "**Goal:** ..."
-    m = re.search(r"\*\*Goal:\*\*\s*(.+?)(?:\n|$)", text)
+    m = re.search(r"\*\*Goal:\*\*\s*(.+?)(?:\n|$)", normalized)
     if m:
         info["goal"] = m.group(1).strip()
     # Key Findings
-    m = re.search(r"\*\*Key Findings\*\*\s*\n+([\s\S]*?)(?=\n\*\*|\n_Progress|\n---|\Z)", text)
+    m = re.search(r"\*\*Key Findings\*\*\s*\n+([\s\S]*?)(?=\n\*\*|\n_Progress|\n---|\Z)", normalized)
     if m:
         info["findings"] = re.sub(r"\s+", " ", m.group(1)).strip()[:300]
     # Tools used: "**Tools used:** `tool1`, `tool2`"
-    m = re.search(r"\*\*Tools used:\*\*\s*(.+?)(?:\n|$)", text)
+    m = re.search(r"\*\*Tools used:\*\*\s*(.+?)(?:\n|$)", normalized)
     if m:
         info["tools"] = re.findall(r"`([^`]+)`", m.group(1))
     # Evidence IDs
-    evidence = re.findall(r"`((?:PMID|DOI|NCT|PMC|UniProt|PubChem|PDB|ChEMBL|Reactome)[:\s][^`]+|(?:GCST|CHEMBL|rs)\S[^`]*)`", text)
+    evidence = re.findall(r"`((?:PMID|DOI|NCT|PMC|UniProt|PubChem|PDB|ChEMBL|Reactome)[:\s][^`]+|(?:GCST|CHEMBL|rs)\S[^`]*)`", normalized)
     if evidence:
         info["evidence"] = evidence[:10]
     # Progress: "_Progress: 2/5 steps complete..."
-    m = re.search(r"_Progress:\s*(.+?)_", text)
+    m = re.search(r"_Progress:\s*(.+?)_", normalized)
     if m:
         info["progress"] = m.group(1).strip()
     # ReAct trace block
-    m = re.search(r"\*\*ReAct Trace\*\*\s*\n+([\s\S]*?)(?=\n\*\*|\n_Progress|\n---|\Z)", text)
+    m = re.search(r"\*\*ReAct Trace\*\*\s*\n+([\s\S]*?)(?=\n\*\*|\n_Progress|\n---|\Z)", normalized)
     if m:
         block = m.group(1)
         cleaned_lines: list[str] = []
@@ -206,6 +219,63 @@ def _parse_step_event_text(text: str) -> dict:
         if phase_map:
             info["react_phases"] = phase_map
     return info
+
+
+def _build_step_completed_event_metrics(text: str) -> dict | None:
+    """Return structured metrics only for actual rendered step-completion blocks."""
+    step_info = _parse_step_event_text(text)
+    step_id = str(step_info.get("step_id", "") or "").strip()
+    if not step_id:
+        return None
+    return {
+        "step_id": step_id,
+        "step_status": str(step_info.get("status", "completed") or "completed").strip(),
+        "goal": str(step_info.get("goal", "") or "").strip(),
+        "findings": str(step_info.get("findings", "") or "").strip(),
+        "tools": list(step_info.get("tools", []) or []),
+        "evidence": list(step_info.get("evidence", []) or []),
+        "progress": str(step_info.get("progress", "") or "").strip(),
+        "react_trace": str(step_info.get("react_trace", "") or "").strip(),
+        "react_phases": step_info.get("react_phases", {}) if isinstance(step_info.get("react_phases", {}), dict) else {},
+        "rendered_step_markdown": text,
+    }
+
+
+def _extract_tool_error_metrics(function_response) -> dict | None:
+    """Extract a user-visible tool error payload from a function response."""
+    if not function_response:
+        return None
+    tool_name = str(getattr(function_response, "name", "") or "").strip()
+    response = getattr(function_response, "response", None) or {}
+    if not isinstance(response, dict) or not bool(response.get("error")):
+        return None
+    message = str(response.get("message", "") or "").strip()
+    suggestion = str(response.get("suggestion", "") or "").strip()
+    error_type = str(response.get("error_type", "") or "").strip()
+    if not tool_name and not message:
+        return None
+    return {
+        "tool": tool_name,
+        "error_type": error_type,
+        "message": message,
+        "suggestion": suggestion,
+    }
+
+
+def _extract_executor_retry_metrics(session_state: dict | None) -> dict | None:
+    """Extract active executor retry info from full session state."""
+    if not isinstance(session_state, dict):
+        return None
+    retries = int(session_state.get(STATE_REACT_PARSE_RETRIES, 0) or 0)
+    step_id = str(session_state.get(STATE_EXECUTOR_ACTIVE_STEP_ID, "") or "").strip()
+    error = str(session_state.get(STATE_EXECUTOR_LAST_ERROR, "") or "").strip()
+    if retries <= 0 or not step_id or not error:
+        return None
+    return {
+        "step_id": step_id,
+        "retry_count": retries,
+        "error": error,
+    }
 
 
 def _generate_chat_title(query: str) -> str:
@@ -681,6 +751,9 @@ class UiRuntime:
         step_counter = 0
         planner_seen = False
         step_started_ids: set[str] = set()
+        step_completed_ids: set[str] = set()
+        retry_signatures: set[tuple[str, int, str]] = set()
+        tool_error_signatures: set[tuple[str, str, str]] = set()
 
         def _step_source_label(tn: str) -> str:
             return _resolve_source_label(tn or "")
@@ -763,6 +836,35 @@ class UiRuntime:
                             human_line=human_step,
                             metrics={"step_id": sid},
                         )
+            for part in parts:
+                fr = getattr(part, "function_response", None)
+                error_metrics = _extract_tool_error_metrics(fr)
+                if not error_metrics:
+                    continue
+                signature = (
+                    str(error_metrics.get("tool", "") or "").strip(),
+                    str(error_metrics.get("error_type", "") or "").strip(),
+                    str(error_metrics.get("message", "") or "").strip(),
+                )
+                if signature in tool_error_signatures:
+                    continue
+                tool_error_signatures.add(signature)
+                tool_name = str(error_metrics.get("tool", "") or "").strip()
+                source = _step_source_label(tool_name) if tool_name else ""
+                error_message = str(error_metrics.get("message", "") or "").strip()
+                if source:
+                    human = f"{source} error: {error_message or 'tool call failed.'}"
+                elif tool_name:
+                    human = f"{tool_name} error: {error_message or 'tool call failed.'}"
+                else:
+                    human = error_message or "Tool call failed."
+                _fire_progress(
+                    phase="execute",
+                    event_type="tool.failed",
+                    status="error",
+                    human_line=human,
+                    metrics=error_metrics,
+                )
 
             text = "".join(
                 part.text
@@ -780,9 +882,9 @@ class UiRuntime:
 
             if author == "step_executor":
                 accumulated = f"{partial_by_author.get('step_executor', '')}{text}"
-                m = re.search(r"###\s*(S\d+)", accumulated)
-                if m:
-                    sid = m.group(1)
+                matches = re.findall(r"###\s*(S\d+)", accumulated)
+                if matches:
+                    sid = matches[-1]
                     if sid not in step_started_ids:
                         step_started_ids.add(sid)
                         wf_state = await self._read_workflow_state(conversation_id)
@@ -803,37 +905,29 @@ class UiRuntime:
                         )
 
             if author == "step_executor" and not bool(getattr(event, "partial", False)):
+                metrics = _build_step_completed_event_metrics(text)
+                if not metrics:
+                    logger.debug(
+                        "[ui:%s] ignoring non-step step_executor text chunk: %s",
+                        run_id,
+                        _compact_text(text, max_chars=120),
+                    )
+                    continue
+                step_id = str(metrics["step_id"]).strip()
+                if step_id in step_completed_ids:
+                    logger.debug("[ui:%s] suppressing duplicate completion event for %s", run_id, step_id)
+                    continue
+                step_completed_ids.add(step_id)
                 step_counter += 1
-                step_info = _parse_step_event_text(text)
-                step_id = step_info.get("step_id", f"S{step_counter}")
-                step_status = step_info.get("status", "completed")
-                goal = step_info.get("goal", "")
-                findings = step_info.get("findings", "")
-                tools = step_info.get("tools", [])
-                evidence = step_info.get("evidence", [])
-                progress = step_info.get("progress", "")
-                react_trace = step_info.get("react_trace", "")
-                react_phases = step_info.get("react_phases", {})
 
+                goal = str(metrics.get("goal", "") or "").strip()
                 headline = f"{step_id} · {goal}" if goal else f"{step_id} complete"
                 _fire_progress(
                     phase="execute",
                     event_type="step.completed",
                     status="done",
                     human_line=_compact_text(headline, max_chars=220),
-                    metrics={
-                        "step_id": step_id,
-                        "step_status": step_status,
-                        "goal": goal,
-                        "findings": findings,
-                        "tools": tools,
-                        "evidence": evidence,
-                        "progress": progress,
-                        "react_trace": react_trace,
-                        "react_phases": react_phases,
-                        "rendered_step_markdown": text,
-                        "step_number": step_counter,
-                    },
+                    metrics={**metrics, "step_number": step_counter},
                 )
 
             elif author == "planner" and not bool(getattr(event, "partial", False)):
@@ -854,6 +948,26 @@ class UiRuntime:
 
             if bool(getattr(event, "partial", False)):
                 partial_by_author[author] = f"{partial_by_author.get(author, '')}{text}"
+                session_state = await self._read_session_state(conversation_id)
+                retry_metrics = _extract_executor_retry_metrics(session_state)
+                if retry_metrics:
+                    signature = (
+                        str(retry_metrics.get("step_id", "") or "").strip(),
+                        int(retry_metrics.get("retry_count", 0) or 0),
+                        str(retry_metrics.get("error", "") or "").strip(),
+                    )
+                    if signature not in retry_signatures:
+                        retry_signatures.add(signature)
+                        _fire_progress(
+                            phase="execute",
+                            event_type="step.retry",
+                            status="progress",
+                            human_line=(
+                                f"Retrying {signature[0]} after {signature[2]} "
+                                f"(attempt {signature[1]}/{MAX_REACT_PARSE_RETRIES})."
+                            ),
+                            metrics=retry_metrics,
+                        )
                 continue
 
             is_final = getattr(event, "is_final_response", None)
@@ -861,6 +975,26 @@ class UiRuntime:
                 final_by_author[author] = (
                     f"{partial_by_author.pop(author, '')}{text}".strip() or text
                 )
+                session_state = await self._read_session_state(conversation_id)
+                retry_metrics = _extract_executor_retry_metrics(session_state)
+                if retry_metrics:
+                    signature = (
+                        str(retry_metrics.get("step_id", "") or "").strip(),
+                        int(retry_metrics.get("retry_count", 0) or 0),
+                        str(retry_metrics.get("error", "") or "").strip(),
+                    )
+                    if signature not in retry_signatures:
+                        retry_signatures.add(signature)
+                        _fire_progress(
+                            phase="execute",
+                            event_type="step.retry",
+                            status="progress",
+                            human_line=(
+                                f"Retrying {signature[0]} after {signature[2]} "
+                                f"(attempt {signature[1]}/{MAX_REACT_PARSE_RETRIES})."
+                            ),
+                            metrics=retry_metrics,
+                        )
                 continue
             partial_by_author[author] = f"{partial_by_author.get(author, '')}{text}"
 

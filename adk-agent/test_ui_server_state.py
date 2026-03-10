@@ -9,8 +9,11 @@ for _env_name in ("AI_CO_SCIENTIST_POSTGRES_DSN", "POSTGRES_DSN", "DATABASE_URL"
 
 import ui_server
 from co_scientist.workflow import (
+    STATE_EXECUTOR_ACTIVE_STEP_ID,
+    STATE_EXECUTOR_LAST_ERROR,
     STATE_PLAN_PENDING_APPROVAL,
     STATE_PRIOR_RESEARCH,
+    STATE_REACT_PARSE_RETRIES,
     STATE_WORKFLOW_TASK,
 )
 from state_store import JsonTaskStore
@@ -54,6 +57,81 @@ def test_extract_persistable_session_state_filters_transient_keys():
         STATE_WORKFLOW_TASK: {"objective": "Test"},
         STATE_PRIOR_RESEARCH: [{"objective": "Earlier"}],
         STATE_PLAN_PENDING_APPROVAL: True,
+    }
+
+
+def test_parse_step_event_text_uses_latest_step_block():
+    text = """
+### S1 · `completed`
+
+**Goal:** Find disease IDs
+
+**Key Findings**
+
+Retrieved identifiers.
+
+---
+
+### S2 · `completed`
+
+**Goal:** Query target evidence
+
+**Key Findings**
+
++Found strong evidence.
+
+_Progress: 2/4 steps complete. Next: S3_
+""".strip()
+
+    parsed = ui_server._parse_step_event_text(text)
+
+    assert parsed["step_id"] == "S2"
+    assert parsed["status"] == "completed"
+    assert parsed["goal"] == "Query target evidence"
+    assert "strong evidence" in parsed["findings"]
+
+
+def test_build_step_completed_event_metrics_ignores_non_step_text():
+    metrics = ui_server._build_step_completed_event_metrics(
+        "_Completed 1 of 4 steps. Next: **S2**. Send `finalize` for a partial summary._"
+    )
+
+    assert metrics is None
+
+
+def test_extract_executor_retry_metrics_from_session_state():
+    metrics = ui_server._extract_executor_retry_metrics(
+        {
+            STATE_EXECUTOR_ACTIVE_STEP_ID: "S1",
+            STATE_REACT_PARSE_RETRIES: 1,
+            STATE_EXECUTOR_LAST_ERROR: "JSON parse error: Unexpected token",
+        }
+    )
+
+    assert metrics == {
+        "step_id": "S1",
+        "retry_count": 1,
+        "error": "JSON parse error: Unexpected token",
+    }
+
+
+def test_extract_tool_error_metrics_from_function_response():
+    class DummyFunctionResponse:
+        name = "run_bigquery_select_query"
+        response = {
+            "error": True,
+            "error_type": "ValueError",
+            "message": "Tool 'run_bigquery_select_query' failed: bad SQL",
+            "suggestion": "Try a simpler query.",
+        }
+
+    metrics = ui_server._extract_tool_error_metrics(DummyFunctionResponse())
+
+    assert metrics == {
+        "tool": "run_bigquery_select_query",
+        "error_type": "ValueError",
+        "message": "Tool 'run_bigquery_select_query' failed: bad SQL",
+        "suggestion": "Try a simpler query.",
     }
 
 

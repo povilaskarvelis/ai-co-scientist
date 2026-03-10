@@ -529,8 +529,12 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
 
   const stepEvents = safeEvents.filter((e) => e?.type === "step.completed" && e?.metrics?.step_id);
   const toolCalledEvents = safeEvents.filter((e) => e?.type === "tool.called");
+  const toolFailedEvents = safeEvents.filter((e) => e?.type === "tool.failed");
+  const stepRetryEvents = safeEvents.filter((e) => e?.type === "step.retry");
   const stepStartedEvents = safeEvents.filter((e) => e?.type === "step.started" && e?.metrics?.step_id);
   const latestToolCalled = toolCalledEvents.length ? toolCalledEvents[toolCalledEvents.length - 1] : null;
+  const latestToolFailed = toolFailedEvents.length ? toolFailedEvents[toolFailedEvents.length - 1] : null;
+  const latestStepRetry = stepRetryEvents.length ? stepRetryEvents[stepRetryEvents.length - 1] : null;
   const latestStepStarted = stepStartedEvents.length ? stepStartedEvents[stepStartedEvents.length - 1] : null;
   const stepsCompleted = Number(latestSummary?.steps_completed || stepEvents.length || 0);
   const stepsTotal = Number(latestSummary?.steps_total || 0);
@@ -563,6 +567,10 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
   let summary = "";
   if (normalizedStatus === "completed" && (stepsTotal > 0 || latestSummary?.summary)) {
     summary = String(latestSummary?.summary || "").trim() || `${stepsCompleted}/${stepsTotal} plan steps executed`;
+  } else if (latestToolFailed) {
+    summary = String(latestToolFailed?.human_line || "").trim() || "A tool call failed.";
+  } else if (latestStepRetry) {
+    summary = String(latestStepRetry?.human_line || "").trim() || "Retrying the current step.";
   } else if (latestToolCalled) {
     summary = String(latestToolCalled?.human_line || "").trim() || "Querying sources\u2026";
   } else if (latestStepStarted) {
@@ -759,7 +767,7 @@ function getRunForTask(taskId) {
 }
 
 const RESEARCH_EVENT_TYPES = new Set([
-  "plan.generated", "plan.retry", "plan.failed", "task.created", "step.completed", "step.started", "tool.called",
+  "plan.generated", "plan.retry", "plan.failed", "task.created", "step.completed", "step.started", "step.retry", "tool.called", "tool.failed",
   "synthesis.completed", "checkpoint.opened", "execution.paused", "execution.running", "run.completed",
 ]);
 

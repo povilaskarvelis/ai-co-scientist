@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 MCP_SERVER_DIR = Path(__file__).resolve().parents[2] / "research-mcp"
 DEFAULT_MODEL = os.getenv("ADK_NATIVE_MODEL", "gemini-2.5-flash")
+PLANNER_MODEL = os.getenv("ADK_PLANNER_MODEL", "gemini-3.1-flash-lite-preview")
 SYNTHESIZER_MODEL = os.getenv("ADK_SYNTHESIZER_MODEL", "gemini-2.5-flash")
 ROUTER_MODEL = os.getenv("ADK_ROUTER_MODEL", "gemini-3.1-flash-lite-preview")
 THINKING_CONFIG = types.ThinkingConfig(thinking_level="HIGH")
@@ -77,6 +78,7 @@ STATE_EXECUTOR_RENDERED = "temp:co_scientist_executor_rendered"
 STATE_EXECUTOR_ACTIVE_STEP_ID = "temp:co_scientist_executor_active_step_id"
 STATE_REACT_PARSE_RETRIES = "temp:co_scientist_react_parse_retries"
 STATE_EXECUTOR_LAST_PROSE = "temp:co_scientist_executor_last_prose"
+STATE_EXECUTOR_LAST_ERROR = "temp:co_scientist_executor_last_error"
 MAX_REACT_PARSE_RETRIES = 2
 STATE_EXECUTOR_PREV_STEP_STATUS = "temp:co_scientist_executor_prev_step_status"
 STATE_PLAN_PENDING_APPROVAL = "co_scientist_plan_pending_approval"
@@ -4645,7 +4647,7 @@ def _validate_final_synthesis(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _make_planner_before_model_callback(*, require_approval: bool):
+def _make_planner_before_model_callback(*, require_approval: bool, model_name: str = PLANNER_MODEL):
     """Factory: returns a planner before-model callback.
 
     When ``require_approval`` is True, the callback recognises ``approve``,
@@ -4736,7 +4738,7 @@ def _make_planner_before_model_callback(*, require_approval: bool):
                 callback_context.state[STATE_PLAN_PENDING_APPROVAL] = False
                 llm_request.config = llm_request.config or types.GenerateContentConfig()
                 # 2.5 Flash doesn't support thinking_config
-                if "3.1" in str(DEFAULT_MODEL):
+                if "3.1" in str(model_name):
                     llm_request.config.thinking_config = THINKING_CONFIG
                 llm_request.config.response_mime_type = "application/json"
                 llm_request.append_instructions([
@@ -4770,7 +4772,7 @@ def _make_planner_before_model_callback(*, require_approval: bool):
             callback_context.state[STATE_WORKFLOW_TASK] = None
 
         llm_request.config = llm_request.config or types.GenerateContentConfig()
-        if "3.1" in str(DEFAULT_MODEL):
+        if "3.1" in str(model_name):
             llm_request.config.thinking_config = THINKING_CONFIG
         llm_request.config.response_mime_type = "application/json"
         llm_request.append_instructions([_planner_json_instruction_suffix()])
@@ -4974,12 +4976,14 @@ def _react_before_model_callback(*, callback_context: CallbackContext, llm_reque
         _append_executor_rendered(callback_context, rendered)
         return _make_text_response(rendered)
 
+    retries = int(callback_context.state.get(STATE_REACT_PARSE_RETRIES, 0) or 0)
     callback_context.state[STATE_EXECUTOR_ACTIVE_STEP_ID] = current_step_id
     callback_context.state[STATE_EXECUTOR_PREV_STEP_STATUS] = str(active_step.get("status", "pending"))
+    if retries == 0:
+        callback_context.state[STATE_EXECUTOR_LAST_ERROR] = ""
     active_step["status"] = "in_progress"
     callback_context.state[STATE_WORKFLOW_TASK] = task_state
 
-    retries = int(callback_context.state.get(STATE_REACT_PARSE_RETRIES, 0) or 0)
     logger.info("[react:before] executing step %s (retry=%d): %s", current_step_id, retries, active_step.get("goal", ""))
 
     llm_request.config = llm_request.config or types.GenerateContentConfig()
@@ -5061,6 +5065,7 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
     def _handle_step_error(error_label: str, error_msg: str) -> LlmResponse:
         """Retry the step or mark it blocked after max retries."""
         _restore_step_status_on_failure()
+        callback_context.state[STATE_EXECUTOR_LAST_ERROR] = f"{error_label}: {error_msg}".strip()
         if retries < MAX_REACT_PARSE_RETRIES:
             callback_context.state[STATE_REACT_PARSE_RETRIES] = retries + 1
             logger.warning(
@@ -5109,6 +5114,7 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
                 callback_context.state[STATE_WORKFLOW_TASK] = task_state
                 if new_plan_status == "completed":
                     callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
+                callback_context.state[STATE_EXECUTOR_LAST_ERROR] = ""
                 rendered = (
                     f"### {active_step_id} · `partial` _(output recovered from prose)_\n\n"
                     f"{last_prose[:800]}{'…' if len(last_prose) > 800 else ''}\n\n---"
@@ -5197,6 +5203,7 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
     callback_context.state[STATE_WORKFLOW_TASK] = task_state
     callback_context.state[STATE_EXECUTOR_ACTIVE_STEP_ID] = ""
     callback_context.state[STATE_EXECUTOR_PREV_STEP_STATUS] = ""
+    callback_context.state[STATE_EXECUTOR_LAST_ERROR] = ""
 
     if new_plan_status == "completed":
         callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
@@ -5828,6 +5835,7 @@ def create_workflow_agent(
             ``revise: <feedback>`` before executing the plan.
     """
     runtime_model = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    planner_model = PLANNER_MODEL
     synthesizer_model = SYNTHESIZER_MODEL
     router_model = ROUTER_MODEL
     use_bigquery_priority = DEFAULT_PREFER_BIGQUERY if prefer_bigquery is None else bool(prefer_bigquery)
@@ -5850,7 +5858,7 @@ def create_workflow_agent(
 
     planner = LlmAgent(
         name="planner",
-        model=runtime_model,
+        model=planner_model,
         instruction=_build_planner_instruction(
             executor_tool_hints,
             prefer_bigquery=use_bigquery_priority,
@@ -5859,6 +5867,7 @@ def create_workflow_agent(
         disallow_transfer_to_parent=True,
         before_model_callback=_make_planner_before_model_callback(
             require_approval=require_plan_approval,
+            model_name=planner_model,
         ),
         after_model_callback=_make_planner_after_model_callback(
             require_approval=require_plan_approval,

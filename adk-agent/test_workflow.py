@@ -28,6 +28,7 @@ def test_native_workflow_graph_shape():
 
     planner_agent = research_workflow.sub_agents[0]
     assert isinstance(planner_agent, LlmAgent)
+    assert planner_agent.model == workflow.PLANNER_MODEL
     assert planner_agent.before_model_callback is not None
     assert planner_agent.after_model_callback is not None
 
@@ -38,11 +39,13 @@ def test_native_workflow_graph_shape():
 
     step_executor = react_loop.sub_agents[0]
     assert isinstance(step_executor, LlmAgent)
+    assert step_executor.model == workflow.DEFAULT_MODEL
     assert step_executor.before_model_callback is not None
     assert step_executor.after_model_callback is not None
 
     report_agent = research_workflow.sub_agents[2]
     assert isinstance(report_agent, LlmAgent)
+    assert report_agent.model == workflow.SYNTHESIZER_MODEL
     assert report_agent.before_model_callback is not None
     assert report_agent.after_model_callback is not None
 
