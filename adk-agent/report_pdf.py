@@ -15,8 +15,16 @@ from xml.sax.saxutils import escape
 try:  # pragma: no cover - exercised indirectly in environments with reportlab.
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import LETTER
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.lib.styles import ListStyle, ParagraphStyle, getSampleStyleSheet
+    from reportlab.platypus import (
+        ListFlowable,
+        ListItem,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
 
     REPORTLAB_AVAILABLE = True
 except Exception:  # pragma: no cover - fallback for minimal environments.
@@ -215,6 +223,73 @@ def _normalize_list_markers(text: str) -> str:
     return re.sub(r"^(\s*)\*(\s+)", r"\1-\2", text, flags=re.MULTILINE)
 
 
+def _normalize_list_indentation(text: str) -> str:
+    """
+    Normalize nested list indentation so the HTML export path behaves more like
+    the in-app preview, which treats any increased indent as a deeper level.
+    """
+    if not text:
+        return ""
+
+    lines = text.splitlines()
+    normalized: list[str] = []
+    indent_stack: list[int] = []
+    current_item_indent: int | None = None
+    current_item_level = 0
+    in_code_block = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            normalized.append(line)
+            in_code_block = not in_code_block
+            if not in_code_block:
+                indent_stack.clear()
+                current_item_indent = None
+                current_item_level = 0
+            continue
+
+        if in_code_block:
+            normalized.append(line)
+            continue
+
+        match = _match_list_item(line)
+        if match:
+            indent_width = _indent_width(match.group("indent") or "")
+            level = _resolve_list_level(indent_width, indent_stack)
+            marker = f"{match.group('num')}." if match.group("num") is not None else (match.group("bullet") or "-")
+            normalized.append(f"{' ' * (level * 4)}{marker} {match.group('text').rstrip()}")
+            current_item_indent = indent_width
+            current_item_level = level
+            continue
+
+        if not stripped:
+            normalized.append("")
+            continue
+
+        if current_item_indent is not None and indent_stack:
+            leading = re.match(r"^(\s*)", line).group(1)
+            indent_width = _indent_width(leading)
+            if indent_width > current_item_indent:
+                normalized_indent = (current_item_level * 4) + max(4, indent_width - current_item_indent)
+                normalized.append(f"{' ' * normalized_indent}{line.lstrip()}")
+                continue
+
+        indent_stack.clear()
+        current_item_indent = None
+        current_item_level = 0
+        normalized.append(line)
+
+    result = "\n".join(normalized)
+    if text.endswith("\n"):
+        result += "\n"
+    return result
+
+
+def _prepare_markdown_for_pdf(text: str) -> str:
+    return _normalize_list_indentation(_normalize_list_markers(text))
+
+
 def _heading_level(line: str) -> int:
     if line.startswith("### "):
         return 3
@@ -350,9 +425,10 @@ def _find_chrome_binary() -> str | None:
 
 def _build_html_document(markdown_text: str, *, title: str) -> str:
     safe_title = escape(title or "AI Co-Scientist Report")
+    normalized_markdown = _prepare_markdown_for_pdf(markdown_text)
     if MARKDOWN_AVAILABLE:
         body_html = markdown_lib.markdown(
-            _normalize_list_markers(markdown_text),
+            normalized_markdown,
             extensions=[
                 "extra",
                 "sane_lists",
@@ -362,7 +438,7 @@ def _build_html_document(markdown_text: str, *, title: str) -> str:
             ],
         )
     else:
-        body_html = f"<pre>{escape(markdown_text)}</pre>"
+        body_html = f"<pre>{escape(normalized_markdown)}</pre>"
     return (
         "<!DOCTYPE html>\n"
         "<html lang=\"en\">\n"
@@ -451,6 +527,26 @@ def _indent_width(whitespace: str) -> int:
     return len((whitespace or "").expandtabs(4))
 
 
+def _resolve_list_level(indent_width: int, indent_stack: list[int]) -> int:
+    """
+    Infer list nesting from observed indentation changes instead of assuming
+    every nested level uses exactly four spaces.
+    """
+    if not indent_stack:
+        indent_stack.append(indent_width)
+        return 0
+
+    while len(indent_stack) > 1 and indent_width < indent_stack[-1]:
+        indent_stack.pop()
+
+    if indent_width > indent_stack[-1]:
+        indent_stack.append(indent_width)
+    elif indent_width < indent_stack[-1]:
+        indent_stack[-1] = indent_width
+
+    return len(indent_stack) - 1
+
+
 def _match_list_item(line: str):
     return re.match(
         r"^(?P<indent>\s*)(?:(?P<num>\d+)\.\s+|(?P<bullet>[-*+])\s+)(?P<text>.+)$",
@@ -462,6 +558,8 @@ def _extract_list_items(lines: list[str], start_idx: int) -> tuple[list[dict], i
     items: list[dict] = []
     idx = start_idx
     ordered_counters: dict[int, int] = {}
+    level_indents: list[int] = []
+    list_kinds: dict[int, str] = {}
 
     while idx < len(lines):
         raw = lines[idx]
@@ -479,11 +577,14 @@ def _extract_list_items(lines: list[str], start_idx: int) -> tuple[list[dict], i
             break
 
         indent_width = _indent_width(match.group("indent") or "")
-        level = max(0, indent_width // 4)
+        level = _resolve_list_level(indent_width, level_indents)
 
         for depth in list(ordered_counters.keys()):
             if depth > level:
                 del ordered_counters[depth]
+        for depth in list(list_kinds.keys()):
+            if depth > level:
+                del list_kinds[depth]
 
         text_parts = [match.group("text").strip()]
         idx += 1
@@ -501,8 +602,8 @@ def _extract_list_items(lines: list[str], start_idx: int) -> tuple[list[dict], i
 
                 next_match = _match_list_item(lines[look])
                 if next_match:
-                    next_level = max(0, _indent_width(next_match.group("indent") or "") // 4)
-                    if next_level <= level:
+                    next_indent = _indent_width(next_match.group("indent") or "")
+                    if next_indent <= indent_width:
                         idx = look
                         break
                     idx = look
@@ -518,8 +619,8 @@ def _extract_list_items(lines: list[str], start_idx: int) -> tuple[list[dict], i
 
             next_match = _match_list_item(candidate)
             if next_match:
-                next_level = max(0, _indent_width(next_match.group("indent") or "") // 4)
-                if next_level <= level:
+                next_indent = _indent_width(next_match.group("indent") or "")
+                if next_indent <= indent_width:
                     break
                 break
 
@@ -532,7 +633,7 @@ def _extract_list_items(lines: list[str], start_idx: int) -> tuple[list[dict], i
 
         if match.group("num") is not None:
             source_number = int(match.group("num"))
-            if level not in ordered_counters:
+            if list_kinds.get(level) != "ordered" or level not in ordered_counters:
                 ordered_counters[level] = max(0, source_number - 1)
             ordered_counters[level] += 1
             marker = f"{ordered_counters[level]}."
@@ -540,6 +641,9 @@ def _extract_list_items(lines: list[str], start_idx: int) -> tuple[list[dict], i
         else:
             marker = "•"
             kind = "unordered"
+            ordered_counters.pop(level, None)
+
+        list_kinds[level] = kind
 
         items.append(
             {
@@ -553,6 +657,27 @@ def _extract_list_items(lines: list[str], start_idx: int) -> tuple[list[dict], i
     return items, idx
 
 
+def _nest_list_items(items: list[dict]) -> list[dict]:
+    roots: list[dict] = []
+    stack: list[dict] = []
+
+    for item in items:
+        node = {**item, "children": []}
+        level = int(node.get("level", 0))
+
+        while stack and int(stack[-1].get("level", 0)) >= level:
+            stack.pop()
+
+        if stack:
+            stack[-1]["children"].append(node)
+        else:
+            roots.append(node)
+
+        stack.append(node)
+
+    return roots
+
+
 def _styles() -> dict[str, ParagraphStyle]:
     sample = getSampleStyleSheet()
     return {
@@ -563,6 +688,15 @@ def _styles() -> dict[str, ParagraphStyle]:
             fontSize=10.5,
             leading=14,
             spaceAfter=4,
+            textColor=colors.HexColor("#1a1a1a"),
+        ),
+        "list_body": ParagraphStyle(
+            "report_list_body",
+            parent=sample["BodyText"],
+            fontName="Helvetica",
+            fontSize=10.5,
+            leading=14,
+            spaceAfter=0,
             textColor=colors.HexColor("#1a1a1a"),
         ),
         "h1": ParagraphStyle(
@@ -631,20 +765,73 @@ def _flush_paragraph(buffer: list[str], story: list, styles: dict[str, Paragraph
     story.append(Spacer(1, 4))
 
 
+def _group_list_nodes(nodes: list[dict]) -> list[list[dict]]:
+    groups: list[list[dict]] = []
+    current: list[dict] = []
+    current_kind = ""
+
+    for node in nodes:
+        kind = str(node.get("kind", "unordered"))
+        if current and kind != current_kind:
+            groups.append(current)
+            current = []
+        current.append(node)
+        current_kind = kind
+
+    if current:
+        groups.append(current)
+
+    return groups
+
+
+def _list_style(kind: str, level: int) -> ListStyle:
+    return ListStyle(
+        f"report_list_{kind}_{level}",
+        leftIndent=18 + (level * 14),
+        rightIndent=0,
+        bulletType="1" if kind == "ordered" else "bullet",
+        bulletColor=colors.HexColor("#333333"),
+        bulletFontName="Helvetica",
+        bulletFontSize=10,
+        bulletOffsetY=0,
+        bulletDedent="auto",
+    )
+
+
+def _build_list_flowables(nodes: list[dict], styles: dict[str, ParagraphStyle]) -> list:
+    flowables: list = []
+
+    for group in _group_list_nodes(nodes):
+        if not group:
+            continue
+
+        kind = str(group[0].get("kind", "unordered"))
+        level = int(group[0].get("level", 0))
+        list_kwargs = {"style": _list_style(kind, level)}
+
+        if kind == "ordered":
+            marker = str(group[0].get("marker", "1.")).rstrip(".")
+            try:
+                list_kwargs["start"] = int(marker)
+            except ValueError:
+                pass
+
+        items: list[ListItem] = []
+        for node in group:
+            text_markup = _format_inline_markdown(str(node.get("text", ""))).strip() or "&nbsp;"
+            item_flowables: list = [Paragraph(text_markup, styles["list_body"])]
+            item_flowables.extend(_build_list_flowables(node.get("children", []), styles))
+            items.append(ListItem(item_flowables))
+
+        flowables.append(ListFlowable(items, **list_kwargs))
+
+    return flowables
+
+
 def _add_list_block(lines: list[str], start_idx: int, story: list, styles: dict[str, ParagraphStyle]) -> int:
     items, idx = _extract_list_items(lines, start_idx)
-    for item in items:
-        level = int(item.get("level", 0))
-        list_style = ParagraphStyle(
-            f"report_list_{item.get('kind', 'unordered')}_{level}",
-            parent=styles["body"],
-            leftIndent=16 + (level * 14),
-            firstLineIndent=-12,
-            spaceAfter=3,
-        )
-        marker = str(item.get("marker", "•"))
-        text_markup = _format_inline_markdown(str(item.get("text", "")))
-        story.append(Paragraph(f"{escape(marker)} {text_markup}", list_style))
+    for flowable in _build_list_flowables(_nest_list_items(items), styles):
+        story.append(flowable)
     if items:
         story.append(Spacer(1, 4))
     return idx
@@ -733,7 +920,7 @@ def _markdown_story(markdown: str) -> list:
     styles = _styles()
     story: list = []
     paragraph_buffer: list[str] = []
-    lines = _normalize_list_markers(markdown).splitlines()
+    lines = _prepare_markdown_for_pdf(markdown).splitlines()
     idx = 0
     while idx < len(lines):
         stripped = lines[idx].strip()

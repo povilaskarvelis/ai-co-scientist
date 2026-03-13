@@ -26,6 +26,7 @@ from pathlib import Path
 import re
 import time
 from typing import Any
+from typing import Mapping
 import urllib.parse
 import urllib.request
 
@@ -35,6 +36,7 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.tools import McpToolset
 from google.adk.tools.base_tool import BaseTool
+from google.adk.tools.base_toolset import ToolPredicate
 from google.adk.tools.mcp_tool.mcp_toolset import StdioConnectionParams
 from google.adk.tools.tool_context import ToolContext
 from google import genai as _genai_module
@@ -6654,6 +6656,90 @@ def _resolve_step_tools(domains: list[str] | None, *, available_tools: set[str] 
     return tools
 
 
+def _resolve_step_tool_allowlist(
+    active_step: dict[str, Any],
+    *,
+    available_tools: list[str] | None = None,
+) -> list[str]:
+    """Return the narrowed MCP tool list for a single active step."""
+    available = _dedupe_str_list(list(available_tools) if available_tools else KNOWN_MCP_TOOLS, limit=120)
+    available_set = set(available)
+
+    step_domains = active_step.get("domains") or []
+    focused_tools = _resolve_step_tools(step_domains, available_tools=available_set) if step_domains else []
+
+    tool_hint = str(active_step.get("tool_hint", "")).strip()
+    fallback_tools = [
+        str(name).strip()
+        for name in tool_registry.TOOL_ROUTING_METADATA.get(tool_hint, {}).get("fallback_tools", [])
+        if str(name).strip()
+    ]
+    for tool_name in [tool_hint, *fallback_tools]:
+        if tool_name and tool_name in available_set and tool_name not in focused_tools:
+            focused_tools.append(tool_name)
+
+    if not focused_tools:
+        return available
+    return _prioritize_tools_for_step(focused_tools, tool_hint)
+
+
+def _get_task_state_from_state_map(state: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not state:
+        return None
+    task_state = state.get(STATE_WORKFLOW_TASK)
+    return task_state if isinstance(task_state, dict) else None
+
+
+def _resolve_active_step_tool_allowlist(
+    task_state: dict[str, Any] | None,
+    *,
+    available_tools: list[str] | None = None,
+) -> list[str] | None:
+    """Return the current step's allowed tool names, or None for the full base set."""
+    if not task_state:
+        return None
+
+    plan_status = str(task_state.get("plan_status", "")).strip()
+    current_step_id = str(task_state.get("current_step_id") or "").strip()
+    if plan_status == "blocked" and current_step_id:
+        next_step_id = _next_pending_step_id(task_state)
+        if next_step_id:
+            current_step_id = next_step_id
+            plan_status = "ready"
+
+    if not current_step_id or plan_status == "completed":
+        return None
+
+    try:
+        _, active_step = _find_step(task_state, current_step_id)
+    except Exception:  # noqa: BLE001
+        return None
+
+    return _resolve_step_tool_allowlist(active_step, available_tools=available_tools)
+
+
+class _ActiveStepToolPredicate:
+    """Expose only the active step's MCP tools during executor turns."""
+
+    def __init__(self, available_tools: list[str]):
+        self._available_tools = _dedupe_str_list(list(available_tools), limit=120)
+        self._available_tool_set = set(self._available_tools)
+
+    def __call__(self, tool: BaseTool, readonly_context: Any = None) -> bool:
+        if tool.name not in self._available_tool_set:
+            return False
+
+        state = getattr(readonly_context, "state", None)
+        task_state = _get_task_state_from_state_map(state)
+        scoped_tools = _resolve_active_step_tool_allowlist(
+            task_state,
+            available_tools=self._available_tools,
+        )
+        if not scoped_tools:
+            return True
+        return tool.name in set(scoped_tools)
+
+
 def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
     tool_catalog = _format_tool_catalog(tool_hints)
     routing_policy = _format_source_precedence_rules(tool_hints)
@@ -6847,9 +6933,9 @@ def _report_assistant_before_model_callback(
     return None
 
 
-def create_mcp_toolset(tool_filter: list[str] | None = None) -> McpToolset | None:
+def create_mcp_toolset(tool_filter: list[str] | ToolPredicate | None = None) -> McpToolset | None:
     """Build an MCP toolset for the native evidence-executor agent."""
-    if tool_filter is not None and len(tool_filter) == 0:
+    if isinstance(tool_filter, list) and len(tool_filter) == 0:
         return None
 
     server_params = StdioServerParameters(
@@ -6894,9 +6980,14 @@ def create_workflow_agent(
     router_model = ROUTER_MODEL
     use_bigquery_priority = DEFAULT_PREFER_BIGQUERY if prefer_bigquery is None else bool(prefer_bigquery)
 
-    mcp_toolset = create_mcp_toolset(tool_filter=tool_filter)
+    base_tool_hints = _dedupe_str_list(KNOWN_MCP_TOOLS if tool_filter is None else tool_filter, limit=120)
+    executor_tool_filter: list[str] | ToolPredicate | None
+    if base_tool_hints:
+        executor_tool_filter = _ActiveStepToolPredicate(base_tool_hints)
+    else:
+        executor_tool_filter = []
+    mcp_toolset = create_mcp_toolset(tool_filter=executor_tool_filter)
     executor_tools: list[McpToolset] = [mcp_toolset] if mcp_toolset is not None else []
-    base_tool_hints = _dedupe_str_list(tool_filter if tool_filter else KNOWN_MCP_TOOLS, limit=120)
     if use_bigquery_priority:
         base_hint_set = set(base_tool_hints)
         prioritized_hints = [name for name in BQ_PRIORITY_TOOLS if name in base_hint_set]
@@ -6935,6 +7026,7 @@ def create_workflow_agent(
             prefer_bigquery=use_bigquery_priority,
         ),
         tools=executor_tools,
+        include_contents="none",
         before_agent_callback=_react_skip_if_done,
         before_model_callback=_react_before_model_callback,
         after_model_callback=_react_after_model_callback,
@@ -6952,6 +7044,7 @@ def create_workflow_agent(
         model=synthesizer_model,
         instruction=SYNTHESIZER_INSTRUCTION,
         tools=[],
+        include_contents="none",
         before_agent_callback=hitl_agent_gate,
         before_model_callback=_synth_before_model_callback,
         after_model_callback=_synth_after_model_callback,

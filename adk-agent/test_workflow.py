@@ -40,12 +40,14 @@ def test_native_workflow_graph_shape():
     step_executor = react_loop.sub_agents[0]
     assert isinstance(step_executor, LlmAgent)
     assert step_executor.model == workflow.DEFAULT_MODEL
+    assert step_executor.include_contents == "none"
     assert step_executor.before_model_callback is not None
     assert step_executor.after_model_callback is not None
 
     report_agent = research_workflow.sub_agents[2]
     assert isinstance(report_agent, LlmAgent)
     assert report_agent.model == workflow.SYNTHESIZER_MODEL
+    assert report_agent.include_contents == "none"
     assert report_agent.before_model_callback is not None
     assert report_agent.after_model_callback is not None
 
@@ -183,6 +185,44 @@ def test_initialize_and_advance_task_state_one_step_at_a_time():
     assert task_state["current_step_id"] == "S2"
     assert task_state["plan_status"] == "blocked"
     assert task_state["execution_metrics"]["summary"]["blocked_count"] == 1
+
+
+def test_resolve_active_step_tool_allowlist_scopes_to_current_step():
+    task_state = {
+        "plan_status": "ready",
+        "current_step_id": "S2",
+        "steps": [
+            {
+                "id": "S1",
+                "tool_hint": "search_pubmed",
+                "domains": ["literature"],
+                "status": "completed",
+            },
+            {
+                "id": "S2",
+                "tool_hint": "search_clinical_trials",
+                "domains": ["clinical"],
+                "status": "pending",
+            },
+        ],
+    }
+
+    scoped_tools = workflow._resolve_active_step_tool_allowlist(
+        task_state,
+        available_tools=[
+            "search_pubmed",
+            "get_pubmed_abstract",
+            "search_clinical_trials",
+            "get_clinical_trial",
+            "get_intact_interactions",
+        ],
+    )
+
+    assert scoped_tools is not None
+    assert "search_clinical_trials" in scoped_tools
+    assert "get_clinical_trial" in scoped_tools
+    assert "search_pubmed" in scoped_tools
+    assert "get_intact_interactions" not in scoped_tools
 
 
 def test_coverage_status_complete_vs_partial():
