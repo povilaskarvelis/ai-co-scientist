@@ -1,12 +1,12 @@
 # AI Co-Scientist
 
-An agentic AI research assistant that synthesizes evidence across biomedical databases to guide pre-clinical decisions.
+AI Co-Scientist is a human-in-the-loop biomedical research assistant built on Google ADK. It plans an investigation, waits for approval, gathers evidence across live APIs and BigQuery public datasets, and produces cited reports for pre-clinical research decisions.
 
 ## What It Does
 
 The AI Co-Scientist helps biomedical researchers evaluate therapeutic targets and research directions before human trials by:
 
-- **Synthesizing evidence across 57 databases and services** — genomics, transcriptomics, literature, clinical trials, neuroscience, protein structure, pathways, safety, ontologies, rare-disease knowledge, translational model-organism evidence, single-cell atlases, pharmacogenomics, functional screening, curated interaction evidence, and more
+- **Synthesizing evidence across dozens of biomedical databases and services** — genomics, transcriptomics, literature, clinical trials, neuroscience, protein structure, pathways, safety, ontologies, rare-disease knowledge, translational model-organism evidence, single-cell atlases, pharmacogenomics, functional screening, curated interaction evidence, and more
 - **Generating query-specific execution plans** with explicit tool and data-source proposals
 - **Requiring human plan approval or revision** before evidence tools run
 - **Running iterative evidence-gathering loops** via a ReAct (Reason → Act → Observe) cycle
@@ -39,7 +39,7 @@ This stack combines live REST APIs (literature, trials, identifiers/ontologies, 
 
 ## Architecture
 
-The system uses a **router-based agentic architecture**: a top-level intent classifier routes user messages to specialist agents. Research questions enter the full evidence-gathering pipeline; factual Q&A, clarification prompts, and post-report follow-ups go to lighter-weight agents.
+The system uses a **router-based agent architecture**: a top-level intent classifier routes user messages to specialist agents. Research questions enter the full evidence-gathering pipeline; factual Q&A, clarification prompts, and post-report follow-ups go to lighter-weight agents.
 
 ### High-Level Architecture
 
@@ -69,7 +69,7 @@ flowchart TB
     RUN --> S
 ```
 
-### Agentic Agent Hierarchy
+### Agent Hierarchy
 
 ```mermaid
 flowchart TB
@@ -105,33 +105,7 @@ flowchart TB
 
 **Router behavior:** The router uses a fast model (`ADK_ROUTER_MODEL`) to classify intent. It transfers to `general_qa` for straightforward knowledge questions, `clarifier` for ambiguous queries, `report_assistant` when the user is asking about an existing report, and `research_workflow` for full evidence-gathering investigations. In-workflow commands (approve, continue, finalize, etc.) bypass the router LLM and go directly to `research_workflow`.
 
-### Data Flow
-
-```mermaid
-flowchart LR
-    subgraph User["User"]
-        Q["Question"]
-        A["Approval / Commands"]
-    end
-
-    subgraph Pipeline["Evidence Pipeline"]
-        P["Planner"]
-        E["ReAct Loop<br/>(Reason → Act → Observe)"]
-        R["Report Synthesizer"]
-    end
-
-    Q --> ROUTER
-    A --> ROUTER
-    ROUTER -->|research| P
-    P -->|plan JSON| A
-    A -->|approved| E
-    E -->|step results| R
-    R -->|Markdown report| User
-
-    E <-->|MCP tools| MCP["research-mcp"]
-```
-
-The custom web UI (`ui/index.html`, `app.js`, `styles.css`) communicates with `ui_server.py`, which manages conversations, run orchestration, and PDF export. Under the hood it uses the Google ADK `Runner` with `InMemorySessionService`. Source of truth for agent definitions: `adk-agent/co_scientist/workflow.py`.
+The primary runtime is the custom web UI in `adk-agent/ui/`, served by `adk-agent/ui_server.py`. That server manages conversations, state persistence, run orchestration, and PDF export on top of the Google ADK `Runner`. The source of truth for agent behavior is `adk-agent/co_scientist/workflow.py`.
 
 ## Dynamic Workflow
 
@@ -362,6 +336,13 @@ python ui_server.py
 
 Opens the custom web interface at `http://localhost:8080` with conversation management, real-time activity tracking, report panel, and PDF export.
 
+**Runtime notes:**
+
+- The UI server binds to `127.0.0.1:8080` by default. Override with `CO_SCI_UI_HOST` and `CO_SCI_UI_PORT`.
+- Local task and conversation state is stored in `adk-agent/state/workflow_tasks.json` by default.
+- To use Postgres-backed persistence instead of local JSON, set `AI_CO_SCIENTIST_POSTGRES_DSN` (or `POSTGRES_DSN` / `DATABASE_URL`).
+- Generated Markdown/PDF reports are written to `adk-agent/reports/`.
+
 **ADK CLI / ADK Web UI (alternative):**
 
 ```bash
@@ -378,6 +359,10 @@ python agent.py
 python agent.py --query "Evaluate LRRK2 as a drug target in Parkinson disease"
 ```
 
+**Legacy minimal HTTP API:**
+
+`adk-agent/server.py` exposes a smaller programmatic interface (`GET /healthz`, `POST /query`) if you explicitly run that app. It is not the default local or Cloud Run entrypoint.
+
 ## Cloud Run Deployment
 
 ```bash
@@ -387,13 +372,22 @@ SERVICE_NAME="ai-co-scientist" \
 bash scripts/deploy_cloud_run.sh
 ```
 
-The deploy script builds a container image via Cloud Build, then deploys to Cloud Run with Vertex AI auth and the full BigQuery dataset allowlist pre-configured.
+The deploy script builds a container image via Cloud Build, then deploys the primary `ui_server.py` app to Cloud Run with Vertex AI auth and the full BigQuery dataset allowlist pre-configured.
 
 ### Runtime endpoints (Cloud Run)
-- `GET /healthz` — readiness and config status
-- `POST /api/query` — submit a research question
-- `GET /api/conversations` — list conversations
-- `GET /api/conversations/{id}` — conversation detail with iterations
+- `GET /` — primary web UI
+- `GET /about` — static project overview page
+- `GET /api/health` — readiness and runtime status
+- `GET /api/rate-limit` — rate-limit window and remaining quota for the caller IP
+- `POST /api/query` — start a new research question
+- `GET /api/conversations` — list conversations owned by the caller IP
+- `GET /api/conversations/{id}` — full conversation detail with iterations
+- `GET /api/tasks/{id}` — task detail, active plan, report, and research log
+- `POST /api/tasks/{id}/start` — start an approved task
+- `POST /api/tasks/{id}/continue` — continue an in-progress task
+- `POST /api/tasks/{id}/feedback` — send revision feedback or follow-up input
+- `POST /api/tasks/{id}/revise` — request a scoped revision
+- `GET /api/runs/{id}` — poll a run record
 - `GET /api/tasks/{id}/report.pdf` — export report as PDF
 
 ## Project Structure
@@ -409,14 +403,16 @@ The deploy script builds a container image via Cloud Build, then deploys to Clou
 │   │   └── workflow.py     # Workflow graph, HITL, history/rollback, callbacks
 │   ├── ui/
 │   │   ├── index.html      # Landing page and chat interface
+│   │   ├── about.html      # Static architecture / project overview page
 │   │   ├── app.js          # Client-side application logic
 │   │   └── styles.css      # UI styles
-│   ├── .adk/               # ADK local sessions/artifacts (created at runtime)
+│   ├── state/              # Local JSON task/conversation state (runtime-created)
+│   ├── reports/            # Generated Markdown/PDF reports (runtime-created)
+│   ├── .adk/               # ADK local sessions/artifacts (created by `adk run` / `adk web`)
 │   └── test_*.py           # Regression tests
 │
 ├── research-mcp/           # Research Tools Server (Node.js)
 │   ├── server.js           # MCP tool server (Allen + EBRAINS + biomedical tools)
-│   ├── data/               # Local datasets
 │   └── test-tools.js       # Optional manual MCP tool test script
 │
 ├── scripts/
@@ -429,7 +425,9 @@ The deploy script builds a container image via Cloud Build, then deploys to Clou
 
 ## Data Sources
 
-### Live APIs
+The full tool catalog above is the authoritative source. The lists below highlight the major external sources this project currently uses.
+
+### Representative Live APIs
 - **[ClinicalTrials.gov](https://clinicaltrials.gov/)** — Clinical trial registry and results
 - **[PubMed / NCBI](https://pubmed.ncbi.nlm.nih.gov/)** — Biomedical literature, abstracts, and PMC-linked open-access full text
 - **[Gene Expression Omnibus (GEO)](https://www.ncbi.nlm.nih.gov/geo/)** — Functional genomics records across gene expression, microarray, and sequencing studies
@@ -465,9 +463,11 @@ The deploy script builds a container image via Cloud Build, then deploys to Clou
 
 ```bash
 cd adk-agent
-../.venv/bin/python -m py_compile agent.py server.py ui_server.py report_pdf.py co_scientist/workflow.py
+python -m py_compile agent.py server.py ui_server.py report_pdf.py state_store.py co_scientist/workflow.py
+python -m pytest test_tool_registry.py test_report_pdf.py test_ui_server_state.py test_workflow.py
 ```
 
 Notes:
 - External network tests were removed from the default suite to keep CI/dev runs deterministic and fast.
+- `test_cli.py` is best treated as a manual smoke test rather than part of the default automated suite.
 - Generated artifacts in `adk-agent/reports/` are runtime outputs and can be safely deleted.

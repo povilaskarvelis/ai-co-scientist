@@ -24,6 +24,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import random
 import time
 from typing import Any
 from typing import Mapping
@@ -6412,8 +6413,14 @@ def _make_planner_after_model_callback(*, require_approval: bool):
     return _callback
 
 
-RATE_LIMIT_BACKOFF_SECONDS = int(os.environ.get("ADK_RATE_LIMIT_BACKOFF_SECONDS", "5"))
-RATE_LIMIT_AUTO_RETRY = os.environ.get("ADK_RATE_LIMIT_AUTO_RETRY", "").strip().lower() in {"1", "true", "yes", "on"}
+RATE_LIMIT_BACKOFF_BASE = int(os.environ.get("ADK_RATE_LIMIT_BACKOFF_SECONDS", "5"))
+RATE_LIMIT_BACKOFF_MAX = 60
+RATE_LIMIT_MAX_RETRIES = int(os.environ.get("ADK_RATE_LIMIT_MAX_RETRIES", "5"))
+RATE_LIMIT_AUTO_RETRY = os.environ.get(
+    "ADK_RATE_LIMIT_AUTO_RETRY", "true"
+).strip().lower() not in {"0", "false", "no", "off"}
+
+STATE_RATE_LIMIT_RETRY_COUNT = "temp:co_scientist_rate_limit_retry_count"
 
 
 def _using_vertex_ai_backend() -> bool:
@@ -6426,7 +6433,7 @@ def _on_model_error(
     llm_request: LlmRequest,
     error: Exception,
 ) -> LlmResponse | None:
-    """Handle model-level errors. Auto-retries rate limits after a backoff."""
+    """Handle model-level errors with exponential backoff for rate limits."""
     error_type = type(error).__name__
     error_msg = str(error)
     logger.error("Model error in %s: [%s] %s", "agent", error_type, error_msg)
@@ -6435,29 +6442,34 @@ def _on_model_error(
 
     is_rate_limit = any(
         hint in error_msg.lower()
-        for hint in ("429", "resource exhausted", "rate limit", "quota")
+        for hint in ("429", "resource exhausted", "rate limit", "quota", "503", "unavailable")
     )
     if is_rate_limit:
         backend_label = "Vertex AI" if _using_vertex_ai_backend() else "Google AI Studio"
-        if RATE_LIMIT_AUTO_RETRY and RATE_LIMIT_BACKOFF_SECONDS > 0:
+        retry_count = int(callback_context.state.get(STATE_RATE_LIMIT_RETRY_COUNT, 0))
+
+        if RATE_LIMIT_AUTO_RETRY and retry_count < RATE_LIMIT_MAX_RETRIES:
+            callback_context.state[STATE_RATE_LIMIT_RETRY_COUNT] = retry_count + 1
+            backoff = min(RATE_LIMIT_BACKOFF_BASE * (2 ** retry_count) + random.uniform(0, RATE_LIMIT_BACKOFF_BASE), RATE_LIMIT_BACKOFF_MAX)
             logger.info(
-                "Rate limit detected from %s — waiting %ds before auto-retry",
-                backend_label,
-                RATE_LIMIT_BACKOFF_SECONDS,
+                "Rate limit from %s — retry %d/%d, backing off %.1fs",
+                backend_label, retry_count + 1, RATE_LIMIT_MAX_RETRIES, backoff,
             )
-            time.sleep(RATE_LIMIT_BACKOFF_SECONDS)
+            time.sleep(backoff)
             user_msg = (
-                f"_Rate limit hit from {backend_label} — waited {RATE_LIMIT_BACKOFF_SECONDS}s, retrying…_"
+                f"_Rate limit hit from {backend_label} — retry {retry_count + 1}/{RATE_LIMIT_MAX_RETRIES}, waited {backoff:.0f}s…_"
             )
         else:
+            callback_context.state[STATE_RATE_LIMIT_RETRY_COUNT] = 0
             mitigation = (
                 "This deployment is currently using Vertex AI. If local runs are fine, redeploy with `USE_VERTEX_AI=false` to use the configured API key backend, or increase Vertex quota."
                 if _using_vertex_ai_backend()
                 else "Retry after quota resets, reduce concurrent usage, or switch to a backend with available quota."
             )
+            reason = f"Retries exhausted ({RATE_LIMIT_MAX_RETRIES})" if retry_count >= RATE_LIMIT_MAX_RETRIES else "Auto-retry disabled"
             user_msg = (
                 "## Execution Error\n\n"
-                f"{backend_label} quota or rate limit exhausted.\n\n"
+                f"{backend_label} quota or rate limit exhausted. {reason}.\n\n"
                 f"`{error_msg[:300]}`\n\n"
                 f"{mitigation}"
             )

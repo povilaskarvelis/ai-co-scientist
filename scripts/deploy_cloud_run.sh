@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ── Required ─────────────────────────────────────────────────────────────────
 # PROJECT_ID  – GCP project (pass via env or edit default below)
-# GOOGLE_API_KEY – Google AI Studio key (pass via env; stored in Secret Manager)
+# GOOGLE_API_KEY – Google AI Studio key (required only when USE_VERTEX_AI=false; stored in Secret Manager)
 # ── Optional overrides ───────────────────────────────────────────────────────
 # REGION, SERVICE_NAME, REPO_NAME, IMAGE_NAME, USE_VERTEX_AI, GA4_MEASUREMENT_ID, CONCURRENCY
 # ─────────────────────────────────────────────────────────────────────────────
@@ -34,15 +34,12 @@ if [[ -z "${PROJECT_ID}" ]]; then
   exit 1
 fi
 
-# Default to the API-key backend when one is already configured. This keeps
-# Cloud deploys aligned with local behavior instead of silently switching to
-# Vertex AI quotas unless the caller explicitly opts in.
+# Default to Vertex AI for Cloud Run deploys. Vertex AI uses project-level
+# quotas that are separate from the AI Studio API key, preventing deployed
+# services from competing with local development for TPM quota.
+# Pass USE_VERTEX_AI=false to explicitly opt into AI Studio API key backend.
 if [[ -z "${USE_VERTEX_AI}" ]]; then
-  if [[ -n "${GOOGLE_API_KEY}" ]]; then
-    USE_VERTEX_AI="false"
-  else
-    USE_VERTEX_AI="true"
-  fi
+  USE_VERTEX_AI="true"
 fi
 
 if [[ "${USE_VERTEX_AI}" != "true" && -z "${GOOGLE_API_KEY}" ]]; then
@@ -156,5 +153,6 @@ SERVICE_URL="$(
 echo ""
 echo "Deployment complete."
 echo "Service URL: ${SERVICE_URL}"
-echo "Health check: ${SERVICE_URL}/healthz"
-echo "Query endpoint: ${SERVICE_URL}/query"
+echo "Web UI: ${SERVICE_URL}/"
+echo "Health endpoint: ${SERVICE_URL}/api/health"
+echo "Query endpoint: ${SERVICE_URL}/api/query"

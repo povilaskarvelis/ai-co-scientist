@@ -53,6 +53,8 @@ logger = logging.getLogger(__name__)
 
 RATE_LIMIT_QUERIES = int(os.environ.get("RATE_LIMIT_QUERIES", "20"))
 RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "3600"))
+MAX_CONCURRENT_TURNS = int(os.environ.get("ADK_MAX_CONCURRENT_TURNS", "6"))
+_global_turn_semaphore = threading.Semaphore(MAX_CONCURRENT_TURNS)
 GA4_MEASUREMENT_ID = os.environ.get("GA4_MEASUREMENT_ID", "").strip()
 _GA4_ID_PATTERN = re.compile(r"^G-[A-Z0-9]+$")
 
@@ -567,7 +569,7 @@ class UiRuntime:
         self.runs_lock = asyncio.Lock()
         self.runs: dict[str, RunRecord] = {}
         self.background_tasks: set[asyncio.Task] = set()
-        self._thread_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="wf")
+        self._thread_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TURNS + 4, thread_name_prefix="wf")
 
     async def startup(self) -> None:
         is_valid, error_message = validate_runtime_configuration()
@@ -684,17 +686,24 @@ class UiRuntime:
         thread_lock = self._get_conv_thread_lock(conversation_id)
 
         def _thread_target() -> tuple[str, str]:
-            thread_lock.acquire()
+            acquired = _global_turn_semaphore.acquire(timeout=0)
+            if not acquired:
+                logger.info("[ui:%s] Turn queued — %d concurrent turns already running (max %d)", run_id, MAX_CONCURRENT_TURNS, MAX_CONCURRENT_TURNS)
+                _global_turn_semaphore.acquire()
             try:
-                loop = asyncio.new_event_loop()
+                thread_lock.acquire()
                 try:
-                    return loop.run_until_complete(
-                        self._workflow_turn_inner(cs, conversation_id, prompt, run_id=run_id, caller_loop=main_loop)
-                    )
+                    loop = asyncio.new_event_loop()
+                    try:
+                        return loop.run_until_complete(
+                            self._workflow_turn_inner(cs, conversation_id, prompt, run_id=run_id, caller_loop=main_loop)
+                        )
+                    finally:
+                        loop.close()
                 finally:
-                    loop.close()
+                    thread_lock.release()
             finally:
-                thread_lock.release()
+                _global_turn_semaphore.release()
 
         return await main_loop.run_in_executor(self._thread_pool, _thread_target)
 
