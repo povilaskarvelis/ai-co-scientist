@@ -138,6 +138,7 @@ KNOWN_MCP_TOOLS = [
     "search_pubmed_advanced",
     "get_pubmed_abstract",
     "get_paper_fulltext",
+    "search_iedb_epitope_evidence",
     "search_geo_datasets",
     "get_geo_dataset",
     "search_openalex_works",
@@ -223,7 +224,12 @@ Rules:
 - Build a concrete execution plan before any evidence collection begins.
 - Break the objective into ordered, atomic subtasks.
 - Prioritize high-signal subtasks that reduce uncertainty first.
+- For archive-style dataset discovery (for example OpenNeuro, NEMAR, DANDI, Brain-CODE, CONP), prefer one archive per step and plan around simple keyword or modality checks rather than compound boolean expressions.
+- When archive metadata is likely sparse, add a fallback browse/inspection step instead of assuming a zero-hit disease keyword search proves absence.
 - Choose the number of steps needed for the objective. Avoid unnecessary fragmentation.
+- Do not create standalone schema-inspection or table-discovery steps unless the user explicitly asked about schemas
+  or the BigQuery lookup is already identifier-ready and schema inspection is unavoidable. In most cases, schema
+  inspection should happen inline inside an evidence-gathering step, not as a reportable deliverable.
 - Each step must include: id, goal, tool_hint, domains, completion_condition.
 - Every step must call at least one tool. Pick tool_hint from the catalog above.
 - Pick domains from the domain list above. Include 1-3 domains most relevant to the step.
@@ -287,6 +293,8 @@ Rules:
 - You MUST call at least one tool before returning a result.
 - If a tool call fails or returns insufficient data, try an alternative tool or query
   (e.g. search_pubmed <-> search_openalex_works, or fall back to run_bigquery_select_query).
+- For archive/search tools that do literal metadata matching (for example OpenNeuro, DANDI, NEMAR, Brain-CODE, CONP), avoid boolean query strings like `A OR B` unless the tool explicitly supports them; run separate simple searches instead.
+- For dataset archives with sparse disorder labels, a zero-hit disease query is not enough to conclude the archive has no relevant data; retry with modality, task, study name, or archive browsing before blocking the step.
 - If no tool can satisfy the step after trying alternatives, state clearly that the step is BLOCKED and why.
 - For search_clinical_trials and summarize_clinical_trials_landscape, the `status` argument must be a
   single registry enum such as `RECRUITING`, `COMPLETED`, `ACTIVE_NOT_RECRUITING`, or `TERMINATED`.
@@ -716,6 +724,9 @@ def _describe_tool_call(name: str, args: dict[str, Any]) -> str:
         return f"Fetching abstract for PMID {pmid}" if pmid else "Fetching PubMed abstract"
     if name == "get_paper_fulltext":
         return f"Retrieving full text for {query[:60]}" if query else "Retrieving paper full text"
+    if name == "search_iedb_epitope_evidence":
+        focus = query or str(args.get("peptide", "") or args.get("antigen", "") or args.get("allele", "") or "").strip()
+        return f"Searching IEDB epitope evidence for {focus[:120]}" if focus else "Searching IEDB epitope evidence"
     if name in ("search_openalex_works", "search_europe_pmc_literature"):
         return f"Searching literature for {query[:140]}" if query else f"Searching {source}"
 
@@ -934,6 +945,18 @@ def _extract_result_summary(name: str, response: dict[str, Any]) -> str:
         count = response.get("count") or response.get("total") or response.get("totalResults")
         if count is not None:
             return f"found {count} articles"
+    if name == "search_iedb_epitope_evidence":
+        records = response.get("records")
+        if isinstance(records, list):
+            return f"found {len(records)} IEDB evidence records"
+        endpoint_counts = response.get("endpoint_counts")
+        if isinstance(endpoint_counts, dict):
+            total = 0
+            for meta in endpoint_counts.values():
+                if isinstance(meta, dict):
+                    total += int(meta.get("retrieved") or 0)
+            if total > 0:
+                return f"found {total} IEDB endpoint hits"
 
     # GWAS
     if name == "search_gwas_associations":
@@ -1433,6 +1456,10 @@ _SUMMARY_PROCESS_PREFIXES = (
 
 _SUMMARY_PROCESS_MARKERS = (
     "next planned step",
+    "previous step",
+    "completion condition",
+    "fulfills the completion condition",
+    "objective of this step",
     "the user encountered",
     "the user plans",
     "the approach involves",
@@ -1531,6 +1558,7 @@ def _clean_executor_summary_text(text: str) -> str:
             continue
         line = re.sub(r"^#{1,6}\s*Step\s+S?\d+\s*:?\s*", "", line, flags=re.IGNORECASE)
         line = re.sub(r"^#{1,6}\s*S\d+\s*(?:[·:-]\s*.*)?$", "", line, flags=re.IGNORECASE)
+        line = re.sub(r"^(?:REASON|FINDINGS)\s*:\s*", "", line, flags=re.IGNORECASE)
         line = re.sub(r"\bFindings Summary:\s*", "", line, flags=re.IGNORECASE)
         if not line:
             continue
@@ -3835,6 +3863,62 @@ def _compact_completed_step_summaries(task_state: dict[str, Any]) -> list[dict[s
     return summaries
 
 
+_STEP_FOCUS_STOPWORDS = {
+    "AND", "ARE", "ASSAY", "ASSAYS", "BUILD", "CANDIDATE", "CANDIDATES", "COMPARE", "COMPARES",
+    "COMPLETION", "CONDITION", "DATA", "DATASET", "DATASETS", "DERIVED", "EVIDENCE", "EXACT",
+    "EXISTING", "FIND", "FINDINGS", "FROM", "GOAL", "HUMAN", "IDENTIFIED", "IDENTIFY", "IN",
+    "LITERATURE", "MODEL", "MUTANT", "MUTATION", "MUTATIONS", "OF", "OR", "PEPTIDE", "PEPTIDES",
+    "PRESENTATION", "PUBLIC", "QUERY", "RANK", "RECOGNITION", "RETRIEVE", "RETURN", "SEARCH",
+    "SEQUENCE", "SEQUENCES", "STEP", "SUPPORT", "THE", "THIS", "USE", "USING", "VALIDATE",
+}
+
+
+def _extract_step_focus_terms(step: dict[str, Any], *, limit: int = 12) -> list[str]:
+    text = " ".join(
+        str(step.get(field, "") or "").strip()
+        for field in ("goal", "completion_condition")
+    )
+    if not text:
+        return []
+
+    ordered_terms: list[str] = []
+    seen: set[str] = set()
+
+    def _add_term(raw: str) -> None:
+        term = re.sub(r"\s+", " ", str(raw or "").strip())
+        if not term:
+            return
+        key = term.upper()
+        if key in seen:
+            return
+        seen.add(key)
+        ordered_terms.append(term)
+
+    for match in re.finditer(r"\b([A-Z0-9-]{2,12})\s+([A-Z]\d{1,5}[A-Z*])\b", text):
+        gene = match.group(1).strip()
+        if gene not in _STEP_FOCUS_STOPWORDS:
+            _add_term(f"{gene} {match.group(2).strip()}")
+
+    for match in re.finditer(r"\bHLA-[A-Z]\*\d{2}:\d{2}\b", text):
+        _add_term(match.group(0))
+
+    for match in re.finditer(r"\b[A-Z]\d{1,5}[A-Z*]\b", text):
+        _add_term(match.group(0))
+
+    for match in re.finditer(r"\b[ACDEFGHIKLMNPQRSTVWY]{8,}\b", text):
+        _add_term(match.group(0))
+
+    for match in re.finditer(r"\b[A-Z0-9-]{2,12}\b", text):
+        token = match.group(0).strip()
+        if token in _STEP_FOCUS_STOPWORDS:
+            continue
+        if token.isdigit():
+            continue
+        _add_term(token)
+
+    return ordered_terms[:limit]
+
+
 def _serialize_pretty_json(data: Any) -> str:
     return json.dumps(data, indent=2, ensure_ascii=True)
 
@@ -5868,6 +5952,8 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
 
     step_domains = active_step.get("domains") or []
     tool_hint = str(active_step.get("tool_hint", "")).strip()
+    goal_text = str(active_step.get("goal", "") or "")
+    focus_terms = _extract_step_focus_terms(active_step)
     focused_tools = _prioritize_tools_for_step(
         _resolve_step_tools(step_domains),
         tool_hint,
@@ -5884,6 +5970,7 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
             "tool_hint": active_step.get("tool_hint"),
             "domains": step_domains,
             "completion_condition": active_step.get("completion_condition"),
+            "focus_terms": focus_terms,
         },
         "remaining_steps_after_this": remaining_count - 1,
         "prior_completed_steps": prior_completed,
@@ -5905,6 +5992,26 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
     )
     if routing_guidance:
         instructions.append(routing_guidance)
+
+    if focus_terms:
+        instructions.append(
+            "Scope guardrails for this step:\n"
+            f"- In-scope anchors: {', '.join(focus_terms)}.\n"
+            "- Reuse prior_completed_steps only when they directly support these anchors.\n"
+            "- Ignore sibling genes, mutations, alleles, datasets, or diseases from other plan steps unless this step explicitly requires them.\n"
+            "- In result_summary, describe only what this step established. Do not narrate that a previous step already succeeded or that the completion condition was fulfilled."
+        )
+
+    is_mutation_epitope_step = bool(
+        re.search(r"\b[A-Z]\d{1,5}[A-Z*]\b", goal_text)
+        and re.search(r"\b(epitope|neoepitope|neoantigen|peptide)\b", goal_text, flags=re.IGNORECASE)
+    )
+    if is_mutation_epitope_step:
+        instructions.append(
+            "Mutation-specific peptide guardrails:\n"
+            "- Do not invent or reverse-engineer an exact mutant peptide from a generic protein sequence unless the residue position and substituted amino acid are explicitly verified in the cited source.\n"
+            "- If the source only supports a peptide span, residue range, or long-peptide construct without an exact sequence, state that the exact sequence remains unresolved instead of fabricating one."
+        )
 
     instructions.append(
         f"Execute ONLY step {active_step.get('id')}. "
@@ -6937,11 +7044,6 @@ BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_ta
     Contains clinical significance classifications (pathogenic, benign, etc.), variant types, and condition
     associations. Does NOT contain SIFT/PolyPhen prediction scores.
 
-  === Immunology ===
-  **bigquery-public-data.immune_epitope_db** — IEDB: immune epitopes, B-cell assays, MHC ligand binding,
-    T-cell receptor data. Tables: epitope_full_v3, bcell_full_v3, mhc_ligand_full, receptor_full_v3, etc.
-    Use for immunotherapy target assessment and vaccine design.
-
   === Drug nomenclature & regulatory ===
   **bigquery-public-data.nlm_rxnorm** — RxNorm drug nomenclature, ingredient relationships, and
     clinical drug pathways. Use for standardizing drug names across sources.
@@ -6952,8 +7054,11 @@ BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_ta
 
   === Perturbation biology ===
   **bigquery-public-data.umiami_lincs** — LINCS L1000 perturbation signatures: cell lines, small molecules,
-    nucleic acid reagents, readouts, and perturbation signatures. Use for drug repurposing hypotheses
-    and mechanism-of-action characterization.
+    nucleic acid reagents, readouts, and perturbation signatures. Use for metadata-level LINCS lookup,
+    exact signature/perturbagen follow-up, and mechanism-of-action characterization when identifiers are
+    already known. Avoid broad ad hoc scans of the `readout` table for gene lists unless the byte-billed
+    guardrail has been intentionally raised; the raw readout table is extremely large and generic gene filters
+    still tend to trigger full-table scans.
 
   **How to query**: Always wrap table names in backticks in SQL. Short names are auto-expanded:
   `open_targets_platform.target` → `bigquery-public-data.open_targets_platform.target`.
@@ -6962,12 +7067,15 @@ BQ_DATASET_CATALOG = """Available BigQuery datasets (query via `list_bigquery_ta
   `WHERE name = 'Alzheimer''s disease'`.
   When trying unfamiliar or nested-field SQL, run the same query once with `dryRun=true` first to catch syntax issues cheaply.
 
-  Start every structured data lookup with BigQuery. Use `list_bigquery_tables` to discover tables, \
-and `list_bigquery_tables(dataset="...", table="...")` to inspect column schemas before writing queries.
+  Start every structured data lookup with BigQuery when the task is truly dataset-like or identifier-ready.
+  Use `list_bigquery_tables` to discover tables, and `list_bigquery_tables(dataset="...", table="...")` to inspect
+  column schemas before writing queries. Do not turn schema inspection into a standalone investigation goal unless
+  the user asked about the schema itself.
   Write Standard SQL via `run_bigquery_select_query`. Use non-BigQuery MCP tools for:
     - Literature search: search_pubmed, search_pubmed_advanced, get_pubmed_abstract, get_paper_fulltext (PubMed/NCBI/PMC)
     - Literature search: search_openalex_works (OpenAlex — broader coverage, preprints)
     - Literature enrichment with preprints and citation metadata: search_europe_pmc_literature (Europe PMC)
+    - Immunology epitope / assay evidence: search_iedb_epitope_evidence (IEDB — epitope, T-cell, and MHC ligand evidence)
     - Clinical trials: search_clinical_trials, get_clinical_trial, summarize_clinical_trials_landscape
     - Researcher discovery: search_openalex_authors, rank_researchers_by_activity
     - Gene identifier normalization: resolve_gene_identifiers (MyGene.info)
@@ -7010,7 +7118,6 @@ BQ_EXECUTOR_POLICY = """- BigQuery-first policy: For any structured data lookup,
 and `run_bigquery_select_query` over non-BQ tools. \
 Available datasets: open_targets_platform (targets, diseases, drugs, evidence), ebi_chembl (bioactivity), \
 gnomAD (variant frequencies), human_genome_variants, human_variant_annotation (ClinVar), \
-immune_epitope_db (IEDB), \
 nlm_rxnorm (drug nomenclature), fda_drug (drug labels, NDC, enforcement), \
 umiami_lincs (perturbation signatures), ebi_surechembl (patents).
 CRITICAL SQL syntax: Always wrap table references in backticks in your SQL queries. \
@@ -7025,8 +7132,10 @@ Before writing queries:
   Column names are often singular (e.g. "target" not "targets") \
   and use IDs rather than human-readable names (e.g. targetId is an Ensembl ID like "ENSG00000012048", \
   diseaseId is an EFO ID like "EFO_0001075"). Look up IDs from reference tables first.
+For `umiami_lincs`, restrict BigQuery usage to metadata-sized tables (`signature`, `perturbagen`, `small_molecule`, `model_system`, `cell_line`) unless you already have exact signature IDs or have explicitly raised the bytes-billed cap. The `readout` table is extremely large and broad gene-list filters usually still scan roughly the full table. \
 Fall back to non-BQ tools for: literature search (search_pubmed, get_paper_fulltext, search_openalex_works), \
 Europe PMC literature/preprints/citations (search_europe_pmc_literature), \
+IEDB epitope / assay evidence (search_iedb_epitope_evidence), \
 ClinicalTrials.gov, UniProt, Reactome pathways, STRING interactions, \
 IntAct experimental interactions (get_intact_interactions), \
 BioGRID experimental interactions (get_biogrid_interactions), \
@@ -7349,6 +7458,7 @@ def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) 
             "- For ontology crosswalks across MONDO/EFO/DOID/MeSH/OMIM/UMLS, use map_ontology_terms_oxo (EBI OxO).\n"
             "- For GO term search and GO annotations, use search_quickgo_terms and get_quickgo_annotations (QuickGO).\n"
             "- For literature search that needs preprints or Europe PMC citation metadata, use search_europe_pmc_literature (Europe PMC).\n"
+            "- For curated epitope, T-cell, and MHC ligand evidence, use search_iedb_epitope_evidence (IEDB).\n"
             "- When only a gene is known but variant-level tools are needed: first use search_variants_by_gene (MyVariant) or search_civic_variants (cancer genes) to discover variants, then get_variant_annotations or annotate_variants_vep with the returned HGVS/rsID.\n"
             "- For variant pathogenicity predictions, use annotate_variants_vep (Ensembl VEP — SIFT, PolyPhen, AlphaMissense). Requires HGVS; not gene symbols.\n"
             "- For aggregated variant annotations (ClinVar, CADD, dbSNP, gnomAD, COSMIC), use get_variant_annotations (MyVariant.info). Requires rsID or HGVS; not gene symbols.\n"
@@ -7367,6 +7477,7 @@ def _build_planner_instruction(tool_hints: list[str], *, prefer_bigquery: bool) 
             "- For compound sensitivity and cancer pharmacogenomics, use get_gdsc_drug_sensitivity (GDSC / CancerRxGene).\n"
             "- For Broad single-dose repurposing response across pooled cell lines, use get_prism_repurposing_response (PRISM Repurposing).\n"
             "- For harmonized cross-dataset pharmacogenomics across public screens, use get_pharmacodb_compound_response (PharmacoDB).\n"
+            "- For LINCS L1000 via BigQuery, use `umiami_lincs` only for metadata-sized lookups or when exact signature IDs / perturbagen IDs are already known. Do not plan broad `umiami_lincs.readout` scans for ad hoc gene lists under the default byte-billed cap.\n"
             "- For single-cell dataset discovery by disease, tissue, cell type, assay, and organism, use search_cellxgene_datasets (CELLxGENE Discover / Census metadata).\n"
             "- For integrated pathway context across multiple pathway databases, use search_pathway_commons_top_pathways (Pathway Commons).\n"
             "- For curated gene-disease validity and dosage sensitivity, use get_clingen_gene_curation (ClinGen).\n"

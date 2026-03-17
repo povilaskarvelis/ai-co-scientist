@@ -15,13 +15,43 @@ REPO_NAME="${REPO_NAME:-co-scientist-images}"
 IMAGE_NAME="${IMAGE_NAME:-ai-co-scientist}"
 USE_VERTEX_AI="${USE_VERTEX_AI:-}"
 GOOGLE_API_KEY="${GOOGLE_API_KEY:-}"
+BIOGRID_ACCESS_KEY="${BIOGRID_ACCESS_KEY:-}"
+BIOGRID_ORCS_ACCESS_KEY="${BIOGRID_ORCS_ACCESS_KEY:-}"
 GA4_MEASUREMENT_ID="${GA4_MEASUREMENT_ID:-G-NTCXHW3B2G}"
 CONCURRENCY="${CONCURRENCY:-16}"
 
-# Source local .env if API key not already in environment
-if [[ -z "${GOOGLE_API_KEY}" && -f "adk-agent/.env" ]]; then
-  set -a; source adk-agent/.env; set +a
-fi
+ENV_FILE="adk-agent/.env"
+
+load_env_var_from_file() {
+  local var_name="$1"
+  local env_file="$2"
+  local line=""
+  local value=""
+
+  if [[ -n "${!var_name:-}" || ! -f "${env_file}" ]]; then
+    return 0
+  fi
+
+  line="$(grep -E "^${var_name}=" "${env_file}" | tail -n 1 || true)"
+  if [[ -z "${line}" ]]; then
+    return 0
+  fi
+
+  value="${line#*=}"
+  if [[ ${#value} -ge 2 ]]; then
+    if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+  fi
+
+  export "${var_name}=${value}"
+}
+
+load_env_var_from_file "GOOGLE_API_KEY" "${ENV_FILE}"
+load_env_var_from_file "BIOGRID_ACCESS_KEY" "${ENV_FILE}"
+load_env_var_from_file "BIOGRID_ORCS_ACCESS_KEY" "${ENV_FILE}"
 
 if [[ -z "${PROJECT_ID}" ]]; then
   echo "Error: PROJECT_ID is required."
@@ -75,34 +105,58 @@ gcloud builds submit \
   --suppress-logs \
   . || true
 
-# ── Store API key in Secret Manager (if using AI Studio) ─────────────────────
+# ── Store secrets in Secret Manager ───────────────────────────────────────────
 
-SECRET_NAME="ai-co-scientist-api-key"
-if [[ "${USE_VERTEX_AI}" != "true" ]]; then
-  if ! gcloud secrets describe "${SECRET_NAME}" \
+GOOGLE_SECRET_NAME="ai-co-scientist-api-key"
+BIOGRID_SECRET_NAME="ai-co-scientist-biogrid-access-key"
+BIOGRID_ORCS_SECRET_NAME="ai-co-scientist-biogrid-orcs-access-key"
+PROJECT_NUMBER=""
+COMPUTE_SA=""
+
+ensure_compute_service_account() {
+  if [[ -n "${COMPUTE_SA}" ]]; then
+    return 0
+  fi
+  PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
+  COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+}
+
+upsert_secret_value() {
+  local secret_name="$1"
+  local secret_value="$2"
+
+  if [[ -z "${secret_value}" ]]; then
+    return 0
+  fi
+
+  if ! gcloud secrets describe "${secret_name}" \
     --project "${PROJECT_ID}" >/dev/null 2>&1; then
-    echo "${GOOGLE_API_KEY}" | gcloud secrets create "${SECRET_NAME}" \
+    printf '%s' "${secret_value}" | gcloud secrets create "${secret_name}" \
       --project "${PROJECT_ID}" \
       --data-file=-
   else
-    echo "${GOOGLE_API_KEY}" | gcloud secrets versions add "${SECRET_NAME}" \
+    printf '%s' "${secret_value}" | gcloud secrets versions add "${secret_name}" \
       --project "${PROJECT_ID}" \
       --data-file=-
   fi
 
-  PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
-  COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-
-  gcloud secrets add-iam-policy-binding "${SECRET_NAME}" \
+  ensure_compute_service_account
+  gcloud secrets add-iam-policy-binding "${secret_name}" \
     --project "${PROJECT_ID}" \
     --member="serviceAccount:${COMPUTE_SA}" \
     --role="roles/secretmanager.secretAccessor" \
     --quiet >/dev/null 2>&1 || true
+}
+
+if [[ "${USE_VERTEX_AI}" != "true" ]]; then
+  upsert_secret_value "${GOOGLE_SECRET_NAME}" "${GOOGLE_API_KEY}"
 fi
+upsert_secret_value "${BIOGRID_SECRET_NAME}" "${BIOGRID_ACCESS_KEY}"
+upsert_secret_value "${BIOGRID_ORCS_SECRET_NAME}" "${BIOGRID_ORCS_ACCESS_KEY}"
 
 # ── Deploy ───────────────────────────────────────────────────────────────────
 
-BQ_ALLOWLIST="bigquery-public-data.open_targets_platform,bigquery-public-data.ebi_chembl,bigquery-public-data.gnomAD,bigquery-public-data.fda_drug,bigquery-public-data.human_variant_annotation,bigquery-public-data.human_genome_variants,bigquery-public-data.immune_epitope_db,bigquery-public-data.umiami_lincs,bigquery-public-data.nlm_rxnorm,bigquery-public-data.ebi_surechembl"
+BQ_ALLOWLIST="bigquery-public-data.open_targets_platform,bigquery-public-data.ebi_chembl,bigquery-public-data.gnomAD,bigquery-public-data.fda_drug,bigquery-public-data.human_variant_annotation,bigquery-public-data.human_genome_variants,bigquery-public-data.umiami_lincs,bigquery-public-data.nlm_rxnorm,bigquery-public-data.ebi_surechembl"
 
 DEPLOY_FLAGS=(
   --project "${PROJECT_ID}"
@@ -135,8 +189,16 @@ if [[ "${USE_VERTEX_AI}" == "true" ]]; then
 else
   DEPLOY_FLAGS+=(
     --set-env-vars "GOOGLE_GENAI_USE_VERTEXAI=false"
-    --set-secrets "GOOGLE_API_KEY=${SECRET_NAME}:latest"
+    --set-secrets "GOOGLE_API_KEY=${GOOGLE_SECRET_NAME}:latest"
   )
+fi
+
+if [[ -n "${BIOGRID_ACCESS_KEY}" ]]; then
+  DEPLOY_FLAGS+=(--set-secrets "BIOGRID_ACCESS_KEY=${BIOGRID_SECRET_NAME}:latest")
+fi
+
+if [[ -n "${BIOGRID_ORCS_ACCESS_KEY}" ]]; then
+  DEPLOY_FLAGS+=(--set-secrets "BIOGRID_ORCS_ACCESS_KEY=${BIOGRID_ORCS_SECRET_NAME}:latest")
 fi
 
 gcloud run deploy "${SERVICE_NAME}" "${DEPLOY_FLAGS[@]}"

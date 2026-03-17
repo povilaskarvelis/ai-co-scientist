@@ -179,6 +179,7 @@ The reasoning trace captures the full decision chain per step and is stored alon
 | **Clinical Trials** | `search_clinical_trials`, `get_clinical_trial`, `summarize_clinical_trials_landscape` | ClinicalTrials.gov |
 | **Literature** | `search_pubmed`, `search_pubmed_advanced`, `get_pubmed_abstract`, `get_paper_fulltext` | PubMed / PMC (NCBI E-utilities) |
 | **Literature Enrichment** | `search_europe_pmc_literature` | Europe PMC (preprints, citation counts, open-access metadata, broader article coverage) |
+| **Immunology** | `search_iedb_epitope_evidence` | IEDB (epitope summaries, MHC ligand evidence, T-cell assay evidence, PMIDs) |
 | **Transcriptomics** | `search_geo_datasets`, `get_geo_dataset` | NCBI Gene Expression Omnibus (GEO; series, samples, platforms, curated datasets) |
 | **Researcher Discovery** | `search_openalex_works`, `search_openalex_authors`, `rank_researchers_by_activity`, `get_researcher_contact_candidates` | OpenAlex |
 | **Gene ID Normalization** | `resolve_gene_identifiers` | MyGene.info |
@@ -230,7 +231,6 @@ All accessed via `list_bigquery_tables` and `run_bigquery_select_query` with rea
 | **gnomad** | Population variant frequencies across diverse ancestries |
 | **human_genome_variants** | 1000 Genomes Phase 3 variants, Platinum Genomes, Simons Diversity |
 | **human_variant_annotation** | ClinVar clinical significance classifications, variant-condition associations (hg19/hg38) |
-| **immune_epitope_db** | Immune epitopes, B-cell assays, MHC ligand binding, T-cell receptor data |
 | **nlm_rxnorm** | Drug nomenclature, ingredient relationships, clinical drug pathways |
 | **fda_drug** | FAERS adverse event reports, drug labels, NDC listings, enforcement actions |
 | **umiami_lincs** | L1000 perturbation signatures: cell lines, small molecules, readouts |
@@ -290,6 +290,8 @@ pip install -r requirements.txt
 # 5a. Local mode auth (AI Studio API key)
 cp .env.local.example .env
 # then edit .env and set GOOGLE_API_KEY
+# optional BioGRID integrations:
+# set BIOGRID_ACCESS_KEY and/or BIOGRID_ORCS_ACCESS_KEY in .env
 # optional for BigQuery tools (ADC):
 # gcloud auth application-default login
 # optional for gated Hugging Face datasets (e.g., GPQA):
@@ -298,6 +300,8 @@ cp .env.local.example .env
 # 5b. Vertex mode auth (project-backed)
 cp .env.vertex.example .env
 # then edit GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION
+# optional BioGRID integrations:
+# set BIOGRID_ACCESS_KEY and/or BIOGRID_ORCS_ACCESS_KEY in .env
 # and authenticate with:
 # gcloud auth application-default login
 ```

@@ -61,6 +61,7 @@ const CBIOPORTAL_API = "https://www.cbioportal.org/api";
 const DEPMAP_PORTAL_API = "https://depmap.org/portal";
 const PUBCHEM_API = "https://pubchem.ncbi.nlm.nih.gov/rest/pug";
 const CHEMBL_API = "https://www.ebi.ac.uk/chembl/api/data";
+const IEDB_QUERY_API = "https://query-api.iedb.org";
 const ABA_API = "https://api.brain-map.org/api/v2";
 const EBRAINS_KG_SEARCH_API = "https://search.kg.ebrains.eu/api";
 const HF_DATASETS_SERVER_API = "https://datasets-server.huggingface.co";
@@ -178,6 +179,34 @@ let orphanetGeneCatalogCache = null;
 
 function normalizeWhitespace(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function splitArchiveSearchTerms(rawQuery) {
+  const raw = normalizeWhitespace(rawQuery || "");
+  if (!raw) return [];
+
+  const looksCompound = /\b(?:or|and|not)\b/i.test(raw) || /[,;|/]/.test(raw);
+  if (!looksCompound) return [raw];
+
+  const parts = raw
+    .replace(/[()]/g, " ")
+    .replace(/\s*\/\s*/g, " / ")
+    .split(/\b(?:or|and|not)\b|[,;|/]/i)
+    .map((part) => normalizeWhitespace(part))
+    .filter((part) => part && !/^(?:or|and|not)$/i.test(part));
+
+  if (parts.length === 0) return [raw];
+  return [...new Set(parts)];
+}
+
+function buildArchiveSearchKeyFields(rawQuery, searchTerms, { browseLabel = "Browse: all", queryLabel = "Query" } = {}) {
+  const raw = normalizeWhitespace(rawQuery || "");
+  if (!raw) return [browseLabel];
+  const fields = [`${queryLabel}: ${raw}`];
+  if (searchTerms.length > 1) {
+    fields.push(`Parsed search terms: ${searchTerms.join("; ")}`);
+  }
+  return fields;
 }
 
 function decodeHtmlEntities(value) {
@@ -489,6 +518,11 @@ function buildUniProtUrl(pathname, params = new URLSearchParams()) {
   return query ? `${UNIPROT_API}${pathname}?${query}` : `${UNIPROT_API}${pathname}`;
 }
 
+function buildIedbQueryUrl(pathname, params = new URLSearchParams()) {
+  const query = params.toString();
+  return query ? `${IEDB_QUERY_API}${pathname}?${query}` : `${IEDB_QUERY_API}${pathname}`;
+}
+
 function buildNcbiEutilsUrl(baseUrl, params = new URLSearchParams()) {
   const nextParams = new URLSearchParams(params);
   if (NCBI_API_KEY && !nextParams.has("api_key")) {
@@ -517,6 +551,338 @@ function buildHfHubDatasetUrl(dataset) {
     .map((segment) => encodeURIComponent(segment))
     .join("/");
   return `https://huggingface.co/datasets/${safePath}`;
+}
+
+function parseContentRangeTotal(value) {
+  const normalized = normalizeWhitespace(value || "");
+  if (!normalized) return null;
+  const match = normalized.match(/\/(\d+|\*)$/);
+  if (!match || match[1] === "*") return null;
+  const total = Number(match[1]);
+  return Number.isFinite(total) ? total : null;
+}
+
+function normalizePeptideSequence(value) {
+  return normalizeWhitespace(value || "").toUpperCase().replace(/[^A-Z]/g, "");
+}
+
+function iedbArrayFilterContains(value) {
+  const normalized = normalizeWhitespace(value || "");
+  if (!normalized) return "";
+  return `cs.{${JSON.stringify(normalized)}}`;
+}
+
+function toTextArray(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeWhitespace(item)).filter(Boolean);
+  }
+  const normalized = normalizeWhitespace(value || "");
+  return normalized ? [normalized] : [];
+}
+
+function extractIedbAntigenNames(row) {
+  const direct = [
+    ...toTextArray(row?.parent_source_antigen_names),
+    ...toTextArray(row?.parent_source_antigen_name),
+    ...toTextArray(row?.curated_source_antigen),
+  ];
+  const curated = Array.isArray(row?.curated_source_antigens)
+    ? row.curated_source_antigens.map((item) => normalizeWhitespace(item?.name || "")).filter(Boolean)
+    : [];
+  return dedupeArray([...direct, ...curated]);
+}
+
+function extractIedbAntigenIris(row) {
+  const direct = [
+    ...toTextArray(row?.parent_source_antigen_iris),
+    ...toTextArray(row?.parent_source_antigen_iri),
+  ];
+  const curated = Array.isArray(row?.curated_source_antigens)
+    ? row.curated_source_antigens.map((item) => normalizeWhitespace(item?.iri || "")).filter(Boolean)
+    : [];
+  return dedupeArray([...direct, ...curated]);
+}
+
+function extractIedbAlleleNames(row) {
+  return dedupeArray([
+    ...toTextArray(row?.mhc_allele_names),
+    ...toTextArray(row?.mhc_allele_name),
+  ]);
+}
+
+function extractIedbQualitativeMeasures(row) {
+  return dedupeArray([
+    ...toTextArray(row?.qualitative_measures),
+    ...toTextArray(row?.qualitative_measure),
+  ]);
+}
+
+function extractIedbPubmedIds(row) {
+  return dedupeArray([
+    ...toTextArray(row?.pubmed_ids),
+    ...toTextArray(row?.pubmed_id),
+  ]);
+}
+
+function extractIedbReferenceTitles(row) {
+  return dedupeArray([
+    ...toTextArray(row?.reference_titles),
+    ...toTextArray(row?.reference_title),
+    ...toTextArray(row?.reference_summary),
+  ]);
+}
+
+function extractIedbDiseaseNames(row) {
+  return dedupeArray([
+    ...toTextArray(row?.disease_names),
+    ...toTextArray(row?.disease_name),
+  ]);
+}
+
+function extractIedbHostNames(row) {
+  return dedupeArray([
+    ...toTextArray(row?.host_organism_names),
+    ...toTextArray(row?.host_organism_name),
+  ]);
+}
+
+function extractIedbAssayNames(row) {
+  return dedupeArray([
+    ...toTextArray(row?.assay_names),
+    ...toTextArray(row?.assay_name),
+  ]);
+}
+
+function matchesIedbText(values, query) {
+  const normalizedQuery = normalizeWhitespace(query || "").toLowerCase();
+  if (!normalizedQuery) return true;
+  return (Array.isArray(values) ? values : [])
+    .some((value) => normalizeWhitespace(value).toLowerCase().includes(normalizedQuery));
+}
+
+function looksLikeMutationToken(value) {
+  const normalized = normalizeWhitespace(value || "");
+  return /\b(?:[A-Z]\d+[A-Z]|p\.[A-Za-z]{3}\d+[A-Za-z]{3})\b/.test(normalized);
+}
+
+function deriveIedbAntigenCandidates(value) {
+  const normalized = normalizeWhitespace(value || "");
+  if (!normalized) return [];
+  const candidates = [normalized];
+  const firstToken = normalized.split(/\s+/)[0] || "";
+  if (looksLikeBareGeneSymbol(firstToken)) {
+    candidates.push(firstToken);
+  }
+  const strippedMutation = normalizeWhitespace(
+    normalized
+      .replace(/\bp\.[A-Za-z]{3}\d+[A-Za-z]{3}\b/gi, " ")
+      .replace(/\b[A-Z]\d+[A-Z]\b/g, " ")
+  );
+  if (strippedMutation) {
+    candidates.push(strippedMutation);
+    const strippedFirst = strippedMutation.split(/\s+/)[0] || "";
+    if (looksLikeBareGeneSymbol(strippedFirst)) {
+      candidates.push(strippedFirst);
+    }
+  }
+  return dedupeArray(candidates).slice(0, 4);
+}
+
+async function resolveIedbAntigenTarget(query) {
+  const candidates = deriveIedbAntigenCandidates(query);
+  for (const candidate of candidates) {
+    const params = new URLSearchParams({
+      query: `(${candidate}) AND reviewed:true`,
+      format: "json",
+      size: "5",
+      fields: "accession,id,protein_name,gene_names,organism_name,reviewed",
+    });
+    const url = buildUniProtUrl("/uniprotkb/search", params);
+    try {
+      const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
+      const rawResults = Array.isArray(data?.results) ? data.results : [];
+      const ranked = rankUniProtResults(rawResults, candidate);
+      const selected = ranked[0];
+      if (!selected) continue;
+      const accession = normalizeWhitespace(selected?.primaryAccession || "");
+      if (!accession) continue;
+      return {
+        query: candidate,
+        accession,
+        iri: `UNIPROT:${accession}`,
+        label: extractUniProtProteinName(selected),
+        gene_symbols: extractUniProtGeneSymbols(selected, 4),
+        source_url: url,
+      };
+    } catch (_) {
+      // Keep trying simplified antigen candidates.
+    }
+  }
+  return null;
+}
+
+const IEDB_ENDPOINT_CONFIG = {
+  epitope: {
+    path: "/epitope_search",
+    select: [
+      "structure_id",
+      "structure_iri",
+      "linear_sequence",
+      "parent_source_antigen_names",
+      "parent_source_antigen_iris",
+      "mhc_allele_names",
+      "qualitative_measures",
+      "pubmed_ids",
+      "reference_titles",
+      "disease_names",
+      "host_organism_names",
+      "assay_names",
+    ].join(","),
+  },
+  tcell: {
+    path: "/tcell_search",
+    select: [
+      "tcell_id",
+      "tcell_iri",
+      "structure_id",
+      "structure_iri",
+      "linear_sequence",
+      "parent_source_antigen_name",
+      "parent_source_antigen_iri",
+      "mhc_allele_name",
+      "qualitative_measure",
+      "pubmed_id",
+      "reference_titles",
+      "reference_summary",
+      "disease_names",
+      "host_organism_name",
+      "assay_names",
+    ].join(","),
+  },
+  mhc: {
+    path: "/mhc_search",
+    select: [
+      "elution_id",
+      "elution_iri",
+      "structure_id",
+      "structure_iri",
+      "linear_sequence",
+      "parent_source_antigen_name",
+      "parent_source_antigen_iri",
+      "mhc_allele_name",
+      "qualitative_measure",
+      "quantitative_measure",
+      "pubmed_id",
+      "reference_titles",
+      "reference_summary",
+      "disease_names",
+      "host_organism_name",
+      "assay_names",
+    ].join(","),
+  },
+};
+
+async function fetchIedbEndpoint(endpoint, { peptide, antigenTarget, allele, positiveOnly, limit }) {
+  const config = IEDB_ENDPOINT_CONFIG[endpoint];
+  if (!config) throw new Error(`Unknown IEDB endpoint: ${endpoint}`);
+  const params = new URLSearchParams({
+    select: config.select,
+    limit: String(limit),
+  });
+  if (peptide) {
+    params.set("linear_sequence", `ilike.*${peptide}*`);
+  }
+  if (antigenTarget?.iri) {
+    if (endpoint === "epitope") {
+      params.set("parent_source_antigen_iris", `cs.{${antigenTarget.iri}}`);
+    } else {
+      params.set("parent_source_antigen_iri", `eq.${antigenTarget.iri}`);
+    }
+  }
+  if (allele) {
+    if (endpoint === "epitope") {
+      params.set("mhc_allele_names", iedbArrayFilterContains(allele));
+    } else {
+      params.set("mhc_allele_name", `eq.${allele}`);
+    }
+  }
+  if (positiveOnly) {
+    if (endpoint === "epitope") {
+      params.set("qualitative_measures", iedbArrayFilterContains("Positive"));
+    } else {
+      params.set("qualitative_measure", "eq.Positive");
+    }
+  }
+
+  const url = buildIedbQueryUrl(config.path, params);
+  const response = await fetchWithRetry(url, {
+    retries: 1,
+    timeoutMs: 12000,
+    maxBackoffMs: 2500,
+    headers: { Prefer: "count=exact" },
+  });
+  const totalCount = parseContentRangeTotal(response.headers.get("content-range"));
+  const rows = await response.json();
+  if (!Array.isArray(rows)) {
+    throw new Error(`IEDB returned a non-array response for ${endpoint}.`);
+  }
+  return { rows, totalCount, url };
+}
+
+function normalizeIedbRecord(endpoint, row) {
+  return {
+    endpoint,
+    record_id:
+      normalizeWhitespace(row?.tcell_iri || row?.elution_iri || row?.structure_iri || "")
+      || normalizeWhitespace(String(row?.tcell_id || row?.elution_id || row?.structure_id || "")),
+    structure_id: normalizeWhitespace(row?.structure_iri || "") || null,
+    sequence: normalizePeptideSequence(row?.linear_sequence || "") || null,
+    antigen_names: extractIedbAntigenNames(row),
+    antigen_iris: extractIedbAntigenIris(row),
+    allele_names: extractIedbAlleleNames(row),
+    qualitative_measures: extractIedbQualitativeMeasures(row),
+    quantitative_measure: normalizeWhitespace(row?.quantitative_measure || "") || null,
+    pubmed_ids: extractIedbPubmedIds(row),
+    reference_titles: extractIedbReferenceTitles(row),
+    disease_names: extractIedbDiseaseNames(row),
+    host_organism_names: extractIedbHostNames(row),
+    assay_names: extractIedbAssayNames(row),
+  };
+}
+
+function scoreIedbRecord(record, { peptide, allele, antigenQuery, disease, hostOrganism }) {
+  let score = 0;
+  if (record.endpoint === "tcell") score += 18;
+  else if (record.endpoint === "mhc") score += 12;
+  else score += 6;
+
+  if (peptide) {
+    if (record.sequence === peptide) score += 80;
+    else if ((record.sequence || "").includes(peptide)) score += 45;
+  }
+  if (allele && record.allele_names.includes(allele)) score += 35;
+  if (antigenQuery && matchesIedbText(record.antigen_names, antigenQuery)) score += 24;
+  if (disease && matchesIedbText(record.disease_names, disease)) score += 12;
+  if (hostOrganism && matchesIedbText(record.host_organism_names, hostOrganism)) score += 10;
+  if (record.qualitative_measures.includes("Positive")) score += 8;
+  if (record.pubmed_ids.length > 0) score += Math.min(8, record.pubmed_ids.length);
+  if (record.allele_names.length > 0) score += 2;
+  return score;
+}
+
+function formatIedbRecordLine(record, idx) {
+  const antigen = compactErrorMessage(record.antigen_names[0] || "unknown antigen", 90);
+  const allele = compactErrorMessage(record.allele_names.slice(0, 3).join(", ") || "unspecified", 70);
+  const measureBits = [];
+  if (record.qualitative_measures.length > 0) {
+    measureBits.push(record.qualitative_measures.join(", "));
+  }
+  if (record.quantitative_measure) {
+    measureBits.push(record.quantitative_measure);
+  }
+  const measure = compactErrorMessage(measureBits.join(" | ") || "not reported", 70);
+  const pmidText = record.pubmed_ids.length > 0 ? record.pubmed_ids.slice(0, 3).join(", ") : "n/a";
+  return `${idx + 1}. [${record.endpoint}] ${record.sequence || "sequence unavailable"} | antigen: ${antigen} | allele: ${allele} | measure: ${measure} | PMID: ${pmidText}`;
 }
 
 function getHfAuthHeaders() {
@@ -942,6 +1308,19 @@ function buildBigQueryErrorHint(query, errorMessage) {
 
   if (/Unrecognized name/i.test(normalizedMessage)) {
     hints.push("Re-check exact column names with list_bigquery_tables(dataset=..., table=...).");
+  }
+
+  if (/Query exceeded limit for bytes billed/i.test(normalizedMessage)) {
+    if (/`?bigquery-public-data\.umiami_lincs\.readout`?/i.test(normalizedQuery) || /`?umiami_lincs\.readout`?/i.test(normalizedQuery)) {
+      hints.push(
+        "umiami_lincs.readout is extremely large; broad gene-list filters still tend to scan roughly the full table."
+      );
+      hints.push(
+        "Use umiami_lincs metadata tables first (signature, perturbagen, small_molecule, model_system, cell_line), switch to PRISM/GDSC/PharmacoDB for compound prioritization, or raise BQ_MAX_BYTES_BILLED only if you intentionally want a costly raw LINCS scan."
+      );
+    } else {
+      hints.push("Run the same query with dryRun=true to estimate bytes, then narrow joins/filters or raise BQ_MAX_BYTES_BILLED if the scan is intentionally large.");
+    }
   }
 
   return hints.join(" ");
@@ -5332,6 +5711,278 @@ server.registerTool(
         },
       };
     }
+  }
+);
+
+// ============================================
+// TOOL: IEDB epitope / assay evidence search
+// ============================================
+server.registerTool(
+  "search_iedb_epitope_evidence",
+  {
+    description:
+      "Searches IEDB for epitope, T-cell, and MHC ligand evidence. " +
+      "Best used with an exact or partial peptide sequence, and can also resolve an antigen/protein name " +
+      "to a UniProt accession before querying IEDB. Returns matching sequences, alleles, assay evidence, and PMIDs.",
+    inputSchema: {
+      peptide: z.string().optional().describe("Exact or partial peptide sequence, e.g. 'SIINFEKL' or 'KLVVVGAGGVGKSAL'. Strongest input when known."),
+      antigen: z.string().optional().describe("Antigen or protein text, e.g. 'KRAS', 'KRAS G12D', or 'spike glycoprotein'. Resolved to a UniProt accession when possible."),
+      allele: z.string().optional().describe("Exact HLA / MHC allele name, e.g. 'HLA-A*11:01'."),
+      disease: z.string().optional().describe("Optional disease context filter applied after retrieval, e.g. 'glioma' or 'melanoma'."),
+      hostOrganism: z.string().optional().describe("Optional host organism filter applied after retrieval, e.g. 'human' or 'mouse'."),
+      assay: z.enum(["any", "epitope", "tcell", "mhc"]).optional().default("any")
+        .describe("Which IEDB endpoint family to query. 'any' searches epitope summaries plus T-cell and MHC assay evidence."),
+      positiveOnly: z.boolean().optional().default(false)
+        .describe("If true, keep only positive assay/evidence rows when the endpoint exposes qualitative positivity."),
+      maxResults: z.number().optional().default(10)
+        .describe("Maximum number of normalized evidence records to return (default 10, max 20)."),
+    },
+  },
+  async ({
+    peptide,
+    antigen,
+    allele,
+    disease,
+    hostOrganism,
+    assay = "any",
+    positiveOnly = false,
+    maxResults = 10,
+  }) => {
+    const normalizedPeptide = normalizePeptideSequence(peptide || "");
+    const normalizedAntigen = normalizeWhitespace(antigen || "");
+    const normalizedAllele = normalizeWhitespace(allele || "");
+    const normalizedDisease = normalizeWhitespace(disease || "");
+    const normalizedHost = normalizeWhitespace(hostOrganism || "");
+    const boundedMaxResults = Math.max(1, Math.min(20, Math.round(Number(maxResults) || 10)));
+
+    if (!normalizedPeptide && !normalizedAntigen && !normalizedAllele) {
+      return {
+        content: [{
+          type: "text",
+          text: "Provide at least one of: peptide, antigen, or allele.",
+        }],
+        structuredContent: {
+          schema: "search_iedb_epitope_evidence.v1",
+          result_status: "error",
+          error: "Missing required search input: peptide, antigen, or allele.",
+        },
+      };
+    }
+
+    let antigenTarget = null;
+    if (normalizedAntigen) {
+      antigenTarget = await resolveIedbAntigenTarget(normalizedAntigen);
+      if (!antigenTarget && !normalizedPeptide && !normalizedAllele) {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `Could not resolve antigen "${normalizedAntigen}" to a UniProt accession for IEDB querying.`,
+              keyFields: [
+                `Antigen query: ${normalizedAntigen}`,
+                "IEDB antigen searches work best with an exact peptide sequence or a resolvable antigen/protein accession.",
+              ],
+              sources: [
+                "https://help.iedb.org/hc/en-us/articles/4402872882189-Immune-Epitope-Database-Query-API-IQ-API",
+              ],
+              limitations: [
+                "Mutation names alone often do not map cleanly to IEDB records. Supply a peptide sequence when possible.",
+              ],
+            }),
+          }],
+          structuredContent: {
+            schema: "search_iedb_epitope_evidence.v1",
+            result_status: "not_found_or_empty",
+            peptide: normalizedPeptide || null,
+            antigen: normalizedAntigen || null,
+            allele: normalizedAllele || null,
+            disease: normalizedDisease || null,
+            host_organism: normalizedHost || null,
+            assay,
+            positive_only: Boolean(positiveOnly),
+            antigen_resolution: null,
+            records: [],
+          },
+        };
+      }
+    }
+
+    const endpoints = assay === "any" ? ["epitope", "tcell", "mhc"] : [assay];
+    const perEndpointLimit = assay === "any"
+      ? Math.max(8, Math.min(40, boundedMaxResults * 3))
+      : Math.max(8, Math.min(50, boundedMaxResults * 4));
+
+    const settled = await Promise.allSettled(
+      endpoints.map((endpoint) =>
+        fetchIedbEndpoint(endpoint, {
+          peptide: normalizedPeptide,
+          antigenTarget,
+          allele: normalizedAllele,
+          positiveOnly: Boolean(positiveOnly),
+          limit: perEndpointLimit,
+        })
+      )
+    );
+
+    const endpointCounts = {};
+    const sourceUrls = [];
+    const rawRecords = [];
+    const errors = [];
+
+    settled.forEach((result, idx) => {
+      const endpoint = endpoints[idx];
+      if (result.status === "fulfilled") {
+        const rows = Array.isArray(result.value?.rows) ? result.value.rows : [];
+        endpointCounts[endpoint] = {
+          retrieved: rows.length,
+          total_count: result.value?.totalCount ?? null,
+        };
+        if (result.value?.url) sourceUrls.push(result.value.url);
+        for (const row of rows) {
+          rawRecords.push(normalizeIedbRecord(endpoint, row));
+        }
+      } else {
+        endpointCounts[endpoint] = {
+          retrieved: 0,
+          total_count: null,
+          error: compactErrorMessage(result.reason?.message || String(result.reason), 180),
+        };
+        errors.push(`${endpoint}: ${endpointCounts[endpoint].error}`);
+      }
+    });
+
+    const filteredRecords = rawRecords.filter((record) => {
+      if (normalizedDisease && !matchesIedbText(record.disease_names, normalizedDisease)) return false;
+      if (normalizedHost && !matchesIedbText(record.host_organism_names, normalizedHost)) return false;
+      if (normalizedAntigen && !antigenTarget && !matchesIedbText(record.antigen_names, normalizedAntigen)) return false;
+      return true;
+    });
+
+    const scoredRecords = filteredRecords
+      .map((record) => ({
+        ...record,
+        score: scoreIedbRecord(record, {
+          peptide: normalizedPeptide,
+          allele: normalizedAllele,
+          antigenQuery: antigenTarget?.query || normalizedAntigen,
+          disease: normalizedDisease,
+          hostOrganism: normalizedHost,
+        }),
+      }))
+      .sort((left, right) => {
+        const scoreDelta = (right.score || 0) - (left.score || 0);
+        if (scoreDelta !== 0) return scoreDelta;
+        return normalizeWhitespace(left.sequence || "").localeCompare(normalizeWhitespace(right.sequence || ""));
+      })
+      .slice(0, boundedMaxResults);
+
+    const uniquePmids = dedupeArray(scoredRecords.flatMap((record) => record.pubmed_ids)).slice(0, 20);
+    const uniqueAlleles = dedupeArray(scoredRecords.flatMap((record) => record.allele_names)).slice(0, 12);
+    const uniqueSequences = dedupeArray(scoredRecords.map((record) => record.sequence).filter(Boolean)).slice(0, 12);
+
+    if (antigenTarget?.source_url) sourceUrls.push(antigenTarget.source_url);
+    const dedupedSources = dedupeArray(sourceUrls);
+    const keyFields = [];
+    if (normalizedPeptide) keyFields.push(`Peptide filter: ${normalizedPeptide}`);
+    if (normalizedAntigen) {
+      keyFields.push(`Antigen query: ${normalizedAntigen}`);
+      if (antigenTarget?.iri) {
+        const geneText = antigenTarget.gene_symbols?.length ? ` | genes: ${antigenTarget.gene_symbols.join(", ")}` : "";
+        keyFields.push(`Resolved antigen: ${antigenTarget.label} (${antigenTarget.iri})${geneText}`);
+      }
+    }
+    if (normalizedAllele) keyFields.push(`Allele filter: ${normalizedAllele}`);
+    if (normalizedDisease) keyFields.push(`Disease filter: ${normalizedDisease}`);
+    if (normalizedHost) keyFields.push(`Host organism filter: ${normalizedHost}`);
+    keyFields.push(`Assay mode: ${assay}`);
+    keyFields.push(`Positive-only: ${positiveOnly ? "yes" : "no"}`);
+    keyFields.push(`Endpoint hits: ${endpoints.map((endpoint) => {
+      const meta = endpointCounts[endpoint] || {};
+      return `${endpoint} ${meta.retrieved || 0}${meta.total_count != null ? ` of ${meta.total_count}` : ""}`;
+    }).join("; ")}`);
+    if (uniqueSequences.length > 0) keyFields.push(`Unique sequences shown: ${uniqueSequences.join(", ")}`);
+    if (uniqueAlleles.length > 0) keyFields.push(`Unique alleles shown: ${uniqueAlleles.join(", ")}`);
+    if (uniquePmids.length > 0) keyFields.push(`Representative PMIDs: ${uniquePmids.join(", ")}`);
+
+    if (scoredRecords.length > 0) {
+      keyFields.push("\nTop evidence:");
+      keyFields.push(...scoredRecords.map((record, idx) => formatIedbRecordLine(record, idx)));
+    }
+
+    const mutationOnlyWarning = normalizedAntigen && looksLikeMutationToken(normalizedAntigen) && !normalizedPeptide;
+    const limitations = [
+      "IEDB retrieval is strongest when you provide an exact peptide sequence and, when known, an exact HLA/MHC allele.",
+      "Positive and negative assay rows can coexist for the same peptide and allele across different studies.",
+      "Antigen text is resolved to the top UniProt hit when possible; broad names can still pull mixed evidence.",
+    ];
+    if (mutationOnlyWarning) {
+      limitations.push("A mutation-like antigen query was simplified for antigen resolution. Supply the exact mutant peptide sequence for mutation-specific retrieval.");
+    }
+    if (errors.length > 0) {
+      limitations.push(`Some IEDB endpoints failed: ${errors.join(" | ")}`);
+    }
+
+    const resultStatus = scoredRecords.length > 0
+      ? (errors.length > 0 ? "degraded" : "ok")
+      : (errors.length > 0 ? "error" : "not_found_or_empty");
+
+    const summary = scoredRecords.length > 0
+      ? `IEDB returned ${scoredRecords.length} normalized evidence record(s) across ${endpoints.length} endpoint${endpoints.length === 1 ? "" : "s"}${uniquePmids.length > 0 ? ` with PMID support from ${uniquePmids.length} article(s)` : ""}.`
+      : `No IEDB evidence records matched the supplied filters${errors.length > 0 ? `; endpoint errors were observed` : ""}.`;
+
+    return {
+      content: [{
+        type: "text",
+        text: renderStructuredResponse({
+          summary,
+          keyFields,
+          sources: dedupedSources.length > 0
+            ? dedupedSources
+            : ["https://help.iedb.org/hc/en-us/articles/4402872882189-Immune-Epitope-Database-Query-API-IQ-API"],
+          limitations,
+        }),
+      }],
+      structuredContent: {
+        schema: "search_iedb_epitope_evidence.v1",
+        result_status: resultStatus,
+        peptide: normalizedPeptide || null,
+        antigen: normalizedAntigen || null,
+        allele: normalizedAllele || null,
+        disease: normalizedDisease || null,
+        host_organism: normalizedHost || null,
+        assay,
+        positive_only: Boolean(positiveOnly),
+        antigen_resolution: antigenTarget
+          ? {
+            query_used: antigenTarget.query,
+            accession: antigenTarget.accession,
+            iri: antigenTarget.iri,
+            label: antigenTarget.label,
+            gene_symbols: antigenTarget.gene_symbols || [],
+          }
+          : null,
+        endpoint_counts: endpointCounts,
+        records: scoredRecords.map((record) => ({
+          endpoint: record.endpoint,
+          record_id: record.record_id || null,
+          structure_id: record.structure_id || null,
+          sequence: record.sequence || null,
+          antigen_names: record.antigen_names,
+          antigen_iris: record.antigen_iris,
+          allele_names: record.allele_names,
+          qualitative_measures: record.qualitative_measures,
+          quantitative_measure: record.quantitative_measure,
+          pubmed_ids: record.pubmed_ids,
+          reference_titles: record.reference_titles.slice(0, 3),
+          disease_names: record.disease_names,
+          host_organism_names: record.host_organism_names,
+          assay_names: record.assay_names.slice(0, 4),
+          score: record.score,
+        })),
+        source_urls: dedupedSources,
+        errors,
+      },
+    };
   }
 );
 
@@ -13225,6 +13876,9 @@ function parseNEMARQuery(rawQuery) {
   const modalities = [];
   for (const token of raw.split(/\s+/)) {
     const normalizedToken = token.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    if (!normalizedToken || ["or", "and", "not"].includes(normalizedToken)) {
+      continue;
+    }
     const modality = NEMAR_MODALITY_ALIASES.get(normalizedToken);
     if (modality) {
       if (!modalities.includes(modality)) modalities.push(modality);
@@ -13308,7 +13962,7 @@ server.registerTool(
     description:
       "Searches NEMAR (NeuroElectroMagnetic data Archive) for EEG, MEG, iEEG, and related datasets using the public NEMAR Data Explorer. " +
       "NEMAR hosts OpenNeuro neuroelectromagnetic data at SDSC with BIDS format, HED event descriptions, and NSG compute integration. " +
-      "Use keywords like 'EEG', 'MEG', 'iEEG', 'resting state', 'visual', 'auditory', or study names. " +
+      "Use simple keywords like 'EEG', 'MEG', 'iEEG', 'resting state', 'visual', 'auditory', or study names rather than boolean strings. " +
       "Omit query or use modality words like 'EEG' or 'iEEG' to browse. Use get_nemar_dataset_details with a dataset id (e.g. ds005522) or legacy repo id for more metadata.",
     inputSchema: {
       query: z.string().optional().describe("Search term for dataset title/README metadata. Include modality words like 'EEG', 'MEG', or 'iEEG' to filter. Omit to browse."),
@@ -13562,7 +14216,7 @@ server.registerTool(
     description:
       "Searches Brain-CODE (Ontario Brain Institute) datasets available through the CONP archive. " +
       "Brain-CODE hosts clinical, MRI, EEG, genomic and other neuroscience data from Canadian brain disorder research (epilepsy, depression, neurodegenerative disease, cerebral palsy, concussion). " +
-      "Datasets are mirrored in conpdatasets under braincode_* repos. Use keywords like 'mouse', 'fBIRN', 'NDD', 'epilepsy', 'POND', or omit to list all Brain-CODE datasets in CONP. " +
+      "Datasets are mirrored in conpdatasets under braincode_* repos. Use simple keywords like 'mouse', 'fBIRN', 'NDD', 'epilepsy', 'POND', or omit to list all Brain-CODE datasets in CONP. " +
       "Use get_braincode_dataset_details with a repo name (e.g. braincode_Mouse_Image) for full metadata. Full catalog and controlled releases: braincode.ca.",
     inputSchema: {
       query: z.string().optional().describe("Keyword to narrow results (e.g. 'mouse', 'fBIRN', 'NDD'). Omit to list all Brain-CODE datasets in CONP."),
@@ -13571,25 +14225,40 @@ server.registerTool(
   },
   async ({ query, maxResults }) => {
     const limit = Math.min(Math.max(1, maxResults || 20), 50);
-    const extra = normalizeWhitespace(query || "");
-    const q = extra ? `${BRAINCODE_CONP_QUERY} ${extra} org:${CONP_GITHUB_ORG}` : `${BRAINCODE_CONP_QUERY} org:${CONP_GITHUB_ORG}`;
-    const params = new URLSearchParams({ q, per_page: String(limit), page: "1", sort: "updated", order: "desc" });
+    const rawQuery = normalizeWhitespace(query || "");
+    const searchTerms = splitArchiveSearchTerms(rawQuery);
+    const queriesToRun = rawQuery ? searchTerms : [""];
+    const items = [];
+    const seen = new Set();
+    const totals = [];
 
-    const url = `${GITHUB_API}/search/repositories?${params.toString()}`;
-    let data;
     try {
-      data = await fetchJsonWithRetry(url, {
-        retries: 1,
-        timeoutMs: 12000,
-        headers: { Accept: "application/vnd.github+json", "User-Agent": "research-mcp" },
-      });
+      for (const term of queriesToRun) {
+        const q = term ? `${BRAINCODE_CONP_QUERY} ${term} org:${CONP_GITHUB_ORG}` : `${BRAINCODE_CONP_QUERY} org:${CONP_GITHUB_ORG}`;
+        const params = new URLSearchParams({ q, per_page: String(limit), page: "1", sort: "updated", order: "desc" });
+        const url = `${GITHUB_API}/search/repositories?${params.toString()}`;
+        const data = await fetchJsonWithRetry(url, {
+          retries: 1,
+          timeoutMs: 12000,
+          headers: { Accept: "application/vnd.github+json", "User-Agent": "research-mcp" },
+        });
+        totals.push(Number(data?.total_count || 0));
+        for (const item of Array.isArray(data?.items) ? data.items : []) {
+          const name = normalizeWhitespace(item?.name || "");
+          if (!name || seen.has(name)) continue;
+          seen.add(name);
+          items.push(item);
+          if (items.length >= limit) break;
+        }
+        if (items.length >= limit) break;
+      }
     } catch (error) {
       return {
         content: [{
           type: "text",
           text: renderStructuredResponse({
             summary: `Brain-CODE search failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
-            keyFields: [extra ? `Query: ${extra}` : "Browse: all Brain-CODE"],
+            keyFields: buildArchiveSearchKeyFields(rawQuery, searchTerms, { browseLabel: "Browse: all Brain-CODE" }),
             sources: ["https://www.braincode.ca/", "https://github.com/conpdatasets"],
             limitations: ["GitHub API rate limits may apply."],
           }),
@@ -13597,17 +14266,19 @@ server.registerTool(
       };
     }
 
-    const items = Array.isArray(data?.items) ? data.items : [];
-    const total = Number(data?.total_count || 0);
+    const total = totals.length <= 1 ? (totals[0] || 0) : null;
     if (items.length === 0) {
       return {
         content: [{
           type: "text",
           text: renderStructuredResponse({
-            summary: `No Brain-CODE datasets found${extra ? ` for "${extra}"` : ""}.`,
-            keyFields: [extra ? `Query: ${extra}` : "Browse: all"],
+            summary: `No Brain-CODE datasets found${rawQuery ? ` for "${rawQuery}"` : ""}.`,
+            keyFields: buildArchiveSearchKeyFields(rawQuery, searchTerms, { browseLabel: "Browse: all Brain-CODE" }),
             sources: ["https://www.braincode.ca/content/public-data-releases", "https://github.com/conpdatasets"],
-            limitations: ["Brain-CODE datasets in CONP use braincode_* naming. Full catalog at braincode.ca."],
+            limitations: [
+              "Brain-CODE datasets in CONP use braincode_* naming. Full catalog at braincode.ca.",
+              "The CONP mirror is sparse; browsing all Brain-CODE repos can be more informative than a disease-keyword search.",
+            ],
           }),
         }],
       };
@@ -13625,8 +14296,13 @@ server.registerTool(
       content: [{
         type: "text",
         text: renderStructuredResponse({
-          summary: `Brain-CODE: ${items.length} dataset(s)${extra ? ` matching "${extra}"` : ""} in CONP. Total: ${total}.`,
-          keyFields: [extra ? `Query: ${extra}` : "Browse: all Brain-CODE", "\nResults:", ...lines],
+          summary: `Brain-CODE: ${items.length} dataset(s)${rawQuery ? ` matching "${rawQuery}"` : ""} in CONP.${total !== null ? ` Total: ${total}.` : ` Aggregated across ${searchTerms.length} parsed search term(s).`}`,
+          keyFields: [
+            ...buildArchiveSearchKeyFields(rawQuery, searchTerms, { browseLabel: "Browse: all Brain-CODE" }),
+            ...(total !== null ? [`Total: ${total}`] : [`Showing unique results: ${items.length}`]),
+            "\nResults:",
+            ...lines,
+          ],
           sources: [
             "https://www.braincode.ca/content/public-data-releases",
             "https://www.braincode.ca/",
@@ -14160,9 +14836,9 @@ server.registerTool(
     description:
       "Searches public OpenNeuro neuroimaging datasets by keyword and/or imaging modality. " +
       "OpenNeuro is the primary open platform for fMRI, MRI, MEG, EEG, and other neuroimaging data (BIDS format). " +
-      "For disorder-focused discovery, prefer keyword-first search terms such as 'schizophrenia', 'psychosis', or 'first-episode psychosis', then narrow by modality. " +
+      "For disorder-focused discovery, prefer simple keyword-first search terms such as 'schizophrenia', 'psychosis', or 'first-episode psychosis', then narrow by modality. " +
       "Use modality to filter: 'MRI', 'MEG', 'EEG', 'PET', 'iEEG', or 'behavioral'. Omit modality to browse all public datasets. " +
-      "OpenNeuro does not expose a dedicated disorder filter here; use keyword matching plus dataset metadata inspection. " +
+      "OpenNeuro does not expose a dedicated disorder filter here; use keyword matching plus dataset metadata inspection, and avoid boolean strings like 'A OR B'. " +
       "If more pages exist, continue with the returned cursor rather than assuming the first page is exhaustive. " +
       "Returns dataset IDs (e.g. ds000224), names, modalities, and latest snapshot tags. Use get_openneuro_dataset with an ID for full metadata.",
     inputSchema: {
@@ -14174,7 +14850,8 @@ server.registerTool(
   },
   async ({ query, modality, after, maxResults }) => {
     const limit = Math.min(Math.max(1, maxResults || 20), 50);
-    const keyword = normalizeWhitespace(query || "");
+    const rawKeyword = normalizeWhitespace(query || "");
+    const searchTerms = splitArchiveSearchTerms(rawKeyword);
     const afterCursor = normalizeWhitespace(after || "");
     const modArg = modality && OPENNEURO_MODALITIES.has(String(modality).trim().toUpperCase())
       ? String(modality).trim().toUpperCase()
@@ -14198,14 +14875,14 @@ server.registerTool(
 
     let data;
     try {
-      if (keyword) {
+      if (rawKeyword) {
         const normalizeForMatch = (value) => String(value || "")
           .toLowerCase()
           .replace(/[^a-z0-9]+/g, " ")
           .replace(/\s+/g, " ")
           .trim();
 
-        const needle = normalizeForMatch(keyword);
+        const needles = searchTerms.map((term) => normalizeForMatch(term)).filter(Boolean);
         let cursor = afterCursor || null;
         let scannedPages = 0;
         let hasNextPage = false;
@@ -14231,7 +14908,7 @@ server.registerTool(
               node.metadata?.studyDomain,
               node.latestSnapshot?.description?.Name,
             ].filter(Boolean).join(" "));
-            if (needle && haystack.includes(needle)) {
+            if (needles.some((needle) => haystack.includes(needle))) {
               matchedEdges.push(edge);
             }
           }
@@ -14264,7 +14941,7 @@ server.registerTool(
           text: renderStructuredResponse({
             summary: `OpenNeuro search failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
             keyFields: [
-              keyword ? `Keyword: ${keyword}` : "Keyword: none",
+              ...buildArchiveSearchKeyFields(rawKeyword, searchTerms, { browseLabel: "Keyword: none", queryLabel: "Keyword" }),
               modArg ? `Modality: ${modArg}` : "Modality: all",
             ],
             sources: ["https://openneuro.org/", "https://docs.openneuro.org/api.html"],
@@ -14283,7 +14960,7 @@ server.registerTool(
           text: renderStructuredResponse({
             summary: `OpenNeuro GraphQL error: ${msg.slice(0, 300)}`,
             keyFields: [
-              keyword ? `Keyword: ${keyword}` : "Keyword: none",
+              ...buildArchiveSearchKeyFields(rawKeyword, searchTerms, { browseLabel: "Keyword: none", queryLabel: "Keyword" }),
               modArg ? `Modality: ${modArg}` : "Modality: all",
             ],
             sources: ["https://openneuro.org/"],
@@ -14299,13 +14976,16 @@ server.registerTool(
         content: [{
           type: "text",
           text: renderStructuredResponse({
-            summary: `No OpenNeuro datasets found${keyword ? ` for keyword '${keyword}'` : ""}${modArg ? ` with modality ${modArg}` : ""}.`,
+            summary: `No OpenNeuro datasets found${rawKeyword ? ` for keyword '${rawKeyword}'` : ""}${modArg ? ` with modality ${modArg}` : ""}.`,
             keyFields: [
-              keyword ? `Keyword: ${keyword}` : "Keyword: none",
+              ...buildArchiveSearchKeyFields(rawKeyword, searchTerms, { browseLabel: "Keyword: none", queryLabel: "Keyword" }),
               modArg ? `Modality: ${modArg}` : "Modality: all",
             ],
             sources: ["https://openneuro.org/datasets"],
-            limitations: ["Valid modalities: MRI, MEG, EEG, PET, iEEG, behavioral."],
+            limitations: [
+              "Valid modalities: MRI, MEG, EEG, PET, iEEG, behavioral.",
+              "If disorder keywords are sparse, retry with modality-only browsing or known study/task names before concluding nothing relevant is available.",
+            ],
           }),
         }],
       };
@@ -14329,9 +15009,9 @@ server.registerTool(
       content: [{
         type: "text",
         text: renderStructuredResponse({
-          summary: `OpenNeuro: ${edges.length} dataset(s)${keyword ? ` matching '${keyword}'` : ""}${modArg ? ` (modality: ${modArg})` : ""}.${hasMore ? " More available via pagination." : ""}`,
+          summary: `OpenNeuro: ${edges.length} dataset(s)${rawKeyword ? ` matching '${rawKeyword}'` : ""}${modArg ? ` (modality: ${modArg})` : ""}.${hasMore ? " More available via pagination." : ""}`,
           keyFields: [
-            keyword ? `Keyword: ${keyword}` : "Keyword: none",
+            ...buildArchiveSearchKeyFields(rawKeyword, searchTerms, { browseLabel: "Keyword: none", queryLabel: "Keyword" }),
             modArg ? `Modality filter: ${modArg}` : "Modality: all",
             `Showing: ${edges.length}`,
             nextCursor ? `Next cursor: ${nextCursor}` : "Next cursor: none",
@@ -14479,7 +15159,7 @@ server.registerTool(
   {
     description:
       "Searches the DANDI Archive for neurophysiology datasets (electrophysiology, optophysiology, behavioral, immunostaining). " +
-      "DANDI hosts NWB/BIDS-format data from the BRAIN Initiative. Use search terms like 'electrophysiology', 'hippocampus', 'calcium imaging', 'spike', or topic keywords. " +
+      "DANDI hosts NWB/BIDS-format data from the BRAIN Initiative. Use simple search terms like 'electrophysiology', 'hippocampus', 'calcium imaging', 'spike', or topic keywords rather than boolean strings. " +
       "Returns dandiset identifiers, names, asset counts, sizes, and embargo status. Use get_dandi_dataset with an identifier for full metadata.",
     inputSchema: {
       query: z.string().optional().describe("Search term (e.g. 'electrophysiology', 'hippocampus', 'calcium'). Omit to list recent dandisets."),
@@ -14488,25 +15168,40 @@ server.registerTool(
   },
   async ({ query, maxResults }) => {
     const limit = Math.min(Math.max(1, maxResults || 20), 50);
-    const params = new URLSearchParams({ page_size: String(limit), page: "1" });
-    if (normalizeWhitespace(query)) params.set("search", normalizeWhitespace(query));
+    const rawQuery = normalizeWhitespace(query || "");
+    const searchTerms = splitArchiveSearchTerms(rawQuery);
+    const queriesToRun = rawQuery ? searchTerms : [""];
+    const results = [];
+    const seen = new Set();
+    const totals = [];
 
-    const url = `${DANDI_API}/dandisets/?${params.toString()}`;
-
-    let data;
     try {
-      data = await fetchJsonWithRetry(url, {
-        retries: 1,
-        timeoutMs: 15000,
-        headers: { Accept: "application/json" },
-      });
+      for (const term of queriesToRun) {
+        const params = new URLSearchParams({ page_size: String(limit), page: "1" });
+        if (term) params.set("search", term);
+        const url = `${DANDI_API}/dandisets/?${params.toString()}`;
+        const data = await fetchJsonWithRetry(url, {
+          retries: 1,
+          timeoutMs: 15000,
+          headers: { Accept: "application/json" },
+        });
+        totals.push(Number(data?.count ?? 0));
+        for (const item of data?.results || []) {
+          const ident = normalizeWhitespace(item?.identifier || "");
+          if (!ident || seen.has(ident)) continue;
+          seen.add(ident);
+          results.push(item);
+          if (results.length >= limit) break;
+        }
+        if (results.length >= limit) break;
+      }
     } catch (error) {
       return {
         content: [{
           type: "text",
           text: renderStructuredResponse({
             summary: `DANDI search failed: ${compactErrorMessage(error?.message || "unknown error", 220)}.`,
-            keyFields: [query ? `Query: ${query}` : "Query: (none)"],
+            keyFields: buildArchiveSearchKeyFields(rawQuery, searchTerms, { browseLabel: "Query: (none)" }),
             sources: ["https://dandiarchive.org/", "https://api.dandiarchive.org/"],
             limitations: ["DANDI API may be temporarily unavailable."],
           }),
@@ -14514,18 +15209,20 @@ server.registerTool(
       };
     }
 
-    const results = data?.results || [];
-    const total = Number(data?.count ?? 0);
+    const total = totals.length <= 1 ? (totals[0] || 0) : null;
 
     if (results.length === 0) {
       return {
         content: [{
           type: "text",
           text: renderStructuredResponse({
-            summary: `No DANDI dandisets found${query ? ` for "${query}"` : ""}.`,
-            keyFields: [query ? `Query: ${query}` : "Query: (none)"],
+            summary: `No DANDI dandisets found${rawQuery ? ` for "${rawQuery}"` : ""}.`,
+            keyFields: buildArchiveSearchKeyFields(rawQuery, searchTerms, { browseLabel: "Query: (none)" }),
             sources: ["https://dandiarchive.org/dandisets/"],
-            limitations: ["Try broader search terms or omit the query to browse all dandisets."],
+            limitations: [
+              "Try broader search terms or omit the query to browse all dandisets.",
+              "Disease labels can be sparse; a modality, task, or study-name search may work better than a disorder phrase.",
+            ],
           }),
         }],
       };
@@ -14551,15 +15248,15 @@ server.registerTool(
       content: [{
         type: "text",
         text: renderStructuredResponse({
-          summary: `DANDI: ${results.length} dandiset(s)${query ? ` matching "${query}"` : ""}. Total in archive: ${total}.`,
+          summary: `DANDI: ${results.length} dandiset(s)${rawQuery ? ` matching "${rawQuery}"` : ""}.${total !== null ? ` Total in archive: ${total}.` : ` Aggregated across ${searchTerms.length} parsed search term(s).`}`,
           keyFields: [
-            query ? `Search: ${query}` : "Browse: recent dandisets",
-            `Total: ${total}`,
+            ...buildArchiveSearchKeyFields(rawQuery, searchTerms, { browseLabel: "Browse: recent dandisets", queryLabel: "Search" }),
+            ...(total !== null ? [`Total: ${total}`] : [`Showing unique results: ${results.length}`]),
             "\nResults:",
             ...lines,
           ],
           sources: [
-            query ? `https://dandiarchive.org/dandisets/?search=${encodeURIComponent(query)}` : "https://dandiarchive.org/dandisets/",
+            rawQuery ? `https://dandiarchive.org/dandisets/?search=${encodeURIComponent(rawQuery)}` : "https://dandiarchive.org/dandisets/",
             "https://dandiarchive.org/",
           ],
           limitations: [

@@ -17,3 +17,11 @@ def test_iter_active_source_precedence_rules_filters_to_present_tools():
 def test_iter_active_source_precedence_rules_ignores_single_tool_overlap_groups():
     active = tool_registry.iter_active_source_precedence_rules(["search_pubmed", "get_clinical_trial"])
     assert active == []
+
+
+def test_iter_active_source_precedence_rules_includes_neuroscience_dataset_discovery():
+    active = tool_registry.iter_active_source_precedence_rules(
+        ["search_openneuro_datasets", "search_nemar_datasets", "get_openneuro_dataset"]
+    )
+    topics = [rule["topic"] for rule in active]
+    assert "Neuroscience dataset discovery" in topics

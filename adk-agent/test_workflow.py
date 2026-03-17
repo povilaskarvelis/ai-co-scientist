@@ -776,6 +776,19 @@ def test_prioritize_tools_for_step_prefers_hint_then_fallbacks():
     assert ordered[2] == "search_drug_gene_interactions"
 
 
+def test_format_source_precedence_rules_mentions_neuroscience_dataset_discovery():
+    text = workflow._format_source_precedence_rules([
+        "search_openneuro_datasets",
+        "search_nemar_datasets",
+        "search_dandi_datasets",
+        "search_braincode_datasets",
+    ])
+    assert "Neuroscience dataset discovery" in text
+    assert "`search_nemar_datasets`" in text
+    assert "`search_openneuro_datasets`" in text
+    assert "Avoid boolean strings like `A OR B`" in text
+
+
 def test_react_step_context_instructions_include_routing_guidance():
     task_state = {
         "objective": "Assess TP53 interactions",

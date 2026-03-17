@@ -51,6 +51,9 @@ TOOL_DOMAINS: dict[str, list[str]] = {
         "get_gdsc_drug_sensitivity", "get_prism_repurposing_response",
         "get_pharmacodb_compound_response",
     ],
+    "immunology": [
+        "search_iedb_epitope_evidence",
+    ],
     "neuroscience": [
         "search_aba_genes", "search_aba_structures",
         "get_aba_gene_expression", "search_aba_differential_expression",
@@ -88,6 +91,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "search_pubmed_advanced": "Advanced PubMed search with field-specific queries (MeSH, author, journal)",
     "get_pubmed_abstract": "Fetch full abstract for a PMID",
     "get_paper_fulltext": "Fetch PMC full text when available using a PMID, PMCID, or DOI",
+    "search_iedb_epitope_evidence": "Search IEDB for epitope, T-cell, and MHC ligand evidence using peptide, antigen, and allele filters",
     "search_geo_datasets": "Search GEO (Gene Expression Omnibus) for transcriptomics and functional genomics records by disease, gene, perturbation, tissue, or accession. Returns GSE/GSM/GPL/GDS accessions for follow-up",
     "get_geo_dataset": "Get detailed GEO metadata for a specific accession or GEO UID, including organism, study type, sample count, PubMed links, and summary text",
     "search_openalex_works": "Search OpenAlex for papers, preprints, and citations (returns DOIs)",
@@ -132,13 +136,13 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "search_conp_datasets": "Search CONP dataset repositories by modality/method keywords (e.g. 'EEG', 'fMRI', 'MRI') or study names - NOT disease names. Disease queries rarely match; use broad neuroscience terms instead",
     "get_conp_dataset_details": "Get detailed metadata (README, license, topics) for a specific CONP dataset repository returned by search_conp_datasets",
     "query_neurobagel_cohorts": "Query Neurobagel public cohorts by age, sex, and imaging modality. Start broad (no filters = browse all). Avoid diagnosis filters - most public datasets lack annotations. Use image_modal as nidm:term (e.g. nidm:T1Weighted, nidm:Electroencephalography)",
-    "search_openneuro_datasets": "Search OpenNeuro public datasets by keyword and/or modality. For disorder questions, start with keywords like schizophrenia, psychosis, or first-episode psychosis, then narrow by modality. Omit modality to browse all. If more pages exist, keep paginating; do not stop at the first 50 results. Returns dataset IDs and pagination info for get_openneuro_dataset",
+    "search_openneuro_datasets": "Search OpenNeuro public datasets by keyword and/or modality. Use simple keywords rather than boolean strings like 'A OR B'; if disorder labels are sparse, browse by modality and inspect metadata. Omit modality to browse all. If more pages exist, keep paginating; do not stop at the first 50 results. Returns dataset IDs and pagination info for get_openneuro_dataset",
     "get_openneuro_dataset": "Get detailed OpenNeuro metadata by dataset ID (e.g. ds000224), including DOI, modalities, diagnosis/study fields when present, and approximate subject counts from the public summary",
-    "search_dandi_datasets": "Search DANDI Archive neurophysiology datasets (electrophysiology, calcium imaging, behavioral). Use keywords like 'hippocampus', 'electrophysiology'. Omit query to browse recent dandisets",
+    "search_dandi_datasets": "Search DANDI Archive neurophysiology datasets (electrophysiology, calcium imaging, behavioral). Use simple keywords like 'hippocampus', 'electrophysiology', or a known study/task name rather than boolean strings. Omit query to browse recent dandisets",
     "get_dandi_dataset": "Get detailed metadata (name, version, assets, size, embargo) for a DANDI dandiset by identifier (e.g. 000003)",
-    "search_nemar_datasets": "Search NEMAR EEG/MEG/iEEG datasets (nemarDatasets GitHub org). Use 'EEG', 'MEG', 'iEEG', 'resting state', 'visual'. Omit query to browse. BIDS data from OpenNeuro at SDSC",
+    "search_nemar_datasets": "Search NEMAR EEG/MEG/iEEG datasets (nemarDatasets GitHub org). Use simple keywords or modality terms like 'EEG', 'MEG', 'iEEG', 'resting state', 'visual'. Omit query to browse. BIDS data from OpenNeuro at SDSC",
     "get_nemar_dataset_details": "Get detailed metadata for a NEMAR dataset by repo name (e.g. nm000104)",
-    "search_braincode_datasets": "Search Brain-CODE (Ontario Brain Institute) datasets in CONP. Use 'mouse', 'fBIRN', 'NDD', 'epilepsy', or omit to list all. braincode_* repos",
+    "search_braincode_datasets": "Search Brain-CODE (Ontario Brain Institute) datasets in CONP. Use simple keywords like 'mouse', 'fBIRN', 'NDD', 'epilepsy', or omit to list all; the CONP mirror is sparse, so browse all if disease keywords fail. braincode_* repos",
     "get_braincode_dataset_details": "Get detailed metadata for a Brain-CODE dataset by repo name (e.g. braincode_Mouse_Image)",
     "search_enigma_datasets": "Search ENIGMA Consortium case-control summary stats (cortical thickness, subcortical volume). Use disorder: schizophrenia, depression, ADHD, bipolar, OCD, autism, epilepsy, Parkinson, 22q",
     "get_enigma_dataset_info": "List ENIGMA summary statistic files for a disorder (e.g. scz, mdd, adhd, 22q, bd, asd). Returns filenames and raw CSV URLs",
@@ -161,6 +165,10 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
         "overlap_group": "literature_search",
         "preferred_for": "broader citation graph context, institution/researcher discovery, and non-PubMed coverage",
         "fallback_tools": ["search_pubmed", "search_europe_pmc_literature"],
+    },
+    "search_iedb_epitope_evidence": {
+        "preferred_for": "direct IEDB epitope, T-cell, and MHC ligand evidence when peptide sequence, antigen, or allele filters are available",
+        "fallback_tools": ["get_paper_fulltext", "search_pubmed"],
     },
     "search_reactome_pathways": {
         "overlap_group": "pathway_context",
@@ -307,6 +315,31 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
         "preferred_for": "model-organism evidence, ortholog context, and Alliance-wide translational summaries for a gene",
         "fallback_tools": ["get_clingen_gene_curation", "query_monarch_associations", "get_orphanet_disease_profile"],
     },
+    "search_openneuro_datasets": {
+        "overlap_group": "neuroscience_dataset_discovery",
+        "preferred_for": "public BIDS neuroimaging discovery when modality filters, dataset metadata, and OpenNeuro dataset IDs matter",
+        "fallback_tools": ["search_nemar_datasets", "search_dandi_datasets", "search_braincode_datasets", "search_conp_datasets"],
+    },
+    "search_nemar_datasets": {
+        "overlap_group": "neuroscience_dataset_discovery",
+        "preferred_for": "EEG/MEG/iEEG dataset discovery, especially BIDS electrophysiology and epilepsy-related public archive search",
+        "fallback_tools": ["search_openneuro_datasets", "search_dandi_datasets", "search_braincode_datasets", "search_conp_datasets"],
+    },
+    "search_dandi_datasets": {
+        "overlap_group": "neuroscience_dataset_discovery",
+        "preferred_for": "NWB/BIDS neurophysiology discovery when the signal is more about task, assay, or neurophysiology modality than a disease label",
+        "fallback_tools": ["search_openneuro_datasets", "search_nemar_datasets", "search_braincode_datasets", "search_conp_datasets"],
+    },
+    "search_braincode_datasets": {
+        "overlap_group": "neuroscience_dataset_discovery",
+        "preferred_for": "Brain-CODE public-release discovery through the CONP mirror when Ontario Brain Institute datasets or Brain-CODE-specific releases are requested",
+        "fallback_tools": ["search_conp_datasets", "search_openneuro_datasets", "search_nemar_datasets", "search_dandi_datasets"],
+    },
+    "search_conp_datasets": {
+        "overlap_group": "neuroscience_dataset_discovery",
+        "preferred_for": "broader CONP repository discovery by modality, method, or study name when disease labels are sparse or archive-specific search is too narrow",
+        "fallback_tools": ["search_braincode_datasets", "search_openneuro_datasets", "search_nemar_datasets", "search_dandi_datasets"],
+    },
 }
 
 SOURCE_PRECEDENCE_RULES: list[dict[str, Any]] = [
@@ -341,9 +374,19 @@ SOURCE_PRECEDENCE_RULES: list[dict[str, Any]] = [
         "summary": "When only gene symbol is known: use `search_variants_by_gene` (or `search_civic_variants` for cancer genes) to discover variants, then `get_variant_annotations` or `annotate_variants_vep`. Variant-level tools require rsID or HGVS—not gene symbols.",
     },
     {
+        "topic": "Epitope evidence discovery",
+        "tools": ["search_iedb_epitope_evidence", "search_pubmed", "get_paper_fulltext"],
+        "summary": "Use `search_iedb_epitope_evidence` for direct IEDB epitope, T-cell, and MHC ligand evidence when you have a peptide, antigen, or allele filter. Use `search_pubmed` and `get_paper_fulltext` first when you need to recover the exact peptide sequence, assay context, or mutation-specific details before querying IEDB.",
+    },
+    {
         "topic": "Expression context",
         "tools": ["get_gene_tissue_expression", "get_human_protein_atlas_gene", "search_cellxgene_datasets"],
         "summary": "Use `get_gene_tissue_expression` for bulk tissue RNA, `get_human_protein_atlas_gene` for protein localization and atlas summaries, and `search_cellxgene_datasets` when the task is finding relevant single-cell datasets rather than returning expression values directly.",
+    },
+    {
+        "topic": "Neuroscience dataset discovery",
+        "tools": ["search_openneuro_datasets", "search_nemar_datasets", "search_dandi_datasets", "search_braincode_datasets", "search_conp_datasets"],
+        "summary": "Use `search_nemar_datasets` first for EEG/MEG/iEEG and epilepsy-oriented BIDS archive discovery, `search_openneuro_datasets` for public BIDS neuroimaging with modality filters, `search_dandi_datasets` for NWB/BIDS neurophysiology, and `search_braincode_datasets` or `search_conp_datasets` for Brain-CODE or broader CONP mirrors. Avoid boolean strings like `A OR B`; use one clean keyword or study name at a time, and if disease labels are sparse, fall back to modality/task browsing before concluding no public dataset exists.",
     },
     {
         "topic": "Functional screening vs drug response",
@@ -376,7 +419,7 @@ TOOL_SOURCE_NAMES: dict[str, str] = {
     "gnomad": "gnomAD",
     "human_genome_variants": "Human Genome Variants",
     "human_variant_annotation": "ClinVar (BigQuery)",
-    "immune_epitope_db": "IEDB",
+    "search_iedb_epitope_evidence": "IEDB",
     "nlm_rxnorm": "RxNorm",
     "fda_drug": "FDA Drug (BigQuery)",
     "umiami_lincs": "LINCS L1000",
