@@ -376,7 +376,281 @@ function normalizeStructuredPayload(toolName, { status, summary, combinedText, c
   return normalizedPayload;
 }
 
-function normalizeToolResponseEnvelope(toolName, rawResult) {
+function asFiniteCount(value) {
+  if (value === null || value === undefined || value === "") {
+    return null;
+  }
+  const numeric = Number(String(value).replace(/,/g, ""));
+  if (!Number.isFinite(numeric) || numeric < 0) {
+    return null;
+  }
+  return Math.trunc(numeric);
+}
+
+function firstFiniteCount(...values) {
+  for (const value of values) {
+    const numeric = asFiniteCount(value);
+    if (numeric !== null) {
+      return numeric;
+    }
+  }
+  return null;
+}
+
+function extractArrayLengthFromKeys(obj, keys = []) {
+  if (!obj || typeof obj !== "object") {
+    return null;
+  }
+  for (const key of keys) {
+    if (Array.isArray(obj[key])) {
+      return obj[key].length;
+    }
+  }
+  return null;
+}
+
+function inferResultMode(toolName) {
+  if (toolName.startsWith("search_")) {
+    return "search";
+  }
+  if (toolName.startsWith("list_")) {
+    return "list";
+  }
+  if (toolName.startsWith("summarize_") || toolName.startsWith("rank_")) {
+    return "summary";
+  }
+  if (toolName.startsWith("get_")) {
+    return "detail";
+  }
+  return "other";
+}
+
+function inferResultItemLabel(toolName) {
+  const explicit = {
+    search_clinical_trials: "clinical trials",
+    summarize_clinical_trials_landscape: "studies",
+    get_clinical_trial: "clinical trials",
+    search_pubmed: "articles",
+    search_pubmed_advanced: "articles",
+    search_openalex_works: "articles",
+    search_europe_pmc_literature: "articles",
+    search_geo_datasets: "records",
+    search_openneuro_datasets: "datasets",
+    search_dandi_datasets: "datasets",
+    search_nemar_datasets: "datasets",
+    search_conp_datasets: "datasets",
+    search_braincode_datasets: "datasets",
+    search_enigma_datasets: "datasets",
+    search_cellxgene_datasets: "datasets",
+    search_drug_gene_interactions: "drug-gene interaction records",
+    search_gwas_associations: "associations",
+    search_hpo_terms: "phenotype terms",
+    search_quickgo_terms: "terms",
+    map_ontology_terms_oxo: "mappings",
+    search_variants_by_gene: "variants",
+    search_civic_variants: "variants",
+    search_protein_structures: "structures",
+  };
+  return explicit[toolName] || "records";
+}
+
+function buildResultQueryScope(requestArgs) {
+  if (!requestArgs || typeof requestArgs !== "object" || Array.isArray(requestArgs)) {
+    return null;
+  }
+  const scope = {};
+  for (const key of [
+    "query",
+    "gene",
+    "genes",
+    "disease",
+    "compound",
+    "drugName",
+    "variantId",
+    "status",
+    "entryType",
+    "sort",
+    "minDate",
+    "maxDate",
+  ]) {
+    if (!(key in requestArgs)) {
+      continue;
+    }
+    const rawValue = requestArgs[key];
+    if (rawValue === null || rawValue === undefined || rawValue === "") {
+      continue;
+    }
+    if (Array.isArray(rawValue)) {
+      const items = rawValue.slice(0, 8).map((item) => normalizeWhitespace(String(item || ""))).filter(Boolean);
+      if (items.length > 0) {
+        scope[key] = items;
+      }
+      continue;
+    }
+    const scalar = normalizeWhitespace(String(rawValue));
+    if (scalar) {
+      scope[key] = scalar;
+    }
+  }
+  return Object.keys(scope).length > 0 ? scope : null;
+}
+
+function inferResultMetaFromText(text) {
+  const cleaned = normalizeWhitespace(text || "");
+  if (!cleaned) {
+    return {};
+  }
+
+  const meta = {};
+
+  let match = cleaned.match(/\bShowing\s+([\d,]+)\s+of\s+([\d,]+)\b/i);
+  if (match) {
+    meta.returned_count = asFiniteCount(match[1]);
+    meta.reported_total = asFiniteCount(match[2]);
+    if (meta.returned_count !== null && meta.reported_total !== null) {
+      meta.has_more = meta.reported_total > meta.returned_count;
+    }
+    return meta;
+  }
+
+  match = cleaned.match(/\bFound\s+([\d,]+)\b[^.]*\(\s*showing\s+top\s+([\d,]+)\s*\)/i)
+    || cleaned.match(/\bFound\s+([\d,]+)\b[^.]*\(\s*showing\s+([\d,]+)(?:[^)]*)\)/i)
+    || cleaned.match(/\b([\d,]+)\s+record\(s\)\b[^.]*\bShowing\s+top\s+([\d,]+)/i);
+  if (match) {
+    meta.reported_total = asFiniteCount(match[1]);
+    meta.returned_count = asFiniteCount(match[2]);
+    if (meta.returned_count !== null && meta.reported_total !== null) {
+      meta.has_more = meta.reported_total > meta.returned_count;
+    }
+    return meta;
+  }
+
+  match = cleaned.match(/\b(?:Retrieved|Returned)\s+([\d,]+)\b/i);
+  if (match) {
+    meta.returned_count = asFiniteCount(match[1]);
+  }
+
+  if (meta.returned_count === undefined) {
+    match = cleaned.match(/\bFound\s+([\d,]+)\b/i);
+    if (match) {
+      meta.returned_count = asFiniteCount(match[1]);
+    }
+  }
+
+  match = cleaned.match(/\bTotal\s+(?:matches|interactions|records|results|studies|articles|works|associations|terms):\s*([\d,]+)/i);
+  if (match) {
+    meta.reported_total = asFiniteCount(match[1]);
+  }
+
+  return meta;
+}
+
+function normalizeResultMeta(toolName, { originalStructured, summary, combinedText, requestArgs }) {
+  const existing = originalStructured?.result_meta && typeof originalStructured.result_meta === "object"
+    ? { ...originalStructured.result_meta }
+    : {};
+  const inferred = inferResultMetaFromText(`${summary || ""}\n${combinedText || ""}`);
+  const mode = normalizeWhitespace(existing.mode || inferResultMode(toolName)) || "other";
+  const itemLabel = normalizeWhitespace(existing.item_label || inferResultItemLabel(toolName)) || "records";
+  const returnedCount = firstFiniteCount(
+    existing.returned_count,
+    originalStructured?.returned_count,
+    extractArrayLengthFromKeys(originalStructured, [
+      "records",
+      "results",
+      "articles",
+      "studies",
+      "trials",
+      "associations",
+      "terms",
+      "mappings",
+      "works",
+      "authors",
+      "datasets",
+      "items",
+      "hits",
+    ]),
+    inferred.returned_count,
+  );
+  const reportedTotal = firstFiniteCount(
+    existing.reported_total,
+    originalStructured?.reported_total,
+    originalStructured?.total_count,
+    originalStructured?.totalCount,
+    originalStructured?.total,
+    originalStructured?.count,
+    originalStructured?.totalReported,
+    inferred.reported_total,
+  );
+  const limitApplied = firstFiniteCount(
+    existing.limit_applied,
+    requestArgs?.limit,
+    requestArgs?.maxResults,
+    requestArgs?.maxStudies,
+    requestArgs?.size,
+    requestArgs?.numRows,
+    requestArgs?.maxStructures,
+    requestArgs?.maxRecords,
+    requestArgs?.mappingsPerId,
+  );
+
+  let hasMore = null;
+  if (typeof existing.has_more === "boolean") {
+    hasMore = existing.has_more;
+  } else if (typeof originalStructured?.has_more === "boolean") {
+    hasMore = originalStructured.has_more;
+  } else if (typeof originalStructured?.hasMorePages === "boolean") {
+    hasMore = originalStructured.hasMorePages;
+  } else if (typeof originalStructured?.has_more_pages === "boolean") {
+    hasMore = originalStructured.has_more_pages;
+  } else if (normalizeWhitespace(originalStructured?.nextPageToken || "")) {
+    hasMore = true;
+  } else if (normalizeWhitespace(originalStructured?.next_page_token || "")) {
+    hasMore = true;
+  } else if (typeof inferred.has_more === "boolean") {
+    hasMore = inferred.has_more;
+  } else if (reportedTotal !== null && returnedCount !== null) {
+    hasMore = reportedTotal > returnedCount;
+  }
+
+  let totalRelation = normalizeWhitespace(existing.total_relation || "").toLowerCase();
+  if (!["exact", "lower_bound", "unknown"].includes(totalRelation)) {
+    if (reportedTotal !== null) {
+      totalRelation = "exact";
+    } else if (hasMore === true) {
+      totalRelation = "lower_bound";
+    } else if (limitApplied !== null && returnedCount !== null && returnedCount >= limitApplied && mode !== "detail") {
+      totalRelation = "lower_bound";
+    } else {
+      totalRelation = "unknown";
+    }
+  }
+
+  const resultMeta = {
+    mode,
+    item_label: itemLabel,
+    total_relation: totalRelation,
+  };
+  if (returnedCount !== null) {
+    resultMeta.returned_count = returnedCount;
+  }
+  if (reportedTotal !== null) {
+    resultMeta.reported_total = reportedTotal;
+  }
+  if (hasMore !== null) {
+    resultMeta.has_more = hasMore;
+  }
+  if (limitApplied !== null) {
+    resultMeta.limit_applied = limitApplied;
+  }
+  const queryScope = buildResultQueryScope(requestArgs);
+  if (queryScope) {
+    resultMeta.query_scope = queryScope;
+  }
+  return resultMeta;
+}
+
+function normalizeToolResponseEnvelope(toolName, rawResult, requestArgs) {
   const payload = rawResult && typeof rawResult === "object" ? { ...rawResult } : {};
   const originalContent = Array.isArray(payload.content) ? payload.content : [];
   const normalizedParts = originalContent.map(normalizeTextPart).filter(Boolean);
@@ -402,6 +676,13 @@ function normalizeToolResponseEnvelope(toolName, rawResult) {
     rawPayload: payload,
     originalStructured,
   });
+  const resultMeta = normalizeResultMeta(toolName, {
+    originalStructured: normalizedPayload,
+    summary,
+    combinedText,
+    requestArgs,
+  });
+  normalizedPayload.result_meta = resultMeta;
 
   const structuredContent = {
     envelope_version: STRUCTURED_CONTENT_ENVELOPE_VERSION,
@@ -411,6 +692,7 @@ function normalizeToolResponseEnvelope(toolName, rawResult) {
     text: combinedText,
     content_part_count: safeContent.length,
     emitted_at_utc: new Date().toISOString(),
+    result_meta: resultMeta,
     payload: normalizedPayload,
   };
 
@@ -426,13 +708,13 @@ function wrapToolHandler(toolName, handler) {
   return async (...args) => {
     try {
       const rawResult = await handler(...args);
-      return normalizeToolResponseEnvelope(toolName, rawResult);
+      return normalizeToolResponseEnvelope(toolName, rawResult, args[0]);
     } catch (error) {
       const message = normalizeWhitespace(error?.message || String(error));
       return normalizeToolResponseEnvelope(toolName, {
         isError: true,
         content: [{ type: "text", text: `Error in ${toolName}: ${message}` }],
-      });
+      }, args[0]);
     }
   };
 }
@@ -3625,11 +3907,10 @@ async function resolveOrphanetDisorderSelection(query) {
   };
 }
 
-function scoreMonarchSearchItem(item, query, modeConfig) {
+function scoreMonarchSearchLexicalMatch(item, query) {
   const normalizedQuery = normalizeOntologyCurie(query).toUpperCase();
   const queryText = normalizeOrphanetLookupText(query);
   const itemId = normalizeOntologyCurie(item?.id || "").toUpperCase();
-  const category = normalizeWhitespace(item?.category || "");
   const name = normalizeOrphanetLookupText(item?.name || "");
   const symbol = normalizeWhitespace(item?.symbol || "").toUpperCase();
   const synonyms = [
@@ -3642,7 +3923,6 @@ function scoreMonarchSearchItem(item, query, modeConfig) {
 
   let score = 0;
   if (itemId && itemId === normalizedQuery) score += 320;
-  if (modeConfig?.inputCategories?.includes(category)) score += 120;
   if (symbol && symbol === normalizeWhitespace(query || "").toUpperCase()) score += 150;
   if (name && name === queryText) score += 130;
   if (synonyms.includes(queryText)) score += 95;
@@ -3651,15 +3931,65 @@ function scoreMonarchSearchItem(item, query, modeConfig) {
   return score;
 }
 
+function scoreMonarchSearchItem(item, query, modeConfig) {
+  const category = normalizeWhitespace(item?.category || "");
+  let score = scoreMonarchSearchLexicalMatch(item, query);
+  if (modeConfig?.inputCategories?.includes(category)) score += 120;
+  return score;
+}
+
+function normalizeMonarchTaxonHint(value) {
+  const raw = normalizeWhitespace(value || "");
+  if (!raw) return "";
+  const lower = raw.toLowerCase();
+  if (lower === "9606" || lower === "ncbitaxon:9606" || lower === "homo sapiens") {
+    return "NCBITaxon:9606";
+  }
+  return raw;
+}
+
+function getMonarchSearchItemTaxonHints(item) {
+  return dedupeArray([
+    normalizeMonarchTaxonHint(item?.taxon),
+    normalizeMonarchTaxonHint(item?.taxon_id),
+    normalizeMonarchTaxonHint(item?.in_taxon),
+    normalizeMonarchTaxonHint(item?.taxon_label),
+    normalizeMonarchTaxonHint(item?.in_taxon_label),
+  ].filter(Boolean));
+}
+
+function isMonarchHumanGeneSearchItem(item) {
+  if (normalizeWhitespace(item?.category || "") !== "biolink:Gene") return false;
+  const itemId = normalizeOntologyCurie(item?.id || "").toUpperCase();
+  if (/^HGNC:/.test(itemId)) return true;
+  const taxonHints = getMonarchSearchItemTaxonHints(item);
+  return taxonHints.includes("NCBITaxon:9606");
+}
+
+function scoreMonarchHumanGenePreference(item, modeConfig, humanOnly) {
+  if (!humanOnly) return 0;
+  if (!modeConfig?.inputCategories?.includes("biolink:Gene")) return 0;
+  if (normalizeWhitespace(item?.category || "") !== "biolink:Gene") return 0;
+
+  const itemId = normalizeOntologyCurie(item?.id || "").toUpperCase();
+  if (isMonarchHumanGeneSearchItem(item)) return 220;
+  const taxonHints = getMonarchSearchItemTaxonHints(item);
+  if (/^(XENBASE|MGI|RGD|ZFIN|FB|WB|SGD):/.test(itemId)) return -160;
+  if (taxonHints.some((value) => value && value !== "NCBITaxon:9606")) return -140;
+  if (/^(NCBIGENE|ENSEMBL):/.test(itemId)) return 40;
+  return 0;
+}
+
 async function fetchMonarchEntity(entityId) {
   const url = `${MONARCH_API}/entity/${encodeURIComponent(entityId)}`;
   const record = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 12000, maxBackoffMs: 2500 });
   return { record, url };
 }
 
-async function resolveMonarchEntity(queryOrId, associationMode) {
+async function resolveMonarchEntity(queryOrId, associationMode, options = {}) {
   const normalizedQuery = normalizeWhitespace(queryOrId || "");
   const modeConfig = MONARCH_ASSOCIATION_MODES[associationMode];
+  const humanOnly = options?.humanOnly !== false;
   if (!normalizedQuery) return { selected: null, candidates: [], searchUrl: "", entityUrl: "" };
 
   if (!normalizedQuery.includes(":") && modeConfig?.inputCategories?.includes("biolink:PhenotypicFeature")) {
@@ -3701,11 +4031,33 @@ async function resolveMonarchEntity(queryOrId, associationMode) {
   const searchUrl = `${MONARCH_API}/search?${searchParams.toString()}`;
   const searchData = await fetchJsonWithRetry(searchUrl, { retries: 1, timeoutMs: 12000, maxBackoffMs: 2500 });
   const items = Array.isArray(searchData?.items) ? searchData.items : [];
-  const ranked = [...items]
-    .map((item) => ({ item, score: scoreMonarchSearchItem(item, normalizedQuery, modeConfig) }))
+  let candidateItems = [...items];
+  const categoryMatchedItems = candidateItems.filter((item) =>
+    modeConfig?.inputCategories?.includes(normalizeWhitespace(item?.category || ""))
+  );
+  if (categoryMatchedItems.length > 0) {
+    candidateItems = categoryMatchedItems;
+  }
+  if (humanOnly && modeConfig?.inputCategories?.includes("biolink:Gene")) {
+    const humanGeneItems = candidateItems.filter((item) => isMonarchHumanGeneSearchItem(item));
+    if (humanGeneItems.length > 0) {
+      candidateItems = humanGeneItems;
+    }
+  }
+
+  const ranked = [...candidateItems]
+    .map((item) => ({
+      item,
+      lexicalScore: scoreMonarchSearchLexicalMatch(item, normalizedQuery),
+      score:
+        scoreMonarchSearchItem(item, normalizedQuery, modeConfig)
+        + scoreMonarchHumanGenePreference(item, modeConfig, humanOnly),
+    }))
     .sort((a, b) => b.score - a.score);
   const selectedSearchItem = ranked[0]?.item || null;
-  if (!selectedSearchItem?.id) {
+  const selectedScore = ranked[0]?.score || 0;
+  const selectedLexicalScore = ranked[0]?.lexicalScore || 0;
+  if (!selectedSearchItem?.id || selectedScore <= 0 || selectedLexicalScore <= 0) {
     return {
       selected: null,
       candidates: ranked.slice(0, 5).map(({ item }) => item),
@@ -7209,7 +7561,7 @@ server.registerTool(
     }
 
     try {
-      const resolution = await resolveMonarchEntity(normalizedTarget, associationMode);
+      const resolution = await resolveMonarchEntity(normalizedTarget, associationMode, { humanOnly });
       const selected = resolution?.selected || null;
       if (!selected?.id) {
         const candidates = asArray(resolution?.candidates)

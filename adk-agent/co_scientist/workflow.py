@@ -333,6 +333,7 @@ Rules:
 - Build a concrete execution plan before any evidence collection begins.
 - Break the objective into ordered, atomic subtasks.
 - Prioritize high-signal subtasks that reduce uncertainty first.
+- When the objective is centered on clinical trials, GEO datasets, or oncology target validation, load the matching planning skill before finalizing the step sequence.
 - For archive-style dataset discovery (for example OpenNeuro, NEMAR, DANDI, Brain-CODE, CONP), prefer one archive per step and plan around simple keyword or modality checks rather than compound boolean expressions.
 - When archive metadata is likely sparse, add a fallback browse/inspection step instead of assuming a zero-hit disease keyword search proves absence.
 - Choose the number of steps needed for the objective. Avoid unnecessary fragmentation.
@@ -400,8 +401,10 @@ __ROUTING_POLICY__
 Rules:
 - Focus ONLY on the current step provided in the execution context.
 - You MUST call at least one tool before returning a result.
+- Load a relevant specialized skill when the step depends on citation grounding, clinical-trial heuristics, variant interpretation, GEO dataset triage, or oncology target-validation reasoning.
 - If a tool call fails or returns insufficient data, try an alternative tool or query
   (e.g. search_pubmed <-> search_openalex_works, or fall back to run_bigquery_select_query).
+- For `query_monarch_associations`, use only the supported association modes from the tool schema, and pass a normalized `entityId` CURIE when you already resolved the gene, disease, or phenotype.
 - For archive/search tools that do literal metadata matching (for example OpenNeuro, DANDI, NEMAR, Brain-CODE, CONP), avoid boolean query strings like `A OR B` unless the tool explicitly supports them; run separate simple searches instead.
 - For dataset archives with sparse disorder labels, a zero-hit disease query is not enough to conclude the archive has no relevant data; retry with modality, task, study name, or archive browsing before blocking the step.
 - If no tool can satisfy the step after trying alternatives, state clearly that the step is BLOCKED and why.
@@ -432,6 +435,9 @@ After completing your tool calls, write a clear findings summary. Your summary s
 - Include all evidence identifiers inline (PMID, DOI, NCT, UniProt, etc.)
 - Explicitly describe key claims as atomic statements (e.g. "LRRK2 is associated with Parkinson disease
   with an overall association score of 0.815 per Open Targets Platform")
+- For result-limited or paginated search tools, treat the number returned by the tool as a retrieval count, not as the full source count, unless the tool explicitly reports a source total. Prefer wording like "returned", "showing", or "sample of X" over "there are X" when the universe total is unknown.
+- For DGIdb, Guide to Pharmacology, or ChEMBL evidence, do not stop at interaction counts. Name representative compounds and include interaction type, approval/experimental status, potency/score, or PMIDs when available.
+- For ClinicalTrials.gov evidence, do not stop at study counts. Include representative NCT IDs, named interventions, statuses, phases, and note when counts reflect only fetched studies rather than the full registry.
 - Note any contradictions, gaps, or limitations discovered
 - State whether this step is COMPLETED or BLOCKED (and why if blocked)
 - Do NOT embed raw tool response envelopes or large payload objects; summarize tool results in
@@ -457,6 +463,8 @@ A direct, synthesized answer to the research question written as a comprehensive
 ## Evidence Breakdown
 Within this section, organize findings by THEME (use ### subsections with descriptive headings, e.g. "### Human Genetics Support" not "### Step 1"). Write each subsection as information-dense prose with inline evidence citations:
 - State the finding clearly, then provide the supporting data with source names and identifiers (PMID, DOI, NCT, UniProt, etc.) inline.
+- Attach citations to the smallest sensible claim unit. Do not end a long paragraph with one bulk citation dump if the sources support different claims or different named datasets.
+- When naming multiple datasets, trials, variants, or papers in one sentence or paragraph, connect each named item to its own supporting citation when available.
 - Within each theme subsection, write 1-3 connected paragraphs with a clear topic sentence, supporting detail, and brief interpretation of what the combined evidence means.
 - Include specific numbers, scores, measurements, and identifiers rather than vague summaries.
 - Note the confidence level (high, moderate, low, or mixed) and number of independent sources.
@@ -493,8 +501,15 @@ Rules:
 - Be specific and thorough — avoid terse output.
 - NEVER organize findings by step execution order. Group by theme/topic.
 - Use ONLY human-readable database/source names (e.g. "PubMed", "ClinicalTrials.gov"). NEVER mention tool names (like run_bigquery_select_query, search_clinical_trials, etc.).
+- Never reproduce raw ontology predicates or internal mode names such as `biolink:...`, `predicate: ...`, `disease_to_gene_causal`, or `disease_to_gene_correlated`. Translate them into plain English or omit them if they do not help the reader.
 - When citing database counts (e.g. clinical trials, PubMed results): use the total reported by the source when available (e.g. "X of Y total"). If the source says "total not provided" or "more may exist" or "X returned (registry total unknown)", do NOT state "a total of X" or "X total studies" — instead say "at least X" or "X studies (sample; full registry count not determined)".
+- For result-limited search tools more generally, treat raw returned counts as retrieval counts, not universe counts. Unless the source explicitly reports a total, phrase them as "X returned", "X shown", or "sample of X fetched records", and avoid using those counts as primary evidence of breadth or validation.
+- Do not use DGIdb or ClinicalTrials.gov count-only statements as standalone evidence when richer detail was collected. If named compounds or trials are available, include representative compounds, interaction types, approval/experimental status, NCT IDs, interventions, phases, or statuses instead of only reporting totals.
+- For DGIdb specifically, interaction counts are contextual catalog metadata, not target-validation evidence by themselves. Prefer named compounds, interaction types, and supporting PMIDs over raw interaction totals.
+- For ClinicalTrials.gov specifically, make clear when study counts reflect fetched subsets, paginated samples, or query-limited matches rather than the entire registry or only direct target-modulating intervention trials.
 - Include specific identifiers inline when available (PMID, DOI, NCT numbers).
+- Use APA-style author-year citations for literature references in prose when paper metadata is available; keep trial and database identifiers inline as linked identifiers rather than moving them into paper-style parenthetical citations.
+- Prefer claim-local citations over paragraph-end citation bundles. If a sentence contains several distinct findings, place citations immediately after the supported clause or item.
 - For database records, include identifiers with their canonical prefix so they can be linked: UniProt:P00533, PubChem:2244, PDB:1ABC, rs7903146, CHEMBL25, Reactome:R-HSA-1234567, GCST000001.
 - NEVER include raw URLs, API endpoints, or links to JSON output.
 - Return user-facing Markdown only (not JSON).
@@ -597,6 +612,7 @@ You can:
 
 Guidelines:
 - Ground your answers in the report content and any new tool results.
+- Load a relevant follow-up skill when the request is mainly about citation recovery, trial clarification, variant interpretation, GEO datasets, or oncology target-validation nuance.
 - Maintain the report's citation style when referencing sources.
 - When restructuring, preserve all evidence and citations — don't drop content unless asked.
 - If the user's request requires a comprehensive multi-step investigation (new hypothesis, full
@@ -885,7 +901,17 @@ def _describe_tool_call(name: str, args: dict[str, Any]) -> str:
 
     # --- Genetic associations ---
     if name == "query_monarch_associations":
-        return f"Querying gene-phenotype associations for {query}" if query else "Searching Monarch Initiative"
+        association_mode = str(args.get("associationMode", "") or "").strip()
+        target = str(args.get("entityId", "") or query).strip()
+        mode_labels = {
+            "disease_to_phenotype": "disease-to-phenotype associations",
+            "phenotype_to_gene": "phenotype-to-gene associations",
+            "disease_to_gene_causal": "disease-to-gene causal associations",
+            "disease_to_gene_correlated": "disease-to-gene correlated associations",
+            "gene_to_phenotype": "gene-to-phenotype associations",
+        }
+        label = mode_labels.get(association_mode, "Monarch associations")
+        return f"Querying {label} for {target}" if target else "Searching Monarch Initiative"
     if name == "search_civic_variants":
         return f"Searching clinical variant evidence for {query}" if query else "Querying CIViC variants"
     if name == "search_civic_genes":
@@ -912,13 +938,27 @@ def _describe_tool_result(name: str, response: Any) -> str:
     if err:
         return f"Error in {name}: {str(err)[:400]}"
 
+    result_meta = _extract_mcp_result_meta(response)
+
     # MCP tools put text in content[0].text; the format is typically:
     #   "Summary:\n{actual summary}\n\nKey Fields:\n..."
     # Extract the real summary from the second line, or the first non-label line.
     mcp_text = _extract_mcp_text(response)
     if mcp_text:
+        if name == "search_drug_gene_interactions":
+            rich_summary = _extract_dgidb_mcp_summary(mcp_text)
+            if rich_summary:
+                return _truncate_summary(rich_summary, max_chars=500)
+        if name in ("search_clinical_trials", "summarize_clinical_trials_landscape", "get_clinical_trial"):
+            rich_summary = _extract_clinical_trials_mcp_summary(name, mcp_text)
+            if rich_summary:
+                return _truncate_summary(rich_summary, max_chars=500)
+        meta_summary = _summarize_mcp_result_meta(result_meta)
+        if meta_summary:
+            return _truncate_summary(meta_summary, max_chars=500)
         summary_line = _extract_mcp_summary_line(mcp_text)
         if summary_line:
+            summary_line = _qualify_search_mcp_summary_line(name, summary_line)
             # Long-output tools: literature (incl. query in result), clinical trials, abstracts
             long_output_tools = (
                 "get_aba_gene_expression",
@@ -941,6 +981,74 @@ def _describe_tool_result(name: str, response: Any) -> str:
 
 
 _MCP_SECTION_LABELS = {"summary:", "key fields:", "sources:", "limitations:", "notes:"}
+
+
+def _qualify_search_mcp_summary_line(name: str, summary_line: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(summary_line or "").strip())
+    if not cleaned:
+        return ""
+
+    if re.search(r"\bshowing\b", cleaned, flags=re.IGNORECASE):
+        return re.sub(r"^Found\s+([0-9][0-9,]*)\s+", r"Source reported \1 ", cleaned, flags=re.IGNORECASE)
+
+    if name.startswith("search_"):
+        return re.sub(r"^Found\s+([0-9][0-9,]*)\s+", r"Returned \1 ", cleaned, flags=re.IGNORECASE)
+
+    return cleaned
+
+
+def _extract_mcp_result_meta(response: dict[str, Any]) -> dict[str, Any] | None:
+    sc = response.get("structuredContent")
+    if not isinstance(sc, dict):
+        return None
+    direct = sc.get("result_meta")
+    if isinstance(direct, dict):
+        return direct
+    payload = sc.get("payload")
+    if isinstance(payload, dict):
+        nested = payload.get("result_meta")
+        if isinstance(nested, dict):
+            return nested
+    return None
+
+
+def _coerce_result_meta_count(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return max(0, int(str(value).replace(",", "").strip()))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _summarize_mcp_result_meta(meta: dict[str, Any] | None) -> str:
+    if not isinstance(meta, dict):
+        return ""
+    mode = str(meta.get("mode", "") or "").strip().lower()
+    if mode not in {"search", "list", "summary"}:
+        return ""
+
+    item_label = str(meta.get("item_label", "") or "records").strip()
+    returned_count = _coerce_result_meta_count(meta.get("returned_count"))
+    reported_total = _coerce_result_meta_count(meta.get("reported_total"))
+    total_relation = str(meta.get("total_relation", "") or "").strip().lower()
+    has_more = meta.get("has_more")
+    if isinstance(has_more, str):
+        has_more = has_more.strip().lower() in {"1", "true", "yes"}
+    elif not isinstance(has_more, bool):
+        has_more = None
+
+    if reported_total is not None:
+        if returned_count is not None and returned_count != reported_total:
+            return f"returned {returned_count} {item_label} (source reported {reported_total} total matches)"
+        return f"source reported {reported_total} {item_label}"
+
+    if returned_count is not None:
+        if has_more is True or total_relation == "lower_bound":
+            return f"returned {returned_count} {item_label} (more may exist beyond current limit)"
+        return f"returned {returned_count} {item_label}"
+
+    return ""
 
 
 def _extract_mcp_text(response: dict[str, Any]) -> str:
@@ -1007,6 +1115,23 @@ def _extract_result_summary(name: str, response: dict[str, Any]) -> str:
     """Extract a meaningful 1-line summary from tool response data."""
     source = tool_registry.TOOL_SOURCE_NAMES.get(name, name)
 
+    def _count_summary(
+        item_label: str,
+        *,
+        returned_count: int | float | None = None,
+        source_total: int | float | None = None,
+    ) -> str:
+        if source_total is not None:
+            total_value = int(source_total)
+            if returned_count is not None:
+                returned_value = int(returned_count)
+                if returned_value != total_value:
+                    return f"returned {returned_value} {item_label} (source reported {total_value} total matches)"
+            return f"source reported {total_value} {item_label}"
+        if returned_count is not None:
+            return f"returned {int(returned_count)} {item_label}"
+        return ""
+
     # Gene resolver: extract symbol, Ensembl ID
     if name == "resolve_gene_identifiers":
         symbol = response.get("symbol") or response.get("query") or ""
@@ -1039,25 +1164,25 @@ def _extract_result_summary(name: str, response: dict[str, Any]) -> str:
     # Clinical trials
     if name in ("search_clinical_trials", "summarize_clinical_trials_landscape"):
         studies = response.get("studies") or response.get("results") or response.get("trials")
-        if isinstance(studies, list):
-            return f"found {len(studies)} clinical trials"
         count = response.get("totalCount") or response.get("count") or response.get("total")
+        if isinstance(studies, list):
+            return _count_summary("clinical trials", returned_count=len(studies), source_total=count)
         if count is not None:
-            return f"found {count} clinical trials"
+            return _count_summary("clinical trials", source_total=count)
 
     # PubMed / literature search
     if name in ("search_pubmed", "search_pubmed_advanced", "search_openalex_works",
                 "search_europe_pmc_literature"):
         articles = response.get("results") or response.get("articles") or response.get("papers")
-        if isinstance(articles, list):
-            return f"found {len(articles)} articles"
         count = response.get("count") or response.get("total") or response.get("totalResults")
+        if isinstance(articles, list):
+            return _count_summary("articles", returned_count=len(articles), source_total=count)
         if count is not None:
-            return f"found {count} articles"
+            return _count_summary("articles", source_total=count)
     if name == "search_iedb_epitope_evidence":
         records = response.get("records")
         if isinstance(records, list):
-            return f"found {len(records)} IEDB evidence records"
+            return _count_summary("IEDB evidence records", returned_count=len(records))
         endpoint_counts = response.get("endpoint_counts")
         if isinstance(endpoint_counts, dict):
             total = 0
@@ -1065,47 +1190,149 @@ def _extract_result_summary(name: str, response: dict[str, Any]) -> str:
                 if isinstance(meta, dict):
                     total += int(meta.get("retrieved") or 0)
             if total > 0:
-                return f"found {total} IEDB endpoint hits"
+                return _count_summary("IEDB endpoint hits", returned_count=total)
 
     # GWAS
     if name == "search_gwas_associations":
         assocs = response.get("associations") or response.get("results")
+        count = response.get("count") or response.get("total") or response.get("totalCount")
         if isinstance(assocs, list):
-            return f"found {len(assocs)} associations"
+            return _count_summary("associations", returned_count=len(assocs), source_total=count)
+        if count is not None:
+            return _count_summary("associations", source_total=count)
 
     # HPO / ontology
     if name == "search_hpo_terms":
         terms = response.get("terms") or response.get("results")
         if isinstance(terms, list):
-            return f"found {len(terms)} phenotype terms"
+            return _count_summary("phenotype terms", returned_count=len(terms))
 
     # Drug interactions
     if name == "search_drug_gene_interactions":
         interactions = response.get("matchedTerms") or response.get("interactions") or response.get("results")
         if isinstance(interactions, list):
-            return f"found {len(interactions)} drug-gene interactions"
+            return _count_summary("drug-gene interactions", returned_count=len(interactions))
 
     # FDA adverse events
     if name == "search_fda_adverse_events":
         events = response.get("results") or response.get("events")
         if isinstance(events, list):
-            return f"found {len(events)} adverse event reports"
+            return _count_summary("adverse event reports", returned_count=len(events))
 
     # Generic: look for common list/count patterns in any response
     for key in ("results", "data", "items", "hits", "records", "entries"):
         val = response.get(key)
         if isinstance(val, list) and len(val) > 0:
-            return f"found {len(val)} {key}"
+            return _count_summary(key, returned_count=len(val))
     for key in ("count", "total", "totalCount", "numFound", "total_rows"):
         val = response.get(key)
         if isinstance(val, (int, float)) and val > 0:
-            return f"found {int(val)} results"
+            return _count_summary("results", source_total=int(val))
 
     # If response has a meaningful top-level field (symbol, name, id)
     for key in ("symbol", "name", "label", "title"):
         val = response.get(key)
         if isinstance(val, str) and val.strip():
             return f"found: {val.strip()[:80]}"
+
+    return ""
+
+
+def _extract_dgidb_mcp_summary(text: str) -> str:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    summary_line = next((line for line in lines if line.startswith("DGIdb results for ")), "")
+    compounds: list[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if not stripped.startswith("- "):
+            continue
+        name = stripped[2:].split(" (", 1)[0].strip()
+        if name and name not in compounds:
+            compounds.append(name)
+        if len(compounds) >= 3:
+            break
+
+    gene_label = ""
+    summary_match = re.match(r"DGIdb results for (.+?):", summary_line)
+    if summary_match:
+        gene_label = summary_match.group(1).strip()
+
+    parts: list[str] = []
+    if gene_label:
+        parts.append(f"DGIdb interaction record retrieved for {gene_label}.")
+    if compounds:
+        parts.append(f"Representative compounds: {', '.join(compounds)}.")
+    elif summary_line:
+        parts.append(summary_line)
+    return " ".join(parts).strip()
+
+
+def _extract_clinical_trials_mcp_summary(name: str, text: str) -> str:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if name == "search_clinical_trials":
+        raw_count_line = next(
+            (
+                line for line in lines
+                if "trial" in line.lower() and ("showing " in line.lower() or "returned" in line.lower())
+            ),
+            "",
+        )
+        count_line = raw_count_line
+        showing_match = re.match(r"Showing\s+(\d+)\s+of\s+(\d+)\s+total\s+trials", raw_count_line, flags=re.IGNORECASE)
+        if showing_match:
+            shown, total = showing_match.groups()
+            count_line = f"Fetched {shown} ClinicalTrials.gov study records (source reported {total} total matches)."
+        else:
+            returned_match = re.match(r"(\d+)\s+trials returned\b", raw_count_line, flags=re.IGNORECASE)
+            if returned_match:
+                shown = returned_match.group(1)
+                count_line = (
+                    f"Fetched {shown} ClinicalTrials.gov study records; full registry total was not provided and more may exist."
+                )
+        representatives: list[str] = []
+        for idx, line in enumerate(lines):
+            if not line.startswith("NCT ID:"):
+                continue
+            nct = line.split(":", 1)[1].strip()
+            status = ""
+            phase = ""
+            intervention = ""
+            for look_ahead in lines[idx + 1: idx + 6]:
+                if look_ahead.startswith("Status:"):
+                    status = look_ahead.split(":", 1)[1].strip()
+                elif look_ahead.startswith("Phase:"):
+                    phase = look_ahead.split(":", 1)[1].strip()
+                elif look_ahead.startswith("Interventions:"):
+                    intervention = look_ahead.split(":", 1)[1].strip()
+            bits = [nct]
+            if status and status != "Unknown":
+                bits.append(status)
+            if phase and phase != "Not specified":
+                bits.append(phase)
+            if intervention and intervention != "Not specified":
+                bits.append(intervention)
+            representatives.append(" | ".join(bits))
+            if len(representatives) >= 2:
+                break
+        parts = [count_line] if count_line else []
+        if representatives:
+            parts.append(f"Representative studies: {'; '.join(representatives)}.")
+        return " ".join(parts).strip()
+
+    if name == "summarize_clinical_trials_landscape":
+        studies_line = next((line for line in lines if line.startswith("Studies analyzed:")), "")
+        status_line = next((line for line in lines if line.startswith("Status breakdown:")), "")
+        intervention_line = next((line for line in lines if line.startswith("Top interventions:")), "")
+        parts = [part for part in [studies_line, status_line, intervention_line] if part]
+        return " ".join(parts).strip()
+
+    if name == "get_clinical_trial":
+        nct_line = next((line for line in lines if line.startswith("NCT ID:")), "")
+        status_line = next((line for line in lines if line.startswith("Status:")), "")
+        phase_line = next((line for line in lines if line.startswith("Phase:")), "")
+        title_line = next((line for line in lines if not line.endswith(":") and not line.startswith("Summary:")), "")
+        parts = [part for part in [title_line, nct_line, status_line, phase_line] if part]
+        return " ".join(parts).strip()
 
     return ""
 
@@ -1639,7 +1866,9 @@ def _normalize_summary_activity_line(line: str) -> str:
     if _SUMMARY_ACTIVITY_PREFIX_RE.match(normalized):
         if "->" in normalized or "→" in normalized:
             return ""
-        colon_match = re.match(r"^[^:]{1,220}:\s*(.+)$", normalized)
+        # Only treat a colon as a prefix separator when it is followed by whitespace.
+        # This avoids truncating CURIEs like HGNC:18618 or MONDO:0005180 in summary text.
+        colon_match = re.match(r"^[^:]{1,220}:\s+(.+)$", normalized)
         if colon_match:
             tail = colon_match.group(1).strip()
             if re.match(r"^(?:clinical trial|title)\s*:", tail, flags=re.IGNORECASE):
@@ -1681,7 +1910,7 @@ def _clean_executor_summary_text(text: str) -> str:
         if line.lower() in {"this step is completed.", "the step is completed.", "this step is blocked."}:
             continue
         cleaned_lines.append(line)
-    return re.sub(r"\s+", " ", " ".join(cleaned_lines)).strip()
+    return _sanitize_internal_report_text(re.sub(r"\s+", " ", " ".join(cleaned_lines)).strip())
 
 
 def _split_summary_sentences(text: str) -> list[str]:
@@ -1801,7 +2030,7 @@ def _score_tool_log_phrase(entry: dict[str, Any], phrase: str) -> float:
         score += 1.5
     if re.search(r"\b\d+(?:\.\d+)?\b", phrase):
         score += 0.8
-    if any(marker in lowered for marker in ("found", "retrieved", "identified", "confirmed", "no clinical trials found")):
+    if any(marker in lowered for marker in ("found", "returned", "retrieved", "source reported", "identified", "confirmed", "no clinical trials found")):
         score += 1.0
     if any(marker in lowered for marker in ("schema", "table", "tables")):
         score -= 0.6
@@ -2354,6 +2583,7 @@ def _validate_structured_observations(value: Any) -> list[dict[str, Any]]:
             observation.get("predicate"),
             f"structured_observations[{idx}].predicate",
         )
+        predicate = _normalize_observation_predicate(predicate)
         object_value = observation.get("object")
         object_ref = None
         if object_value is not None:
@@ -2402,6 +2632,7 @@ def _format_observation_qualifiers(qualifiers: dict[str, Any]) -> str:
         value = qualifiers.get(key)
         if value in (None, "", [], {}):
             continue
+        key_text = str(key)
         if isinstance(value, list):
             value_text = ", ".join(str(item) for item in value[:6])
         elif isinstance(value, dict):
@@ -2409,8 +2640,14 @@ def _format_observation_qualifiers(qualifiers: dict[str, Any]) -> str:
             value_text = nested
         else:
             value_text = str(value)
-        parts.append(f"{key}: {value_text}")
-    return "; ".join(parts[:8])
+        key_text = {
+            "mode": "association view",
+            "associationMode": "association view",
+            "predicate": "relation",
+        }.get(key_text, key_text.replace("_", " "))
+        value_text = _sanitize_internal_report_text(value_text)
+        parts.append(f"{key_text}: {value_text}")
+    return _sanitize_internal_report_text("; ".join(parts[:8]))
 
 
 def _upsert_claim(
@@ -2482,7 +2719,7 @@ def _append_evidence_record(
         "source_tool": str(source_tool or "").strip(),
         "source_label": str(source_label or "").strip(),
         "evidence_ids": _merge_str_values([], evidence_ids or [], limit=20),
-        "summary_text": str(summary_text or "").strip(),
+        "summary_text": _sanitize_internal_report_text(str(summary_text or "").strip()),
         "score": score,
         "qualifiers": _normalize_observation_qualifiers(qualifiers),
     }
@@ -2569,6 +2806,7 @@ def _infer_entity_from_identifier(identifier: str) -> dict[str, Any] | None:
 
 OVERLAP_GROUP_TO_EXECUTOR_CLUSTER: dict[str, str] = {
     "literature_search": "literature",
+    "clinical_trials": "clinical_regulatory",
     "pathway_context": "interactions_pathways",
     "molecular_interactions": "interactions_pathways",
     "compound_pharmacology": "compound_pharmacology",
@@ -2593,6 +2831,63 @@ DOMAIN_TO_EXECUTOR_CLUSTER: dict[str, str] = {
 
 
 STRUCTURED_OBSERVATION_GUIDANCE_BY_OVERLAP_GROUP: dict[str, dict[str, Any]] = {
+    "clinical_trials": {
+        "label": "clinical-trial evidence",
+        "predicates": ["tested_in", "associated_with"],
+        "entity_types": ["compound", "disease", "trial", "gene"],
+        "when_to_emit": (
+            "Emit observations when the tool reports named interventions, specific NCT studies, or an aggregated "
+            "trial landscape with representative programs and statuses."
+        ),
+        "extraction_rules": [
+            "Prefer `tested_in` when a named intervention or program is linked to a disease or indication; store NCT ID, status, phase, sponsor, and study type in qualifiers.",
+            "Use `associated_with` only when the evidence is landscape-level and cannot be tied to a specific named intervention.",
+            "Do not emit count-only observations from paginated searches; pair counts with representative NCT IDs, interventions, and note when the count reflects only fetched studies.",
+        ],
+        "example": {
+            "observation_type": "clinical_trial",
+            "subject": {"type": "compound", "label": "BIIB122"},
+            "predicate": "tested_in",
+            "object": {"type": "disease", "label": "Parkinson disease", "id": "MONDO:0005180"},
+            "supporting_ids": ["NCT04557800"],
+            "source_tool": "search_clinical_trials",
+            "confidence": "medium",
+            "qualifiers": {
+                "nct_id": "NCT04557800",
+                "status": "RECRUITING",
+                "phase": "Phase 2",
+                "sponsor": "Biogen",
+            },
+        },
+    },
+    "compound_pharmacology": {
+        "label": "compound pharmacology and druggability evidence",
+        "predicates": ["inhibits", "activates", "associated_with"],
+        "entity_types": ["compound", "gene", "protein"],
+        "when_to_emit": (
+            "Emit observations when the tool reports named compounds, target-ligand interactions, quantitative "
+            "potency/selectivity, or explicit interaction types for the queried target."
+        ),
+        "extraction_rules": [
+            "Use the compound as the subject and the gene or protein target as the object.",
+            "Prefer `inhibits` or `activates` when the interaction type or mechanism is explicit; otherwise use `associated_with` for broader druggability support.",
+            "Do not reduce DGIdb or target-ligand output to count-only claims; emit representative named compounds and store approval status, interaction score, potency, selectivity, and PMIDs in qualifiers when available.",
+        ],
+        "example": {
+            "observation_type": "compound_pharmacology",
+            "subject": {"type": "compound", "label": "GSK2646264"},
+            "predicate": "inhibits",
+            "object": {"type": "gene", "label": "LRRK2", "id": "HGNC:18618"},
+            "supporting_ids": ["PMID:30998356"],
+            "source_tool": "search_drug_gene_interactions",
+            "confidence": "medium",
+            "qualifiers": {
+                "approval_status": "experimental",
+                "interaction_type": "inhibitor",
+                "interaction_score": "12.3",
+            },
+        },
+    },
     "target_vulnerability": {
         "label": "drug-response and screening evidence",
         "predicates": ["sensitive_in", "resistant_in", "depends_on", "screen_hit_in"],
@@ -2880,7 +3175,10 @@ CLAIM_SOURCE_TOOL_WEIGHTS: dict[str, float] = {
     "get_gene_tissue_expression": 0.84,
     "get_biogrid_orcs_gene_summary": 0.84,
     "get_alliance_genome_gene_profile": 0.82,
+    "get_clinical_trial": 0.82,
     "query_monarch_associations": 0.8,
+    "summarize_clinical_trials_landscape": 0.78,
+    "search_clinical_trials": 0.76,
     "search_pathway_commons_top_pathways": 0.76,
     "get_prism_repurposing_response": 0.74,
     "annotate_variants_vep": 0.72,
@@ -2893,6 +3191,7 @@ CLAIM_SOURCE_TOOL_WEIGHTS: dict[str, float] = {
 
 
 CLAIM_OVERLAP_GROUP_WEIGHTS: dict[str, float] = {
+    "clinical_trials": 0.8,
     "compound_pharmacology": 0.8,
     "variant_evidence": 0.78,
     "molecular_interactions": 0.82,
@@ -2906,6 +3205,9 @@ CLAIM_OVERLAP_GROUP_WEIGHTS: dict[str, float] = {
 
 
 CLAIM_PREDICATE_STRENGTH_BONUS: dict[str, float] = {
+    "inhibits": 0.12,
+    "activates": 0.1,
+    "tested_in": 0.1,
     "causal_gene_for": 0.24,
     "depends_on": 0.16,
     "has_function": 0.14,
@@ -2937,6 +3239,9 @@ CLAIM_DISPLAY_PREDICATE_BONUS: dict[str, float] = {
     "associated_with": 0.75,
     "depends_on": 0.6,
     "has_function": 0.5,
+    "inhibits": 0.45,
+    "tested_in": 0.45,
+    "activates": 0.35,
     "participates_in": 0.35,
     "sensitive_in": 0.35,
     "resistant_in": 0.35,
@@ -3011,8 +3316,95 @@ def _source_support_weight(source_tool: str, source_label: str) -> float:
     return 0.6
 
 
+_INTERNAL_ASSOCIATION_MODE_LABELS = {
+    "disease_to_gene_causal": "causal disease-gene",
+    "disease_to_gene_correlated": "correlated disease-gene",
+    "disease_to_phenotype": "disease-to-phenotype",
+    "phenotype_to_gene": "phenotype-to-gene",
+    "gene_to_phenotype": "gene-to-phenotype",
+}
+
+
+def _humanize_biolink_predicate(value: str) -> str:
+    cleaned = str(value or "").strip()
+    lowered = cleaned.lower()
+    if lowered.startswith("biolink:"):
+        lowered = lowered.split(":", 1)[1]
+    mapping = {
+        "associated_with": "associated with",
+        "gene_associated_with_condition": "gene-disease association",
+        "contributes_to": "contributory association",
+        "has_phenotype": "has phenotype",
+        "interacts_with": "interacts with",
+        "participates_in": "participates in",
+        "related_to": "related to",
+    }
+    return mapping.get(lowered, lowered.replace("_", " "))
+
+
+def _sanitize_internal_report_text(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "").strip())
+    if not cleaned:
+        return ""
+
+    cleaned = re.sub(
+        r"\(\s*predicate:\s*biolink:[^)]+\)",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    def _replace_predicate(match: re.Match[str]) -> str:
+        label = _humanize_biolink_predicate(match.group(1))
+        return f"relation: {label}" if label else ""
+
+    cleaned = re.sub(
+        r"predicate:\s*biolink:([a-z_]+)",
+        _replace_predicate,
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"biolink:([a-z_]+)",
+        lambda match: _humanize_biolink_predicate(match.group(1)),
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    for raw, label in _INTERNAL_ASSOCIATION_MODE_LABELS.items():
+        cleaned = re.sub(rf"\b{re.escape(raw)}\b", label, cleaned)
+
+    cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+def _normalize_observation_predicate(predicate: str) -> str:
+    cleaned = str(predicate or "").strip()
+    lowered = cleaned.lower()
+    if lowered.startswith("biolink:"):
+        lowered = lowered.split(":", 1)[1]
+    mapping = {
+        "associated_with": "associated_with",
+        "gene_associated_with_condition": "associated_with",
+        "contributes_to": "associated_with",
+        "related_to": "associated_with",
+        "has_phenotype": "has_phenotype",
+        "interacts_with": "interacts_with",
+        "participates_in": "participates_in",
+    }
+    normalized = mapping.get(lowered)
+    if normalized:
+        return normalized
+    if cleaned.lower().startswith("biolink:"):
+        return lowered
+    return cleaned
+
+
 def _humanize_claim_predicate(predicate: str) -> str:
     mapping = {
+        "activates": "activates",
         "associated_with": "is associated with",
         "causal_gene_for": "is a causal gene for",
         "correlated_gene_for": "is correlated with",
@@ -3026,9 +3418,13 @@ def _humanize_claim_predicate(predicate: str) -> str:
         "resistant_in": "is resistant in",
         "screen_hit_in": "is a screen hit in",
         "sensitive_in": "is sensitive in",
+        "tested_in": "is being tested in",
+        "inhibits": "inhibits",
         "supported_by": "is supported by",
     }
     cleaned = str(predicate or "").strip()
+    if cleaned.lower().startswith("biolink:"):
+        return _humanize_biolink_predicate(cleaned)
     return mapping.get(cleaned, cleaned.replace("_", " "))
 
 
@@ -3090,6 +3486,8 @@ def _claim_display_priority_score(claim: dict[str, Any], objective_text: str) ->
         score += {
             "causal_gene_for": 0.25,
             "associated_with": 0.2,
+            "inhibits": 0.14,
+            "tested_in": 0.14,
             "has_function": 0.12,
             "participates_in": 0.08,
             "cross_referenced_in": -0.3,
@@ -4420,14 +4818,14 @@ def _extract_inline_ids_from_text(text: str) -> list[str]:
     return ids
 
 
-_LITERATURE_ID_RE = re.compile(
-    r"(?i)^(PMID:|DOI:|NCT|OpenAlex:|PMC)"
+_REFERENCE_SECTION_ID_RE = re.compile(
+    r"(?i)^(PMID:|DOI:|OpenAlex:|PMC)"
 )
 
 
 def _is_literature_id(eid: str) -> bool:
-    """True for literature/trial identifiers that belong in the References section."""
-    return bool(_LITERATURE_ID_RE.match(re.sub(r"\s*:\s*", ":", eid.strip())))
+    """True for paper-like identifiers that belong in the References section."""
+    return bool(_REFERENCE_SECTION_ID_RE.match(re.sub(r"\s*:\s*", ":", eid.strip())))
 
 
 _VALID_EVIDENCE_ID_RE = re.compile(
@@ -4524,6 +4922,33 @@ def _http_get_json(url: str) -> dict | None:
         return None
 
 
+def _fetch_europepmc_meta_by_pmid(pmid: str) -> dict | None:
+    """Fetch article metadata from Europe PMC for a PubMed identifier."""
+    url = (
+        "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+        f"?query=EXT_ID:{urllib.parse.quote(pmid)}%20AND%20SRC:MED&format=json"
+    )
+    data = _http_get_json(url)
+    results = (((data or {}).get("resultList") or {}).get("result") or [])
+    if not results:
+        return None
+    result = results[0]
+    author_string = re.sub(r"\s+", " ", str(result.get("authorString", "")).strip()).rstrip(".")
+    authors = [part.strip() for part in author_string.split(",") if part.strip()]
+    title = re.sub(r"<[^>]+>", "", str(result.get("title", "")).strip()).rstrip(".")
+    return {
+        "authors": authors,
+        "title": title,
+        "journal": str(result.get("journalTitle", "")).strip(),
+        "year": str(result.get("pubYear", "")).strip(),
+        "volume": str(result.get("journalVolume", "")).strip(),
+        "issue": str(result.get("issue", "")).strip(),
+        "pages": str(result.get("pageInfo", "")).strip(),
+        "doi": str(result.get("doi", "")).strip(),
+        "pmid": str(result.get("pmid", "") or pmid).strip(),
+    }
+
+
 def _fetch_pubmed_meta(pmid: str) -> dict | None:
     """Fetch article metadata from NCBI esummary. Returns a flat dict or None."""
     cache_key = f"pmid:{pmid}"
@@ -4535,12 +4960,14 @@ def _fetch_pubmed_meta(pmid: str) -> dict | None:
     )
     data = _http_get_json(url)
     if not data:
-        _CITATION_META_CACHE[cache_key] = {}
-        return None
+        fallback = _fetch_europepmc_meta_by_pmid(pmid)
+        _CITATION_META_CACHE[cache_key] = fallback or {}
+        return fallback
     result = (data.get("result") or {}).get(pmid)
     if not result:
-        _CITATION_META_CACHE[cache_key] = {}
-        return None
+        fallback = _fetch_europepmc_meta_by_pmid(pmid)
+        _CITATION_META_CACHE[cache_key] = fallback or {}
+        return fallback
     # Extract DOI from articleids
     doi = ""
     for aid in result.get("articleids") or []:
@@ -4562,6 +4989,11 @@ def _fetch_pubmed_meta(pmid: str) -> dict | None:
         "doi": doi,
         "pmid": pmid,
     }
+    if not meta.get("title"):
+        fallback = _fetch_europepmc_meta_by_pmid(pmid)
+        if fallback and fallback.get("title"):
+            _CITATION_META_CACHE[cache_key] = fallback
+            return fallback
     _CITATION_META_CACHE[cache_key] = meta
     return meta
 
@@ -4668,6 +5100,88 @@ def _build_apa_citation(meta: dict, pmid: str = "", doi: str = "") -> str:
     return " ".join(parts)
 
 
+def _format_apa_intext_author(names: list[str]) -> str:
+    """Return an APA-style in-text author component from a list of raw names."""
+    families: list[str] = []
+    for raw_name in names:
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        if "," in name:
+            family = name.split(",", 1)[0].strip()
+        else:
+            tokens = name.split()
+            while len(tokens) > 1 and re.fullmatch(r"(?:[A-Z]\.?){1,4}|[A-Z]{1,4}", tokens[-1]):
+                tokens.pop()
+            if len(tokens) > 1 and len(tokens[-1]) <= 3 and tokens[-1].isupper():
+                tokens.pop()
+            if len(tokens) > 1 and tokens[-1][:1].isupper() and tokens[-1][1:].islower():
+                family = " ".join(tokens[:-1]).strip()
+            else:
+                family = " ".join(tokens).strip()
+        family = family.strip()
+        if family:
+            families.append(family)
+
+    if not families:
+        return ""
+    if len(families) == 1:
+        return families[0]
+    if len(families) == 2:
+        return f"{families[0]} & {families[1]}"
+    return f"{families[0]} et al."
+
+
+def _fetch_reference_meta(eid: str) -> dict | None:
+    """Fetch citation metadata for a reference-style identifier when available."""
+    raw = re.sub(r"\s*:\s*", ":", eid.strip())
+    match = re.fullmatch(r"(?i)PMID:(\d{4,9})", raw)
+    if match:
+        pmid = match.group(1)
+        meta = _fetch_pubmed_meta(pmid)
+        if meta and meta.get("title"):
+            return meta
+        doi = str((meta or {}).get("doi", "")).strip()
+        if doi:
+            crossref_meta = _fetch_crossref_meta(doi)
+            if crossref_meta and crossref_meta.get("title"):
+                crossref_meta["pmid"] = pmid
+                return crossref_meta
+        return meta
+
+    match = re.fullmatch(r"(?i)DOI:(10\..+)", raw)
+    if match:
+        return _fetch_crossref_meta(match.group(1))
+
+    return None
+
+
+def _format_apa_intext_citation(ref_number: int, eid: str) -> str:
+    """Return a linked APA-style in-text citation when metadata is available."""
+    meta = _fetch_reference_meta(eid)
+    citation_label = ""
+    if meta:
+        author_part = _format_apa_intext_author(meta.get("authors") or [])
+        year = str(meta.get("year") or "n.d.").strip() or "n.d."
+        if author_part:
+            citation_label = f"{author_part}, {year}"
+        else:
+            title = str(meta.get("title") or "").strip()
+            if title:
+                citation_label = f"{title[:40].rstrip('.')}..., {year}"
+
+    if not citation_label:
+        raw = re.sub(r"\s*:\s*", ":", eid.strip())
+        if raw.lower().startswith("openalex:"):
+            citation_label = f"{raw.replace(':', ': ', 1)}, n.d."
+        elif raw.upper().startswith("PMC"):
+            citation_label = f"{raw.upper()}, n.d."
+        else:
+            citation_label = raw
+
+    return f"[{citation_label}](#ref-{ref_number})"
+
+
 def _format_reference_apa(i: int, eid: str) -> str:
     """Format a single reference in full APA 7th-edition style, fetching live metadata."""
     raw = re.sub(r"\s*:\s*", ":", eid.strip())
@@ -4761,10 +5275,10 @@ _PROTECT_RE = re.compile(
 def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> str:
     """Replace bare inline ID mentions with links in the body text.
 
-    Literature IDs (PMID, DOI, NCT, OpenAlex, PMC) present in ref_map are
-    replaced with compact numbered citations [N] pointing to the References
-    section.  Database IDs (UniProt, PubChem, PDB, rsID, ChEMBL, Reactome,
-    GCST) are replaced with clickable links to the external database record.
+    Paper-like IDs (PMID, DOI, OpenAlex, PMC) present in ref_map are
+    replaced with linked APA-style citations pointing to the References
+    section. Trial and database IDs (NCT, UniProt, PubChem, PDB, rsID, ChEMBL,
+    Reactome, GCST) are replaced with clickable links to the external record.
     Skips the ## References section (already formatted) and avoids double-linking.
     """
     # Split off the References section — leave it untouched.
@@ -4824,7 +5338,7 @@ def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> s
         ref_key = re.sub(r"\s*:\s*", ":", normalized).lower()
         if ref_map and ref_key in ref_map:
             n = ref_map[ref_key]
-            return f"[{n}]"
+            return _format_apa_intext_citation(n, normalized)
         url = _evidence_id_to_url(normalized)
         if not url:
             return m.group(0)
@@ -4847,7 +5361,10 @@ def _expand_reference_only_body_lines(text: str, lit_ids: list[str]) -> str:
     body = refs_split[0]
     refs_tail = ("\n## References" + refs_split[1]) if len(refs_split) > 1 else ""
     citation_cache: dict[int, str] = {}
-    citation_only_re = re.compile(r"^(\s*(?:[-*]\s+)?)\[(\d+)\](?:\(#ref-\2\))?\s*$")
+    citation_only_re = re.compile(
+        r"^(\s*(?:[-*]\s+)?)"
+        r"(?:\[(\d+)\](?:\(#ref-\2\))?|\[([^\]]+)\]\(#ref-(\d+)\))\s*$"
+    )
 
     def _citation_text(ref_number: int) -> str:
         cached = citation_cache.get(ref_number)
@@ -4867,7 +5384,8 @@ def _expand_reference_only_body_lines(text: str, lit_ids: list[str]) -> str:
         if not match:
             expanded_lines.append(raw_line)
             continue
-        citation_text = _citation_text(int(match.group(2)))
+        ref_number = int(match.group(2) or match.group(4) or 0)
+        citation_text = _citation_text(ref_number)
         if not citation_text:
             expanded_lines.append(raw_line)
             continue
@@ -5379,7 +5897,9 @@ def _build_mixed_evidence_claims_table(claim_summary: dict[str, Any]) -> str:
         for claim in list(conflict.get("claims", []) or [])[:2]:
             sources = ", ".join(list(claim.get("primary_sources", []) or [])[:2])
             if sources:
-                source_fragments.append(f"{claim.get('predicate', '')}: {sources}")
+                source_fragments.append(
+                    f"{_humanize_claim_predicate(str(claim.get('predicate', '')).strip())}: {sources}"
+                )
         rows.append(
             [
                 focus,
@@ -5404,13 +5924,14 @@ NARRATIVE_PREDICATES = {
 }
 TABULAR_PREDICATES = {
     "associated_with", "interacts_with", "has_phenotype", "cross_referenced_in",
-    "has_ortholog", "has_model", "screen_hit_in",
+    "has_ortholog", "has_model", "screen_hit_in", "tested_in",
 }
 
 _ENTITY_TYPE_LABELS: dict[str, str] = {
     "gene": "Gene",
     "compound": "Compound",
     "disease": "Disease",
+    "trial": "Trial",
     "cell_line": "Cell line",
     "phenotype": "Phenotype",
     "pathway": "Pathway",
@@ -5549,7 +6070,7 @@ def _build_synthesis_evidence_briefs(
         )
         evidence_notes = _dedupe_str_list(
             [
-                re.sub(r"\s+", " ", str(record.get("summary_text", "")).strip())
+                _sanitize_internal_report_text(re.sub(r"\s+", " ", str(record.get("summary_text", "")).strip()))
                 for claim in claims
                 for record in evidence_by_claim.get(str(claim.get("claim_id", "")).strip(), [])
                 if str(record.get("summary_text", "")).strip()
@@ -5582,7 +6103,7 @@ def _build_synthesis_evidence_briefs(
                 for claim in claims[:4]
             ]
         else:
-            entry["step_summary"] = str(cluster.get("step_summary", "")).strip()
+            entry["step_summary"] = _sanitize_internal_report_text(str(cluster.get("step_summary", "")).strip())
             source = str(cluster.get("step_source", "")).strip()
             if source:
                 entry["step_source"] = source
@@ -5626,7 +6147,7 @@ def _derive_cluster_title(claims: list[dict[str, Any]]) -> str:
         type_label = _ENTITY_TYPE_LABELS.get(next(iter(entity_type), ""), "")
         predicates = {str(c.get("predicate", "")).strip() for c in claims}
         if len(predicates) == 1:
-            pred = predicates.pop().replace("_", " ")
+            pred = _humanize_claim_predicate(predicates.pop())
             if type_label:
                 return f"{top_entity} ({type_label}) — {pred}"
             return f"{top_entity} — {pred}"
@@ -5763,7 +6284,7 @@ def _render_finding_tabular(claims: list[dict[str, Any]]) -> list[str]:
             subject_label = f"{subject_label} ({subject_type})"
         rows.append([
             subject_label,
-            claim.get("predicate", "").replace("_", " "),
+            _humanize_claim_predicate(str(claim.get("predicate", "")).strip()),
             claim.get("object", "-"),
             source_text,
             ids_text,
@@ -5808,7 +6329,7 @@ def _render_conflicting_evidence_section(claim_summary: dict[str, Any]) -> list[
 
         conflict_claims = list(conflict.get("claims", []) or [])
         for claim in conflict_claims[:4]:
-            predicate = str(claim.get("predicate", "")).replace("_", " ")
+            predicate = _humanize_claim_predicate(str(claim.get("predicate", "")).strip())
             sources = ", ".join(list(claim.get("primary_sources", []) or [])[:2]) or "unknown source"
             lines.append(f"- **{sources}** supports: {claim.get('statement', '')} ({predicate})")
 
@@ -6118,6 +6639,7 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
 
     focused_catalog = _format_tool_catalog(focused_tools)
     routing_guidance = _format_step_routing_guidance(tool_hint, focused_tools)
+    structured_observation_guidance = _format_structured_observation_guidance(tool_hint, focused_tools)
     payload = {
         "schema": "react_step_context.v1",
         "objective": task_state.get("objective", ""),
@@ -6149,6 +6671,8 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
     )
     if routing_guidance:
         instructions.append(routing_guidance)
+    if structured_observation_guidance:
+        instructions.append(structured_observation_guidance)
 
     if focus_terms:
         instructions.append(
@@ -6335,10 +6859,10 @@ def _synth_context_instructions(task_state: dict[str, Any], callback_context: Ca
                 "tool_hint": step.get("tool_hint", ""),
                 "source": _preferred_step_source_label(step, str(step.get("tool_hint", ""))),
                 "status": step.get("status"),
-                "reasoning_trace": step.get("reasoning_trace", ""),
+                "reasoning_trace": _sanitize_internal_report_text(str(step.get("reasoning_trace", "") or "")),
                 "tools_called": list(step.get("tools_called", []) or []),
                 "data_sources_queried": _derive_step_data_sources(step),
-                "result_summary": step.get("result_summary", ""),
+                "result_summary": _sanitize_internal_report_text(str(step.get("result_summary", "") or "")),
                 "evidence_ids": list(step.get("evidence_ids", []) or [])[:20],
                 "open_gaps": list(step.get("open_gaps", []) or [])[:10],
                 "structured_observations": list(step.get("structured_observations", []) or [])[:8],
@@ -7492,6 +8016,12 @@ def _planner_skill_guidance(*, planner_skills_enabled: bool) -> str:
     return (
         "- Use `structured-data-planning` before planning BigQuery-backed, identifier-ready, or aggregate structured-data investigations.\n"
         "- Use `archive-dataset-discovery-planning` before planning archive or neuroscience dataset discovery tasks.\n"
+        "- Use `clinical-trials-planning` before planning trial-landscape, outcome, sponsor, label, or safety-driven investigations.\n"
+        "- Use `geo-dataset-discovery-planning` before planning GEO-centric transcriptomics dataset discovery or accession-triage tasks.\n"
+        "- Use `oncology-target-validation-planning` before planning multi-source oncology target-validation work.\n"
+        "- Use `comparative-assessment-planning` before planning head-to-head comparisons that should be aligned by shared dimensions.\n"
+        "- Use `entity-resolution-planning` before planning tasks that depend on resolving aliases, ontology terms, or ambiguous biomedical entities.\n"
+        "- Use `safety-risk-interpretation-planning` before planning risk- or safety-driven investigations that combine trial, label, and post-market evidence.\n"
         "- Load only the skills relevant to the current objective, then return the final plan JSON."
     )
 

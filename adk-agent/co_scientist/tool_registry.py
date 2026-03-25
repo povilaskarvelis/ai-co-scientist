@@ -103,7 +103,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "map_ontology_terms_oxo": "Map ontology CURIEs across MONDO/EFO/DOID/MeSH/OMIM/UMLS and other prefixes using EBI OxO cross-references",
     "search_hpo_terms": "Search Human Phenotype Ontology terms via OLS for phenotype-term normalization",
     "get_orphanet_disease_profile": "Retrieve Orphanet / ORDO rare-disease profiles with xrefs, phenotypes, and curated disease-gene links",
-    "query_monarch_associations": "Query Monarch phenotype- and rare-disease-centric associations such as phenotype-to-gene, disease-to-gene, and disease-to-phenotype",
+    "query_monarch_associations": "Query Monarch phenotype- and rare-disease-centric associations such as phenotype-to-gene, disease-to-gene, disease-to-phenotype, and gene-to-phenotype. Prefer an explicit CURIE in entityId once a gene, phenotype, or disease has been normalized; do not invent unsupported gene-to-disease modes.",
     "search_quickgo_terms": "Search Gene Ontology terms in QuickGO by text and aspect",
     "get_quickgo_annotations": "Get GO annotations for a gene product via QuickGO, resolving gene symbols to UniProtKB when needed",
     "search_uniprot_proteins": "Search UniProt for protein entries",
@@ -151,6 +151,21 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
 }
 
 TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
+    "search_clinical_trials": {
+        "overlap_group": "clinical_trials",
+        "preferred_for": "named ClinicalTrials.gov study discovery, NCT harvesting, and intervention/status snapshots",
+        "fallback_tools": ["summarize_clinical_trials_landscape", "get_clinical_trial"],
+    },
+    "get_clinical_trial": {
+        "overlap_group": "clinical_trials",
+        "preferred_for": "full details for a specific NCT study, including design, eligibility, outcomes, and posted results",
+        "fallback_tools": ["search_clinical_trials", "summarize_clinical_trials_landscape"],
+    },
+    "summarize_clinical_trials_landscape": {
+        "overlap_group": "clinical_trials",
+        "preferred_for": "status, phase, intervention, and termination-pattern summaries across a ClinicalTrials.gov landscape",
+        "fallback_tools": ["search_clinical_trials", "get_clinical_trial"],
+    },
     "search_pubmed": {
         "overlap_group": "literature_search",
         "preferred_for": "default biomedical literature search, PMID harvesting, and MeSH-friendly follow-up",
@@ -307,7 +322,7 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
     },
     "query_monarch_associations": {
         "overlap_group": "phenotype_rare_disease",
-        "preferred_for": "phenotype-driven gene/disease association reasoning and graph-style rare-disease exploration",
+        "preferred_for": "phenotype-driven or rare-disease graph reasoning after entity normalization, especially when you need disease-to-gene, phenotype-to-gene, disease-to-phenotype, or gene-to-phenotype associations",
         "fallback_tools": ["search_hpo_terms", "get_orphanet_disease_profile"],
     },
     "get_alliance_genome_gene_profile": {
@@ -402,7 +417,7 @@ SOURCE_PRECEDENCE_RULES: list[dict[str, Any]] = [
     {
         "topic": "Phenotype and rare-disease reasoning",
         "tools": ["search_hpo_terms", "get_orphanet_disease_profile", "query_monarch_associations"],
-        "summary": "Use `search_hpo_terms` for phenotype-term normalization, `get_orphanet_disease_profile` for rare-disease profiles and curated phenotype/gene summaries, and `query_monarch_associations` for phenotype-driven or graph-style disease/gene association reasoning.",
+        "summary": "Use `search_hpo_terms` for phenotype-term normalization, `get_orphanet_disease_profile` for rare-disease profiles and curated phenotype/gene summaries, and `query_monarch_associations` for phenotype-driven or graph-style disease/gene association reasoning once the entity has been normalized to a reliable CURIE.",
     },
     {
         "topic": "Translational model-organism evidence",

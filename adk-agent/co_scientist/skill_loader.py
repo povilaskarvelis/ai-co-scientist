@@ -16,14 +16,38 @@ SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 PLANNER_SKILL_DIR_NAMES = (
     "structured-data-planning",
     "archive-dataset-discovery-planning",
+    "clinical-trials-planning",
+    "geo-dataset-discovery-planning",
+    "oncology-target-validation-planning",
+    "comparative-assessment-planning",
+    "entity-resolution-planning",
+    "safety-risk-interpretation-planning",
 )
 EXECUTION_SKILL_DIR_NAMES = (
     "structured-data-execution",
     "archive-dataset-discovery-execution",
+    "citation-grounding-execution",
+    "clinical-trials-execution",
+    "variant-interpretation-execution",
+    "geo-dataset-discovery-execution",
+    "oncology-target-validation-execution",
+    "evidence-weighting-execution",
+    "comparative-assessment-execution",
+    "entity-resolution-execution",
+    "safety-risk-interpretation-execution",
 )
 REPORT_ASSISTANT_SKILL_DIR_NAMES = (
     "structured-data-report-followup",
     "archive-dataset-discovery-report-followup",
+    "citation-grounding-report-followup",
+    "clinical-trials-report-followup",
+    "variant-interpretation-report-followup",
+    "geo-dataset-discovery-report-followup",
+    "oncology-target-validation-report-followup",
+    "evidence-weighting-report-followup",
+    "comparative-assessment-report-followup",
+    "entity-resolution-report-followup",
+    "safety-risk-interpretation-report-followup",
 )
 
 

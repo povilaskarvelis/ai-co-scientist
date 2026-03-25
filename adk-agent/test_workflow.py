@@ -6,6 +6,7 @@ from google.adk.tools import McpToolset
 from google.adk.tools.skill_toolset import SkillToolset
 from google.genai import types
 
+import co_scientist.tool_registry as tool_registry
 import co_scientist.workflow as workflow
 from co_scientist.workflow import create_workflow_agent
 
@@ -162,6 +163,12 @@ def test_planner_instruction_preserves_core_rules_but_trims_large_playbooks():
     assert "Every plan MUST include at least one step" in instruction
     assert "structured-data-planning" in instruction
     assert "archive-dataset-discovery-planning" in instruction
+    assert "clinical-trials-planning" in instruction
+    assert "geo-dataset-discovery-planning" in instruction
+    assert "oncology-target-validation-planning" in instruction
+    assert "comparative-assessment-planning" in instruction
+    assert "entity-resolution-planning" in instruction
+    assert "safety-risk-interpretation-planning" in instruction
     assert "Available BigQuery datasets" not in instruction
     assert "open_targets_platform.target" not in instruction
     assert "Avoid boolean strings like `A OR B`" not in instruction
@@ -176,6 +183,11 @@ def test_trimmed_tool_registry_descriptions_remove_strategy_prose():
         if rule["topic"] == "Neuroscience dataset discovery"
     )
     assert "A OR B" not in summary
+
+
+def test_synthesizer_instruction_prefers_claim_local_citations():
+    assert "Attach citations to the smallest sensible claim unit" in workflow.SYNTHESIZER_INSTRUCTION
+    assert "Prefer claim-local citations over paragraph-end citation bundles" in workflow.SYNTHESIZER_INSTRUCTION
 
 
 def test_planner_before_model_callback_does_not_force_json_mime_type():
@@ -777,6 +789,18 @@ def test_describe_tool_call_clingen():
     assert "validity" in desc.lower() or "ClinGen" in desc
 
 
+def test_describe_tool_call_monarch_uses_association_mode_label():
+    desc = workflow._describe_tool_call(
+        "query_monarch_associations",
+        {
+            "entityId": "MONDO:0005180",
+            "associationMode": "disease_to_gene_correlated",
+        },
+    )
+    assert "disease-to-gene correlated" in desc
+    assert "MONDO:0005180" in desc
+
+
 def test_describe_tool_result_error():
     desc = workflow._describe_tool_result("run_bigquery_select_query", {"error": "syntax error near FROM"})
     assert "error" in desc.lower()
@@ -810,6 +834,29 @@ def test_describe_tool_result_pubmed():
     assert "article" in desc.lower()
 
 
+def test_describe_tool_result_prefers_result_meta_for_search_outputs():
+    desc = workflow._describe_tool_result(
+        "search_openalex_works",
+        {
+            "content": [{
+                "type": "text",
+                "text": "Summary:\nRetrieved 10 OpenAlex works.\n\nKey Fields:\n- Example paper",
+            }],
+            "structuredContent": {
+                "result_meta": {
+                    "mode": "search",
+                    "item_label": "articles",
+                    "returned_count": 10,
+                    "reported_total": 214,
+                    "total_relation": "exact",
+                    "has_more": True,
+                }
+            },
+        },
+    )
+    assert desc == "returned 10 articles (source reported 214 total matches)"
+
+
 def test_describe_tool_result_bigquery_rows():
     desc = workflow._describe_tool_result(
         "run_bigquery_select_query",
@@ -826,6 +873,88 @@ def test_describe_tool_result_bigquery_tables():
     )
     assert "4" in desc
     assert "table" in desc.lower()
+
+
+def test_describe_tool_result_dgidb_mcp_summary_includes_named_compounds():
+    desc = workflow._describe_tool_result(
+        "search_drug_gene_interactions",
+        {
+            "content": [{
+                "type": "text",
+                "text": (
+                    "Summary:\nDGIdb results for LRRK2: 25 drug-gene interactions found.\n\n"
+                    "Key Fields:\n"
+                    "**LRRK2**\n"
+                    "Total interactions: 25 (2 approved, 23 experimental)\n"
+                    "Top interactions:\n"
+                    "  - GSK2646264 (experimental) | type: inhibitor | score: 12.300 | PMID:30998356\n"
+                    "  - URMC-099 (experimental) | type: inhibitor | score: 11.200 | PMID:12345678\n"
+                ),
+            }],
+        },
+    )
+    assert "DGIdb interaction record retrieved for LRRK2." in desc
+    assert "GSK2646264" in desc
+    assert "URMC-099" in desc
+
+
+def test_describe_tool_result_clinical_trials_mcp_summary_includes_ncts():
+    desc = workflow._describe_tool_result(
+        "search_clinical_trials",
+        {
+            "content": [{
+                "type": "text",
+                "text": (
+                    'Clinical trials for "LRRK2 Parkinson disease":\n'
+                    "Showing 2 of 50 total trials\n\n"
+                    "1. BIIB122 in Parkinson Disease\n"
+                    "   NCT ID: NCT04557800\n"
+                    "   Status: RECRUITING\n"
+                    "   Phase: Phase 2\n"
+                    "   Interventions: BIIB122 (DRUG)\n\n"
+                    "2. DNL151 in Parkinson Disease\n"
+                    "   NCT ID: NCT04056689\n"
+                    "   Status: COMPLETED\n"
+                    "   Phase: Phase 1\n"
+                    "   Interventions: DNL151 (DRUG)\n"
+                ),
+            }],
+        },
+    )
+    assert "Fetched 2 ClinicalTrials.gov study records (source reported 50 total matches)." in desc
+    assert "NCT04557800" in desc
+    assert "BIIB122" in desc
+
+
+def test_describe_tool_result_generic_mcp_summary_qualifies_showing_counts():
+    desc = workflow._describe_tool_result(
+        "search_gwas_associations",
+        {
+            "content": [{
+                "type": "text",
+                "text": (
+                    'Summary:\nFound 764 GWAS associations for "Parkinson disease" (showing top 20).\n\n'
+                    "Key Fields:\nGCST123456\n"
+                ),
+            }],
+        },
+    )
+    assert 'Source reported 764 GWAS associations for "Parkinson disease" (showing top 20).' in desc
+
+
+def test_extract_result_summary_search_tools_use_returned_or_source_reported_wording():
+    assert (
+        workflow._extract_result_summary("search_pubmed", {"results": [{}, {}]})
+        == "returned 2 articles"
+    )
+    assert (
+        workflow._extract_result_summary("search_pubmed", {"results": [{}, {}], "count": 3572})
+        == "returned 2 articles (source reported 3572 total matches)"
+    )
+    assert (
+        workflow._extract_result_summary("search_gwas_associations", {"count": 764})
+        == "source reported 764 associations"
+    )
 
 
 def test_describe_tool_result_mcp_structured():
@@ -1034,6 +1163,24 @@ def test_react_step_context_instructions_include_phenotype_routing_guidance():
     assert "Start with `query_monarch_associations`" in text
 
 
+def test_monarch_tool_description_mentions_entity_id_and_supported_modes():
+    desc = tool_registry.TOOL_DESCRIPTIONS["query_monarch_associations"]
+    assert "entityId" in desc
+    assert "gene-to-phenotype" in desc
+    assert "unsupported gene-to-disease" in desc
+
+
+def test_step_executor_instruction_mentions_monarch_entity_id_guidance():
+    assert "For `query_monarch_associations`" in workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "entityId" in workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "supported association modes" in workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
+
+
+def test_step_executor_instruction_mentions_representative_compounds_and_trials():
+    assert "do not stop at interaction counts" in workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "do not stop at study counts" in workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
+
+
 def test_react_step_context_instructions_include_translational_routing_guidance():
     task_state = {
         "objective": "Assess model-organism evidence for TP53",
@@ -1055,6 +1202,52 @@ def test_react_step_context_instructions_include_translational_routing_guidance(
     assert "`get_clingen_gene_curation` (ClinGen)" in text
     assert "`query_monarch_associations` (Monarch Initiative)" in text
     assert "Start with `get_alliance_genome_gene_profile`" in text
+
+
+def test_react_step_context_instructions_include_compound_pharmacology_guidance():
+    task_state = {
+        "objective": "Assess LRRK2 druggability",
+        "steps": [
+            {
+                "id": "S1",
+                "status": "pending",
+                "goal": "Collect representative named compounds and interaction types for LRRK2",
+                "tool_hint": "search_drug_gene_interactions",
+                "domains": ["chemistry"],
+                "completion_condition": "Return representative compounds with interaction types and PMIDs when available",
+            },
+        ],
+    }
+    active_step = task_state["steps"][0]
+    instructions = workflow._react_step_context_instructions(task_state, active_step)
+    text = "\n".join(instructions)
+    assert "Routing guidance for this step's tool_hint `search_drug_gene_interactions`" in text
+    assert "Structured observation guidance for this step:" in text
+    assert "Family: compound pharmacology and druggability evidence." in text
+    assert "`inhibits`" in text
+
+
+def test_react_step_context_instructions_include_clinical_trials_guidance():
+    task_state = {
+        "objective": "Assess clinical development activity for LRRK2 in Parkinson disease",
+        "steps": [
+            {
+                "id": "S1",
+                "status": "pending",
+                "goal": "Collect representative LRRK2-related Parkinson trials with status and phase context",
+                "tool_hint": "search_clinical_trials",
+                "domains": ["clinical"],
+                "completion_condition": "Return representative NCT IDs, interventions, statuses, and phases",
+            },
+        ],
+    }
+    active_step = task_state["steps"][0]
+    instructions = workflow._react_step_context_instructions(task_state, active_step)
+    text = "\n".join(instructions)
+    assert "Routing guidance for this step's tool_hint `search_clinical_trials`" in text
+    assert "`get_clinical_trial` (ClinicalTrials.gov)" in text
+    assert "Family: clinical-trial evidence." in text
+    assert "`tested_in`" in text
 
 
 def test_react_step_context_instructions_include_biogrid_routing_guidance():
@@ -1920,6 +2113,11 @@ def test_postprocess_expands_reference_only_key_finding_bullets(monkeypatch):
         return f'<a id="ref-{ref_number}"></a>{ref_number}. Citation for {eid}'
 
     monkeypatch.setattr(workflow, "_format_reference_apa", _fake_reference)
+    monkeypatch.setattr(
+        workflow,
+        "_format_apa_intext_citation",
+        lambda ref_number, eid: f"[Citation {ref_number}](#ref-{ref_number})",
+    )
 
     raw_markdown = """# AI Co-Scientist Report
 
@@ -2010,7 +2208,109 @@ def test_extract_evidence_ids_from_text_empty():
     assert workflow._extract_evidence_ids_from_text("no identifiers here") == []
 
 
+def test_reference_section_keeps_papers_but_links_trials_inline(monkeypatch):
+    assert workflow._is_literature_id("PMID:12345678")
+    assert not workflow._is_literature_id("NCT03710707")
+
+    monkeypatch.setattr(
+        workflow,
+        "_fetch_reference_meta",
+        lambda eid: {"authors": ["Ng X. Y.", "Cao M."], "year": "2024", "title": "Example paper"},
+    )
+
+    ref_map = workflow._build_ref_map(["PMID:12345678"])
+    linked = workflow._hyperlink_inline_ids("Paper PMID:12345678 and trial NCT03710707 are both relevant.", ref_map)
+
+    assert "Ng & Cao, 2024" in linked
+    assert "#ref-1" in linked
+    assert "12345678" not in linked
+    assert "[NCT03710707](https://clinicaltrials.gov/study/NCT03710707)" in linked
+
+
+def test_apa_intext_citation_uses_author_year_when_metadata_available(monkeypatch):
+    monkeypatch.setattr(
+        workflow,
+        "_fetch_reference_meta",
+        lambda eid: {"authors": ["Ng X. Y.", "Cao M."], "year": "2024", "title": "Example paper"},
+    )
+
+    assert workflow._format_apa_intext_citation(3, "PMID:12345678") == "[Ng & Cao, 2024](#ref-3)"
+
+
 def test_extract_evidence_ids_from_text_deduplication():
     text = "Found PMID:11111111 and PMID:11111111 again, plus PMID:22222222"
     ids = workflow._extract_evidence_ids_from_text(text)
     assert ids == ["PMID:11111111", "PMID:22222222"]
+
+
+def test_clean_executor_summary_text_humanizes_internal_monarch_terms():
+    raw = (
+        "LRRK2 was associated with Parkinson disease via predicate: "
+        "biolink:gene_associated_with_condition in disease_to_gene_causal mode."
+    )
+    cleaned = workflow._clean_executor_summary_text(raw)
+    assert "biolink:" not in cleaned
+    assert "disease_to_gene_causal" not in cleaned
+    assert "gene-disease association" in cleaned
+    assert "causal disease-gene" in cleaned
+
+
+def test_clean_executor_summary_text_preserves_curie_colons_in_query_lines():
+    raw = (
+        'Querying gene-to-phenotype associations for HGNC:18618 (LRRK2) as the gene, both with and without a '
+        '"Parkinson disease" phenotype filter, yielded no results. '
+        "Querying disease-to-gene correlated associations for MONDO:0005180 as the disease entity did not list "
+        "LRRK2 (HGNC:18618) among the top 10 associated genes."
+    )
+    cleaned = workflow._clean_executor_summary_text(raw)
+    assert "HGNC:18618 (LRRK2) as the gene" in cleaned
+    assert "MONDO:0005180 as the disease entity" in cleaned
+    assert "18618) as the gene" not in cleaned
+    assert "for 0005180 as the disease entity" not in cleaned
+
+
+def test_validate_structured_observations_normalizes_biolink_predicate():
+    observations = workflow._validate_structured_observations([
+        {
+            "observation_type": "phenotype_association",
+            "subject": {"type": "disease", "label": "Parkinson disease", "id": "MONDO:0005180"},
+            "predicate": "biolink:gene_associated_with_condition",
+            "object": {"type": "gene", "label": "LRRK2", "id": "HGNC:18618"},
+            "supporting_ids": ["MONDO:0005180"],
+            "source_tool": "query_monarch_associations",
+            "confidence": "high",
+        },
+    ])
+    assert observations[0]["predicate"] == "associated_with"
+
+
+def test_format_reference_apa_falls_back_to_europe_pmc_when_pubmed_meta_is_unavailable(monkeypatch):
+    workflow._CITATION_META_CACHE.clear()
+
+    def _fake_http(url: str):
+        if "eutils.ncbi.nlm.nih.gov" in url:
+            return None
+        if "europepmc" in url:
+            return {
+                "resultList": {
+                    "result": [{
+                        "pmid": "12345678",
+                        "doi": "10.1000/example-doi",
+                        "title": "Fallback LRRK2 paper",
+                        "authorString": "Doe J, Smith A.",
+                        "journalTitle": "Example Journal",
+                        "issue": "2",
+                        "journalVolume": "5",
+                        "pubYear": "2024",
+                        "pageInfo": "10-20",
+                    }],
+                },
+            }
+        return None
+
+    monkeypatch.setattr(workflow, "_http_get_json", _fake_http)
+
+    citation = workflow._format_reference_apa(1, "PMID:12345678")
+    assert "Fallback LRRK2 paper" in citation
+    assert "Example Journal" in citation
+    assert "PMID: [12345678]" in citation
