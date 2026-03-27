@@ -1,4 +1,7 @@
+import html
 import json
+import re
+from pathlib import Path
 
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 from google.adk.models.llm_request import LlmRequest
@@ -3020,13 +3023,141 @@ def test_router_before_model_callback_forces_research_workflow_for_complex_compa
     assert call["args"]["agent_name"] == "research_workflow"
 
 
-def test_router_before_model_callback_leaves_simple_knowledge_question_to_router_model():
+def test_router_before_model_callback_forces_research_workflow_for_candidate_set_query():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {}
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(
+                    text=(
+                        "Among amylin, glucagon, MC4R, and GDF15-based approaches, "
+                        "which obesity mechanisms look strongest beyond GLP-1?"
+                    )
+                )],
+            )
+
+    callback_context = DummyCallbackContext()
+    llm_request = LlmRequest()
+
+    response = workflow._router_before_model_callback(
+        callback_context=callback_context,
+        llm_request=llm_request,
+    )
+
+    assert response is not None
+    call = workflow._extract_function_calls(response)[0]
+    assert call["name"] == "transfer_to_agent"
+    assert call["args"]["agent_name"] == "research_workflow"
+
+
+def test_router_before_model_callback_forces_research_workflow_for_scoped_safety_comparison():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {}
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(
+                    text="Are TYK2 inhibitors safer than JAK inhibitors in psoriasis and psoriatic arthritis?"
+                )],
+            )
+
+    callback_context = DummyCallbackContext()
+    llm_request = LlmRequest()
+
+    response = workflow._router_before_model_callback(
+        callback_context=callback_context,
+        llm_request=llm_request,
+    )
+
+    assert response is not None
+    call = workflow._extract_function_calls(response)[0]
+    assert call["name"] == "transfer_to_agent"
+    assert call["args"]["agent_name"] == "research_workflow"
+
+
+def test_router_before_model_callback_forces_research_workflow_for_all_landing_page_example_queries():
+    ui_html = Path("adk-agent/ui/index.html").read_text(encoding="utf-8")
+    queries = [
+        html.unescape(match)
+        for match in re.findall(r'data-query="([^"]+)"', ui_html)
+    ]
+    assert queries
+
+    class DummyCallbackContext:
+        def __init__(self, text: str) -> None:
+            self.state = {}
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=text)],
+            )
+
+    for query in queries:
+        response = workflow._router_before_model_callback(
+            callback_context=DummyCallbackContext(query),
+            llm_request=LlmRequest(),
+        )
+        assert response is not None, query
+        call = workflow._extract_function_calls(response)[0]
+        assert call["name"] == "transfer_to_agent", query
+        assert call["args"]["agent_name"] == "research_workflow", query
+
+
+def test_router_before_model_callback_forces_research_workflow_for_paraphrased_research_queries():
+    queries = [
+        "Which obesity approaches after GLP-1 seem most compelling among amylin, glucagon, MC4R, and GDF15?",
+        "Which public schizophrenia imaging datasets look most reusable for an external replication study?",
+    ]
+
+    class DummyCallbackContext:
+        def __init__(self, text: str) -> None:
+            self.state = {}
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=text)],
+            )
+
+    for query in queries:
+        response = workflow._router_before_model_callback(
+            callback_context=DummyCallbackContext(query),
+            llm_request=LlmRequest(),
+        )
+        assert response is not None, query
+        call = workflow._extract_function_calls(response)[0]
+        assert call["name"] == "transfer_to_agent", query
+        assert call["args"]["agent_name"] == "research_workflow", query
+
+
+def test_router_before_model_callback_forces_general_qa_for_simple_knowledge_question():
     class DummyCallbackContext:
         def __init__(self) -> None:
             self.state = {}
             self.user_content = types.Content(
                 role="user",
                 parts=[types.Part.from_text(text="What is CRISPR?")],
+            )
+
+    callback_context = DummyCallbackContext()
+    llm_request = LlmRequest()
+
+    response = workflow._router_before_model_callback(
+        callback_context=callback_context,
+        llm_request=llm_request,
+    )
+
+    assert response is not None
+    call = workflow._extract_function_calls(response)[0]
+    assert call["name"] == "transfer_to_agent"
+    assert call["args"]["agent_name"] == "general_qa"
+
+
+def test_router_before_model_callback_leaves_ambiguous_query_to_router_model():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {}
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="compare them")],
             )
 
     callback_context = DummyCallbackContext()

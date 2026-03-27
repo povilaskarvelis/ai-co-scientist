@@ -558,6 +558,8 @@ Available agents:
    commands and plan management.
    Examples: "Evaluate LRRK2 as a therapeutic target for Parkinson disease",
    "Compare the safety profiles of SGLT2 inhibitors vs DPP-4 inhibitors",
+   "Among amylin, glucagon, MC4R, and GDF15-based approaches, which obesity mechanisms look strongest beyond GLP-1?",
+   "Are TYK2 inhibitors safer than JAK inhibitors in psoriasis and psoriatic arthritis?",
    "Why is KRAS G12C monotherapy more effective in NSCLC than colorectal cancer, and which combination strategies have the best biological and clinical support in colorectal cancer?",
    any command (approve, continue, finalize, revise:, history, rollback, switch)
 
@@ -578,6 +580,11 @@ Routing priority rules (check in order):
 7. If the query is a clear research question requiring evidence from databases → research_workflow
 8. If the query is a straightforward biomedical knowledge question → general_qa
 9. If the query is ambiguous, incomplete, or doesn't make sense → clarifier
+
+Important routing bias:
+- Use **general_qa** ONLY for obvious textbook-style questions that can be answered from stable background knowledge without comparing options, ranking candidates, or weighing external evidence.
+- If the user is asking to evaluate, compare, rank, prioritize, assess safety/efficacy/selectivity/pathogenicity, judge tractability, identify datasets, or analyze a named set of options, route to **research_workflow** even if they did not name sources explicitly.
+- If you are unsure between **general_qa** and **research_workflow**, choose **research_workflow**.
 
 You MUST always transfer. Never respond with text yourself.
 """
@@ -862,10 +869,79 @@ def _is_lookup_expansion_request(user_text: str) -> bool:
     )
 
 
+def _is_obvious_general_qa_query(user_text: str) -> bool:
+    """Return True only for narrow textbook-style questions suitable for direct Q&A."""
+    normalized = f" {_normalize_user_text(user_text)} "
+    stripped = normalized.strip()
+    if len(stripped) < 8:
+        return False
+    if _is_obvious_research_workflow_query(user_text):
+        return False
+
+    educational_starts = (
+        "what is ",
+        "what are ",
+        "what does ",
+        "what do ",
+        "explain ",
+        "define ",
+        "describe ",
+        "how does ",
+        "how do ",
+        "why do ",
+        "why does ",
+    )
+    research_like_terms = (
+        " compare ",
+        " compared ",
+        " versus ",
+        " vs ",
+        " safer ",
+        " more effective ",
+        " less effective ",
+        " rank ",
+        " rank them ",
+        " prioritize ",
+        " promising ",
+        " strongest ",
+        " best ",
+        " credible ",
+        " validated ",
+        " efficacy ",
+        " toxic",
+        " tolerability ",
+        " selectivity ",
+        " pathogenic ",
+        " pathogenicity ",
+        " gain-of-function ",
+        " loss-of-function ",
+        " repurpose ",
+        " repurposing ",
+        " dataset ",
+        " datasets ",
+        " trial ",
+        " trials ",
+        " literature ",
+        " evidence ",
+        " pubmed ",
+        " clinicaltrials.gov ",
+        " open targets ",
+    )
+
+    if not stripped.startswith(educational_starts):
+        return False
+    if any(term in normalized for term in research_like_terms):
+        return False
+    if stripped.startswith(("how does ", "how do ", "why do ", "why does ")) and "," in user_text:
+        return False
+    return True
+
+
 def _is_obvious_research_workflow_query(user_text: str) -> bool:
     """Return True for clearly evidence-driven research asks that should bypass general QA."""
     normalized = f" {_normalize_user_text(user_text)} "
-    if len(normalized.strip()) < 40:
+    stripped = normalized.strip()
+    if len(stripped) < 40:
         return False
 
     explicit_research_phrases = (
@@ -883,10 +959,15 @@ def _is_obvious_research_workflow_query(user_text: str) -> bool:
     comparison_phrases = (
         " more effective ",
         " less effective ",
+        " work better ",
+        " works better ",
         " compared with ",
         " compared to ",
         " versus ",
         " vs ",
+        " safer than ",
+        " better than ",
+        " worse than ",
     )
     evidence_terms = (
         " clinical support ",
@@ -900,19 +981,161 @@ def _is_obvious_research_workflow_query(user_text: str) -> bool:
         " combination ",
         " monotherapy ",
     )
+    evaluation_phrases = (
+        " look strongest ",
+        " looks strongest ",
+        " look most promising ",
+        " looks most promising ",
+        " compelling ",
+        " look best ",
+        " looks best ",
+        " look most credible ",
+        " looks most credible ",
+        " work better ",
+        " works better ",
+        " safer than ",
+        " better than ",
+        " worse than ",
+        " clinically validated ",
+        " tissue selectivity ",
+        " pathogenic ",
+        " pathogenicity ",
+        " gain-of-function ",
+        " loss-of-function ",
+        " prioritize next ",
+        " rank ",
+        " rank them ",
+        " compare ",
+        " repurpose ",
+        " repurposing ",
+    )
+    domain_scope_terms = (
+        " drug ",
+        " drugs ",
+        " target ",
+        " targets ",
+        " therapy ",
+        " therapies ",
+        " inhibitor ",
+        " inhibitors ",
+        " mechanism ",
+        " mechanisms ",
+        " approach ",
+        " approaches ",
+        " co-target ",
+        " co-targets ",
+        " dependency ",
+        " dependencies ",
+        " co-dependency ",
+        " co-dependencies ",
+        " variant ",
+        " variants ",
+        " phenotype ",
+        " disease ",
+        " diseases ",
+        " cancer ",
+        " dermatitis ",
+        " psoriasis ",
+        " arthritis ",
+        " obesity ",
+        " dataset ",
+        " datasets ",
+        " mri ",
+        " fmri ",
+        " eeg ",
+        " meg ",
+    )
+    source_terms = (
+        " dailymed ",
+        " clinicaltrials.gov ",
+        " lincs ",
+        " prism ",
+        " pharmacodb ",
+        " chembl ",
+        " rcsb pdb ",
+        " hpo ",
+        " orphanet ",
+        " monarch ",
+        " clingen ",
+        " openneuro ",
+        " dandi ",
+        " nemar ",
+        " brain-code ",
+        " braincode ",
+    )
+    dataset_evaluation_terms = (
+        " most usable ",
+        " strongest ",
+        " benchmark ",
+        " first study ",
+        " reuse ",
+        " reusable ",
+        " realistic ",
+        " replication study ",
+        " metadata quality ",
+        " access friction ",
+    )
 
     if any(phrase in normalized for phrase in explicit_research_phrases):
         return True
 
     if (
-        normalized.strip().startswith(("why is ", "why are ", "which ", "what explains ", "how does "))
-        and any(phrase in normalized for phrase in comparison_phrases)
-        and sum(1 for term in evidence_terms if term in normalized) >= 2
+        stripped.startswith(("among ", "for "))
+        and any(term in normalized for term in evaluation_phrases)
+        and any(term in normalized for term in domain_scope_terms)
+        and ("," in user_text or " and " in normalized)
     ):
         return True
 
     if (
-        (" which " in normalized or normalized.strip().startswith("which "))
+        stripped.startswith("which ")
+        and "," in user_text
+        and any(term in normalized for term in evaluation_phrases)
+        and any(term in normalized for term in domain_scope_terms)
+    ):
+        return True
+
+    if (
+        stripped.startswith(("why is ", "why are ", "why does ", "which ", "what explains ", "how does ", "are ", "is "))
+        and any(phrase in normalized for phrase in comparison_phrases)
+        and any(term in normalized for term in domain_scope_terms)
+        and (
+            sum(1 for term in evidence_terms if term in normalized) >= 1
+            or any(term in normalized for term in evaluation_phrases)
+        )
+    ):
+        return True
+
+    if (
+        any(term in normalized for term in source_terms)
+        and (
+            any(term in normalized for term in evaluation_phrases)
+            or any(term in normalized for term in evidence_terms)
+            or " compare " in normalized
+        )
+    ):
+        return True
+
+    if (
+        stripped.startswith(("which ", "for "))
+        and any(term in normalized for term in (" dataset ", " datasets ", " mri ", " fmri ", " eeg ", " meg ", " openneuro ", " nemar ", " dandi ", " brain-code ", " braincode "))
+        and (
+            any(term in normalized for term in dataset_evaluation_terms)
+            or " rank " in normalized
+            or " rank them " in normalized
+        )
+    ):
+        return True
+
+    if (
+        stripped.startswith(("for ", "how should ", "does "))
+        and " variant " in normalized
+        and any(term in normalized for term in (" pathogenic ", " pathogenicity ", " gain-of-function ", " loss-of-function "))
+    ):
+        return True
+
+    if (
+        (" which " in normalized or stripped.startswith("which "))
         and " support " in normalized
         and " clinical " in normalized
         and " biological " in normalized
@@ -9123,6 +9346,19 @@ def _router_before_model_callback(
             function_call=types.FunctionCall(
                 name="transfer_to_agent",
                 args={"agent_name": "research_workflow"},
+            )
+        )
+        return LlmResponse(
+            content=types.Content(role="model", parts=[transfer_part]),
+            partial=False,
+            turn_complete=False,
+        )
+
+    if not has_report and _is_obvious_general_qa_query(user_turn):
+        transfer_part = types.Part(
+            function_call=types.FunctionCall(
+                name="transfer_to_agent",
+                args={"agent_name": "general_qa"},
             )
         )
         return LlmResponse(
