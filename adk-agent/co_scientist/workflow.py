@@ -419,6 +419,11 @@ def _build_default_tool_hint_by_source_label() -> dict[str, str]:
 
 DEFAULT_TOOL_HINT_BY_SOURCE_LABEL = _build_default_tool_hint_by_source_label()
 INTERNAL_SKILL_TOOL_NAMES = {"list_skills", "load_skill", "load_skill_resource"}
+COMPOUND_QUERY_REQUIRED_TOOLS = {
+    "get_gdsc_drug_sensitivity",
+    "get_prism_repurposing_response",
+    "get_pharmacodb_compound_response",
+}
 
 
 PLANNER_INSTRUCTION_TEMPLATE = """
@@ -446,6 +451,9 @@ Rules:
 - Choose the number of steps needed for the objective. Avoid unnecessary fragmentation.
 - Match each step to real tool capability. Do not write completion conditions that require lineage-, mutation-, cell-line-, or cohort-filtered
   results from a tool that only returns release-level or aggregate summaries.
+- Do not assign model-first or cohort-first drug-discovery steps to compound-response tools that require a named drug/compound query
+  (`get_gdsc_drug_sensitivity`, `get_prism_repurposing_response`, `get_pharmacodb_compound_response`). Use those only after a
+  candidate compound is already named, or rewrite the step so the completion condition matches what the tool can actually return.
 - Do not create standalone schema-inspection or table-discovery steps unless the user explicitly asked about schemas
   or the BigQuery lookup is already identifier-ready and schema inspection is unavoidable. In most cases, schema
   inspection should happen inline inside an evidence-gathering step, not as a reportable deliverable.
@@ -471,6 +479,8 @@ Citation requirement:
     - goal: "Find and record PMIDs / DOIs / NCT numbers for the key claims from the preceding steps."
     - completion_condition: "At least 3 specific identifiers (PMID, DOI, or NCT) are recorded."
 - Place the literature step AFTER the aggregate steps so it can incorporate their findings.
+- For compare / rank / prioritize questions about named mechanisms, targets, or modalities, do NOT make a literature-only plan unless the user explicitly asked for literature-only review. Use at least one structured evidence source (for example Open Targets or GWAS), at least one clinical / pharmacology / tractability source (for example ClinicalTrials.gov, Guide to Pharmacology, DGIdb, or DailyMed when relevant), and literature for caveats or synthesis.
+- When the query names mechanism classes rather than canonical targets or genes (for example amylin, glucagon, MC4R, or GDF15-based approaches), add an explicit mapping step first so later steps can query structured sources against the correct targets, receptors, or lead programs.
 
 __BQ_POLICY__
 
@@ -8753,6 +8763,33 @@ def _using_vertex_ai_backend() -> bool:
     return os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() == "true"
 
 
+def _clear_model_error_stream_state(callback_context: CallbackContext) -> None:
+    """Drop buffered planner/executor/synth text so failures do not leak partial output."""
+    callback_context.state[STATE_PLANNER_BUFFER] = ""
+    callback_context.state[STATE_EXECUTOR_BUFFER] = ""
+    callback_context.state[STATE_EXECUTOR_REASONING_TRACE] = ""
+    callback_context.state[STATE_SYNTH_BUFFER] = ""
+
+
+def _render_rate_limit_error_markdown(*, backend_label: str, error_msg: str) -> str:
+    if _using_vertex_ai_backend():
+        guidance = (
+            "Please try again later, increase the available Vertex AI quota, "
+            "or redeploy with `USE_VERTEX_AI=false` to use the configured API-key backend."
+        )
+    else:
+        guidance = (
+            "Please try again later. Google AI Studio quota windows can take hours "
+            "to reset before another run will succeed."
+        )
+    return (
+        "## Rate Limited\n\n"
+        f"{backend_label} rate limits have been hit, so this run can't continue right now.\n\n"
+        f"{guidance}\n\n"
+        f"`{error_msg[:300]}`"
+    )
+
+
 def _on_model_error(
     *,
     callback_context: CallbackContext,
@@ -8766,38 +8803,49 @@ def _on_model_error(
 
     callback_context.state[STATE_MODEL_ERROR_PASSTHROUGH] = True
 
-    is_rate_limit = any(
-        hint in error_msg.lower()
-        for hint in ("429", "resource exhausted", "rate limit", "quota", "503", "unavailable")
+    lowered_error = error_msg.lower()
+    is_quota_rate_limit = any(
+        hint in lowered_error
+        for hint in ("429", "resource exhausted", "rate limit", "quota")
     )
-    if is_rate_limit:
+    is_retryable_backend_outage = any(
+        hint in lowered_error
+        for hint in ("503", "unavailable")
+    ) and not is_quota_rate_limit
+    if is_quota_rate_limit or is_retryable_backend_outage:
         backend_label = "Vertex AI" if _using_vertex_ai_backend() else "Google AI Studio"
         retry_count = int(callback_context.state.get(STATE_RATE_LIMIT_RETRY_COUNT, 0))
 
-        if RATE_LIMIT_AUTO_RETRY and retry_count < RATE_LIMIT_MAX_RETRIES:
+        if is_quota_rate_limit:
+            callback_context.state[STATE_RATE_LIMIT_RETRY_COUNT] = 0
+            _clear_model_error_stream_state(callback_context)
+            user_msg = _render_rate_limit_error_markdown(
+                backend_label=backend_label,
+                error_msg=error_msg,
+            )
+        elif RATE_LIMIT_AUTO_RETRY and retry_count < RATE_LIMIT_MAX_RETRIES:
             callback_context.state[STATE_RATE_LIMIT_RETRY_COUNT] = retry_count + 1
             backoff = min(RATE_LIMIT_BACKOFF_BASE * (2 ** retry_count) + random.uniform(0, RATE_LIMIT_BACKOFF_BASE), RATE_LIMIT_BACKOFF_MAX)
             logger.info(
-                "Rate limit from %s — retry %d/%d, backing off %.1fs",
+                "Temporary backend outage from %s — retry %d/%d, backing off %.1fs",
                 backend_label, retry_count + 1, RATE_LIMIT_MAX_RETRIES, backoff,
             )
             time.sleep(backoff)
             user_msg = (
-                f"_Rate limit hit from {backend_label} — retry {retry_count + 1}/{RATE_LIMIT_MAX_RETRIES}, waited {backoff:.0f}s…_"
+                f"_Temporary model outage from {backend_label} — retry {retry_count + 1}/{RATE_LIMIT_MAX_RETRIES}, waited {backoff:.0f}s…_"
             )
         else:
             callback_context.state[STATE_RATE_LIMIT_RETRY_COUNT] = 0
-            mitigation = (
-                "This deployment is currently using Vertex AI. If local runs are fine, redeploy with `USE_VERTEX_AI=false` to use the configured API key backend, or increase Vertex quota."
-                if _using_vertex_ai_backend()
-                else "Retry after quota resets, reduce concurrent usage, or switch to a backend with available quota."
+            reason = (
+                f"Retries exhausted ({RATE_LIMIT_MAX_RETRIES})"
+                if retry_count >= RATE_LIMIT_MAX_RETRIES
+                else "Auto-retry disabled"
             )
-            reason = f"Retries exhausted ({RATE_LIMIT_MAX_RETRIES})" if retry_count >= RATE_LIMIT_MAX_RETRIES else "Auto-retry disabled"
             user_msg = (
                 "## Execution Error\n\n"
-                f"{backend_label} quota or rate limit exhausted. {reason}.\n\n"
+                f"{backend_label} is temporarily unavailable. {reason}.\n\n"
                 f"`{error_msg[:300]}`\n\n"
-                f"{mitigation}"
+                "Please try again later."
             )
     else:
         user_msg = (
@@ -10235,6 +10283,11 @@ def _format_step_routing_guidance(tool_hint: str, available_tools: list[str]) ->
         parts.append(
             "- Only fall back if the requested evidence type is unavailable or insufficient. "
             f"Preferred fallbacks: {', '.join(fallback_labels)}."
+        )
+    if hint in COMPOUND_QUERY_REQUIRED_TOOLS:
+        parts.append(
+            "- This is a compound-first tool and requires a named drug/compound query. Do not call it with empty arguments or use it "
+            "to discover unknown compounds from a model-only prompt."
         )
     parts.append(
         "- Do not substitute a nearby overlapping source unless it better matches the step's requested evidence type."

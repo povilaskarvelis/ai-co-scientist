@@ -61,7 +61,8 @@ const CLINGEN_GENE_DOSAGE_DOWNLOAD = "https://search.clinicalgenome.org/kb/gene-
 const ORPHADATA_PRODUCT1_XML = "https://www.orphadata.com/data/xml/en_product1.xml";
 const ORPHADATA_PRODUCT4_XML = "https://www.orphadata.com/data/xml/en_product4.xml";
 const ORPHADATA_PRODUCT6_XML = "https://www.orphadata.com/data/xml/en_product6.xml";
-const CANCERRXGENE_API = "https://www.cancerrxgene.org/api";
+const CELL_MODEL_PASSPORTS_API = "https://api.cellmodelpassports.sanger.ac.uk";
+const CELL_MODEL_PASSPORTS_WEB = "https://cellmodelpassports.sanger.ac.uk";
 const PHARMACODB_GRAPHQL_API = "https://pharmacodb.ca/graphql";
 const PRISM_24Q2_FIGSHARE_ARTICLE = "https://figshare.com/articles/dataset/Repurposing_Public_24Q2/25917643";
 const PRISM_24Q2_COMPOUND_LIST_URL = "https://ndownloader.figshare.com/files/46630981";
@@ -210,6 +211,7 @@ const cellxgeneDeFiltersCache = new Map();
 let clinGenGeneValidityCache = null;
 let clinGenDosageCache = null;
 let gdscCompoundCache = null;
+const gdscOverviewCache = new Map();
 let prismCompoundCatalogCache = null;
 let prismCellLineCatalogCache = null;
 let prismMatrixCache = null;
@@ -2655,6 +2657,72 @@ function normalizeDepMapSubtypeLookupToken(value) {
     .replace(/[^a-z0-9]+/g, "");
 }
 
+function simplifyDepMapSubtypeAlias(value) {
+  const cleaned = normalizeWhitespace(value || "");
+  if (!cleaned) return "";
+  return normalizeWhitespace(
+    cleaned
+      .replace(/\badenocarcinoma in situ\b/gi, "")
+      .replace(/\badenocarcinoma\b/gi, "")
+      .replace(/\bcarcinoma in situ\b/gi, "")
+      .replace(/\bcarcinoma\b/gi, "")
+      .replace(/\bcancer\b/gi, "")
+      .replace(/\btumou?r\b/gi, "")
+      .replace(/\bneoplasm\b/gi, "")
+  );
+}
+
+function getCuratedDepMapSubtypeAliases(row, canonicalCode) {
+  const code = normalizeWhitespace(canonicalCode || "").toUpperCase();
+  const oncotreeCode = normalizeWhitespace(row?.OncotreeCode || "").toUpperCase();
+  const lineage = normalizeWhitespace(row?.Level0 || row?.Level1 || "").toLowerCase();
+  const nodeName = normalizeWhitespace(row?.NodeName || row?.DisplayName || "").toLowerCase();
+  const aliases = [];
+
+  if (code === "COADREAD" || oncotreeCode === "COADREAD" || nodeName.includes("colorectal adenocarcinoma")) {
+    aliases.push("colorectal", "colorectal cancer", "colorectal carcinoma", "crc", "large intestine", "large_intestine");
+  }
+  if (code === "COAD" || oncotreeCode === "COAD" || nodeName.includes("colon adenocarcinoma")) {
+    aliases.push("colon", "colon cancer", "colon carcinoma");
+  }
+  if (code === "READ" || oncotreeCode === "READ" || nodeName.includes("rectal adenocarcinoma")) {
+    aliases.push("rectal", "rectal cancer", "rectal carcinoma");
+  }
+  if (code === "LUNG" || lineage === "lung" || nodeName === "lung") {
+    aliases.push("lung cancer");
+  }
+
+  return dedupeArray(aliases.filter(Boolean));
+}
+
+function buildDepMapSubtypeAliasCandidates(row, canonicalCode) {
+  const candidates = [
+    canonicalCode,
+    row?.NodeName,
+    row?.DisplayName,
+    row?.DepmapModelType,
+    row?.MolecularSubtypeCode,
+    row?.OncotreeCode,
+    row?.Level0,
+    row?.Level1,
+    row?.Level2,
+    row?.Level3,
+    row?.Level4,
+    row?.Level5,
+  ].filter(Boolean);
+
+  const expanded = [];
+  for (const candidate of candidates) {
+    expanded.push(candidate);
+    const simplified = simplifyDepMapSubtypeAlias(candidate);
+    if (simplified && normalizeDepMapSubtypeLookupToken(simplified) !== normalizeDepMapSubtypeLookupToken(candidate)) {
+      expanded.push(simplified);
+    }
+  }
+  expanded.push(...getCuratedDepMapSubtypeAliases(row, canonicalCode));
+  return dedupeArray(expanded.map((value) => normalizeWhitespace(value)).filter(Boolean));
+}
+
 function buildDepMapSubtypeAliasLookup(treeRows) {
   const lookup = new Map();
   const addAlias = (alias, code) => {
@@ -2675,11 +2743,9 @@ function buildDepMapSubtypeAliasLookup(treeRows) {
       || ""
     );
     if (!canonicalCode) continue;
-    addAlias(canonicalCode, canonicalCode);
-    addAlias(row?.NodeName, canonicalCode);
-    addAlias(row?.DisplayName, canonicalCode);
-    addAlias(row?.DepmapModelType, canonicalCode);
-    addAlias(row?.MolecularSubtypeCode, canonicalCode);
+    for (const alias of buildDepMapSubtypeAliasCandidates(row, canonicalCode)) {
+      addAlias(alias, canonicalCode);
+    }
     if (/_LoF$/i.test(canonicalCode)) {
       addAlias(canonicalCode.replace(/_LoF$/i, "Loss"), canonicalCode);
       addAlias(canonicalCode.replace(/_LoF$/i, " Loss"), canonicalCode);
@@ -2688,6 +2754,58 @@ function buildDepMapSubtypeAliasLookup(treeRows) {
   }
 
   return lookup;
+}
+
+function collectDepMapSubtypeSuggestions(subtypeQuery, treeRows, headerColumns = [], limit = 5) {
+  const queryToken = normalizeDepMapSubtypeLookupToken(subtypeQuery);
+  if (!queryToken) return [];
+
+  const scores = new Map();
+  const labelByCode = new Map();
+  const headerSet = new Set(
+    (Array.isArray(headerColumns) ? headerColumns : [])
+      .map((value) => normalizeWhitespace(value))
+      .filter(Boolean)
+  );
+
+  for (const row of Array.isArray(treeRows) ? treeRows : []) {
+    const canonicalCode = normalizeWhitespace(
+      row?.MolecularSubtypeCode
+      || row?.DepmapModelType
+      || row?.NodeName
+      || row?.DisplayName
+      || ""
+    );
+    if (!canonicalCode) continue;
+    const displayName = normalizeWhitespace(row?.NodeName || row?.DisplayName || canonicalCode);
+    labelByCode.set(canonicalCode, displayName);
+
+    let bestScore = scores.get(canonicalCode) || 0;
+    for (const alias of buildDepMapSubtypeAliasCandidates(row, canonicalCode)) {
+      const token = normalizeDepMapSubtypeLookupToken(alias);
+      if (!token) continue;
+      let score = 0;
+      if (token === queryToken) score = 300;
+      else if (token.startsWith(queryToken) || queryToken.startsWith(token)) score = 180;
+      else if (token.includes(queryToken) || queryToken.includes(token)) score = 120;
+      if (headerSet.has(canonicalCode)) score += 10;
+      if (/^Z/.test(canonicalCode) && !queryToken.includes("fibro")) score -= 20;
+      if (score > bestScore) {
+        bestScore = score;
+      }
+    }
+    if (bestScore > 0) {
+      scores.set(canonicalCode, bestScore);
+    }
+  }
+
+  return [...scores.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, Math.max(1, limit))
+    .map(([code]) => ({
+      code,
+      label: labelByCode.get(code) || code,
+    }));
 }
 
 function resolveDepMapSubtypeCode(subtypeQuery, treeRows, headerColumns = []) {
@@ -3184,40 +3302,103 @@ function normalizeGdscLookupText(value) {
     .trim();
 }
 
+function normalizeJsonApiLink(url, fallbackBase = "") {
+  const raw = normalizeWhitespace(url || "");
+  if (!raw) return "";
+  if (/^https?:\/\//i.test(raw)) {
+    return raw.replace(/^http:\/\//i, "https://");
+  }
+  if (!fallbackBase) return raw;
+  try {
+    return new URL(raw, fallbackBase).toString().replace(/^http:\/\//i, "https://");
+  } catch (_) {
+    return raw;
+  }
+}
+
+async function fetchJsonApiCollectionPages(initialUrl, {
+  retries = 1,
+  timeoutMs = 30000,
+  maxBackoffMs = 4000,
+  pageLimit = 25,
+} = {}) {
+  const data = [];
+  const included = new Map();
+  let meta = null;
+  let nextUrl = normalizeJsonApiLink(initialUrl, CELL_MODEL_PASSPORTS_API);
+  let pageCount = 0;
+
+  while (nextUrl && pageCount < pageLimit) {
+    const payload = await fetchJsonWithRetry(nextUrl, {
+      retries,
+      timeoutMs,
+      maxBackoffMs,
+      headers: { Accept: "application/json, application/vnd.api+json" },
+    });
+    pageCount += 1;
+
+    if (Array.isArray(payload?.data)) {
+      data.push(...payload.data);
+    } else if (payload?.data && typeof payload.data === "object") {
+      data.push(payload.data);
+    }
+
+    for (const item of Array.isArray(payload?.included) ? payload.included : []) {
+      const key = `${normalizeWhitespace(item?.type || "")}:${normalizeWhitespace(item?.id || "")}`;
+      if (key !== ":" && !included.has(key)) {
+        included.set(key, item);
+      }
+    }
+
+    if (payload?.meta && typeof payload.meta === "object") {
+      meta = payload.meta;
+    }
+
+    nextUrl = normalizeJsonApiLink(payload?.links?.next || "", CELL_MODEL_PASSPORTS_API);
+  }
+
+  return {
+    data,
+    included: [...included.values()],
+    meta,
+    truncated: Boolean(nextUrl),
+  };
+}
+
 async function fetchGdscCompoundCatalog() {
   const cached = getFreshCacheValue(gdscCompoundCache, 12 * 60 * 60 * 1000);
   if (cached) return cached;
 
-  const response = await fetchWithRetry(`${CANCERRXGENE_API}/compounds?list=all`, {
-    retries: 1,
-    timeoutMs: 20000,
-    maxBackoffMs: 3000,
-  });
-  const text = await response.text();
-  const rows = parseDelimitedObjects(text, "\t")
-    .map((row) => {
+  const payload = await fetchJsonApiCollectionPages(
+    `${CELL_MODEL_PASSPORTS_API}/drugs?page%5Bsize%5D=250`,
+    { retries: 1, timeoutMs: 30000, maxBackoffMs: 3000, pageLimit: 10 }
+  );
+  const rows = (Array.isArray(payload?.data) ? payload.data : [])
+    .map((entry) => {
+      const attrs = entry?.attributes && typeof entry.attributes === "object" ? entry.attributes : {};
       const synonyms = dedupeArray(
-        normalizeWhitespace(row?.Synonyms || "")
+        normalizeWhitespace(attrs?.synonyms || "")
           .split(",")
           .map((value) => normalizeWhitespace(value))
           .filter(Boolean)
       );
       const targets = dedupeArray(
-        normalizeWhitespace(row?.Targets || "")
+        normalizeWhitespace(attrs?.putative_target || "")
           .split(",")
           .map((value) => normalizeWhitespace(value))
           .filter(Boolean)
       );
+      const ic50s = Array.isArray(entry?.relationships?.ic50s?.data) ? entry.relationships.ic50s.data : [];
       return {
-        drug_id: normalizeWhitespace(row?.["Drug Id"] || ""),
-        name: normalizeWhitespace(row?.Name || ""),
+        drug_id: normalizeWhitespace(entry?.id || ""),
+        name: normalizeWhitespace(attrs?.drug_name || ""),
         synonyms,
         targets,
-        target_pathway: normalizeWhitespace(row?.["Target pathway"] || ""),
-        pubchem: normalizeWhitespace(row?.PubCHEM || ""),
-        dataset: normalizeWhitespace(row?.Datasets || ""),
-        screening_site: normalizeWhitespace(row?.["Screening site"] || ""),
-        cell_line_count: toNonNegativeInt(row?.["number of cell lines"], 0),
+        target_pathway: normalizeWhitespace(attrs?.drug_target_pathway || ""),
+        pubchem: normalizeWhitespace(attrs?.pubchem || ""),
+        dataset: "GDSC2",
+        screening_site: normalizeWhitespace(attrs?.screening_site || ""),
+        cell_line_count: ic50s.length,
       };
     })
     .filter((row) => row.drug_id && row.name);
@@ -3312,16 +3493,67 @@ function resolveGdscCompoundSelection(catalogRows, rawQuery, datasetFilter = "al
 }
 
 async function fetchGdscOverviewData(drugId, dataset) {
-  const url =
-    `${CANCERRXGENE_API}/compound/overview_data?id=${encodeURIComponent(drugId)}` +
-    `&screening_set=${encodeURIComponent(dataset)}&tissue=`;
-  const data = await fetchJsonWithRetry(url, {
-    retries: 1,
-    timeoutMs: 20000,
-    maxBackoffMs: 3000,
-    headers: { Accept: "application/json" },
-  });
-  return Array.isArray(data?.data) ? data.data : [];
+  const normalizedDrugId = normalizeWhitespace(drugId || "");
+  const normalizedDataset = normalizeWhitespace(dataset || "").toUpperCase();
+  const cacheKey = `${normalizedDrugId}::${normalizedDataset || "ALL"}`;
+  const cached = getFreshCacheValue(gdscOverviewCache.get(cacheKey), 6 * 60 * 60 * 1000);
+  if (cached) {
+    return cached;
+  }
+
+  if (!normalizedDrugId) {
+    return [];
+  }
+
+  if (normalizedDataset === "GDSC1") {
+    gdscOverviewCache.set(cacheKey, storeCacheValue(null, []));
+    return [];
+  }
+
+  const filterJson = encodeURIComponent(JSON.stringify([
+    { name: "drug_id", op: "eq", val: Number.parseInt(normalizedDrugId, 10) },
+  ]));
+  const payload = await fetchJsonApiCollectionPages(
+    `${CELL_MODEL_PASSPORTS_API}/nlmes?page%5Bsize%5D=250&include=drug,model.sample.tissue&sort=z_score&filter=${filterJson}`,
+    { retries: 1, timeoutMs: 45000, maxBackoffMs: 4000, pageLimit: 12 }
+  );
+  const includedMap = new Map(
+    (Array.isArray(payload?.included) ? payload.included : [])
+      .map((item) => [`${normalizeWhitespace(item?.type || "")}:${normalizeWhitespace(item?.id || "")}`, item])
+  );
+  const drugEntry = includedMap.get(`drug:${normalizedDrugId}`);
+  const drugAttrs = drugEntry?.attributes && typeof drugEntry.attributes === "object" ? drugEntry.attributes : {};
+  const records = (Array.isArray(payload?.data) ? payload.data : [])
+    .map((entry) => {
+      const attrs = entry?.attributes && typeof entry.attributes === "object" ? entry.attributes : {};
+      const modelId = normalizeWhitespace(attrs?.model_id || entry?.relationships?.model?.data?.id || "");
+      const modelEntry = includedMap.get(`model:${modelId}`);
+      const modelAttrs = modelEntry?.attributes && typeof modelEntry.attributes === "object" ? modelEntry.attributes : {};
+      const sampleId = normalizeWhitespace(modelEntry?.relationships?.sample?.data?.id || "");
+      const sampleEntry = includedMap.get(`sample:${sampleId}`);
+      const tissueId = normalizeWhitespace(sampleEntry?.relationships?.tissue?.data?.id || "");
+      const tissueEntry = includedMap.get(`tissue:${tissueId}`);
+      const modelNames = Array.isArray(modelAttrs?.names) ? modelAttrs.names : [];
+      const lnIc50 = toNullableNumber(attrs?.ln_ic50);
+      return {
+        dataset: "GDSC2",
+        drug_id: normalizedDrugId,
+        compound_name: normalizeWhitespace(drugAttrs?.drug_name || ""),
+        cell_name: normalizeWhitespace(modelNames[0] || modelId),
+        cell_id: modelId,
+        tcga: "",
+        tissue_name: normalizeWhitespace(tissueEntry?.attributes?.name || ""),
+        gdsc_desc1: "",
+        gdsc_desc2: "",
+        ic50: Number.isFinite(lnIc50) ? Math.exp(lnIc50) : Number.NaN,
+        auc: toNullableNumber(attrs?.auc),
+        z_score: toNullableNumber(attrs?.z_score),
+      };
+    })
+    .filter((row) => row.cell_name);
+
+  gdscOverviewCache.set(cacheKey, storeCacheValue(null, records));
+  return records;
 }
 
 function getGdscTissueLabel(record) {
@@ -18375,11 +18607,11 @@ server.registerTool(
   {
     description:
       "Computes the mean log2(TPM+1) expression for one gene across a named DepMap model subset or molecular subtype " +
-      "from a public release (for example RB1Loss / RB1_LoF in DepMap Public 25Q3). " +
+      "from a public release (for example RB1Loss / RB1_LoF or colorectal / COADREAD in DepMap Public 25Q3). " +
       "Uses the public SubtypeMatrix plus DepMap expression downloads instead of BigQuery.",
     inputSchema: {
       geneSymbol: z.string().describe("Gene symbol to summarize in the DepMap expression matrix (for example 'MT-CO2')."),
-      subtype: z.string().describe("DepMap subtype code or human-readable alias (for example 'RB1Loss' or 'RB1_LoF')."),
+      subtype: z.string().describe("DepMap subtype code or human-readable alias (for example 'RB1Loss', 'RB1_LoF', 'colorectal', or 'lung')."),
       release: z.string().optional().default("25Q3").describe("DepMap public release tag or label (for example '25Q3' or 'DepMap Public 25Q3')."),
       expressionDataset: z.enum(["protein_coding_stranded", "protein_coding", "all_genes_stranded", "all_genes"]).optional().default("protein_coding_stranded")
         .describe("Which DepMap public expression matrix to query. Defaults to the stranded protein-coding log2(TPM+1) matrix."),
@@ -18421,6 +18653,12 @@ server.registerTool(
       );
       const subtypeCode = resolvedSubtype.code;
       if (!subtypeCode) {
+        const suggestions = collectDepMapSubtypeSuggestions(
+          normalizedSubtype,
+          subtypeTree.rows,
+          subtypeMatrix.header,
+          5
+        );
         return {
           content: [{
             type: "text",
@@ -18433,7 +18671,9 @@ server.registerTool(
               sources: [subtypeTree.sourceUrl, subtypeMatrix.sourceUrl].filter(Boolean),
               limitations: [
                 "Subtype resolution uses the public DepMap subtype tree and matrix aliases.",
-                "Try the exact subtype code from SubtypeTree, for example RB1_LoF.",
+                suggestions.length > 0
+                  ? `Nearby subtype codes: ${suggestions.map((item) => `${item.code} (${item.label})`).join(", ")}.`
+                  : "Try the exact subtype code from SubtypeTree, for example RB1_LoF.",
               ],
             }),
           }],
@@ -18578,7 +18818,7 @@ server.registerTool(
             ],
             sources: [subtypeTree.sourceUrl, subtypeMatrix.sourceUrl, expressionCatalogRow.url].filter(Boolean),
             limitations: [
-              "Subtype aliases are resolved against the public DepMap subtype tree; RB1Loss maps to RB1_LoF in the public 25Q3 subtype tree.",
+              "Subtype aliases are resolved against the public DepMap subtype tree; RB1Loss maps to RB1_LoF and colorectal maps to COADREAD in the public 25Q3 subtype tree.",
               "Expression means are computed from the selected public expression matrix and may differ from internal portal aggregations if a different profile-selection rule is used.",
             ],
           }),
@@ -18767,10 +19007,10 @@ server.registerTool(
   "get_gdsc_drug_sensitivity",
   {
     description:
-      "Summarizes GDSC / CancerRxGene drug sensitivity profiles for a compound across cancer cell lines, " +
+      "Summarizes GDSC / CancerRxGene drug sensitivity profiles for a named compound across cancer cell lines, " +
       "including screened datasets, tissue-level sensitivity patterns, and the most sensitive profiled cell lines.",
     inputSchema: {
-      drugQuery: z.string().describe("Drug name, synonym, brand name, or GDSC drug ID (e.g. 'Sorafenib', 'Nexavar', '30')."),
+      drugQuery: z.string().optional().describe("Drug name, synonym, brand name, or GDSC drug ID (e.g. 'Sorafenib', 'Nexavar', '30')."),
       dataset: z.enum(["all", "GDSC1", "GDSC2"]).optional().default("all")
         .describe("Restrict to one GDSC screen or aggregate across both when available."),
       tissue: z.string().optional().describe("Optional tissue or disease filter (e.g. 'lung', 'melanoma', 'LAML')."),
@@ -18785,10 +19025,39 @@ server.registerTool(
     const boundedTissueLimit = Math.max(1, Math.min(10, Math.round(topTissueLimit || 5)));
 
     if (!query) {
-      return { content: [{ type: "text", text: "Provide a drug name, synonym, brand name, or GDSC drug ID (e.g. Sorafenib)." }] };
+      return {
+        content: [{
+          type: "text",
+          text: "Provide a drug name, synonym, brand name, or GDSC/CMP drug ID (e.g. Sorafenib). This tool is compound-first and cannot discover drugs from a model-only prompt.",
+        }],
+      };
     }
 
     try {
+      if (dataset === "GDSC1") {
+        return {
+          content: [{
+            type: "text",
+            text: renderStructuredResponse({
+              summary: `The current public GDSC MCP integration cannot serve legacy GDSC1-only results for "${query}".`,
+              keyFields: [
+                `Query: ${query}`,
+                "Requested dataset: GDSC1",
+                "Live backend: Cell Model Passports GDSC2 API",
+              ],
+              sources: [
+                `${CELL_MODEL_PASSPORTS_WEB}/downloads`,
+                "https://www.cancerrxgene.org/downloads/bulk_download",
+              ],
+              limitations: [
+                "CancerRxGene's legacy public API is retired.",
+                "Cell Model Passports lists GDSC1 legacy IC50 files on the downloads page, but that bulk-file path is not yet wired into this MCP tool.",
+              ],
+            }),
+          }],
+        };
+      }
+
       const catalogRows = await fetchGdscCompoundCatalog();
       const selection = resolveGdscCompoundSelection(catalogRows, query, dataset);
 
@@ -18806,9 +19075,9 @@ server.registerTool(
                 `Query: ${query}`,
                 selection.alternates.length > 0 ? `Nearest compound names: ${selection.alternates.join(", ")}` : "Nearest compound names: none",
               ],
-              sources: ["https://www.cancerrxgene.org/compounds"],
+              sources: [`${CELL_MODEL_PASSPORTS_WEB}/downloads`, `${CELL_MODEL_PASSPORTS_API}/drugs?page%5Bsize%5D=25`],
               limitations: [
-                `Compound matching uses the public GDSC / CancerRxGene compound catalog.${datasetNote}`.trim(),
+                `Compound matching uses the public Cell Model Passports GDSC drug catalog.${datasetNote}`.trim(),
                 "Some compounds appear under screening-specific IDs rather than a single canonical identifier.",
               ],
             }),
@@ -18851,11 +19120,13 @@ server.registerTool(
                 `Compound: ${selection.matchedName}`,
                 `Datasets requested: ${selection.selectedRows.map((row) => row.dataset).join(", ")}`,
               ],
-              sources: selection.selectedRows
-                .map((row) => `https://www.cancerrxgene.org/compound/${encodeURIComponent(row.name)}/${row.drug_id}/by-tissue`)
-                .slice(0, 4),
+              sources: [
+                `${CELL_MODEL_PASSPORTS_WEB}/downloads`,
+                `${CELL_MODEL_PASSPORTS_API}/drugs/${encodeURIComponent(selection.selectedRows[0]?.drug_id || "")}`,
+              ].filter(Boolean),
               limitations: [
-                "Some compounds in the public catalog have sparse or retired screening payloads.",
+                "The current public MCP backend resolves GDSC sensitivity through Cell Model Passports.",
+                "Legacy GDSC1 bulk files are listed on the downloads page but are not integrated into this tool.",
                 "Try a different dataset selection or a more common compound name if you expected results.",
               ],
             }),
@@ -18885,9 +19156,10 @@ server.registerTool(
                 `Compound: ${selection.matchedName}`,
                 `Datasets searched: ${selection.selectedRows.map((row) => `${row.dataset} (drug ID ${row.drug_id})`).join(", ")}`,
               ],
-              sources: selection.selectedRows
-                .map((row) => `https://www.cancerrxgene.org/compound/${encodeURIComponent(row.name)}/${row.drug_id}/by-tissue`)
-                .slice(0, 4),
+              sources: [
+                `${CELL_MODEL_PASSPORTS_WEB}/downloads`,
+                `${CELL_MODEL_PASSPORTS_API}/drugs/${encodeURIComponent(selection.selectedRows[0]?.drug_id || "")}`,
+              ].filter(Boolean),
               limitations: [
                 "Tissue matching is text-based over GDSC tissue labels and TCGA annotations.",
                 "Try a broader tissue term (e.g. 'lung' instead of 'lung squamous').",
@@ -19011,12 +19283,14 @@ server.registerTool(
           text: renderStructuredResponse({
             summary,
             keyFields,
-            sources: selection.selectedRows
-              .map((row) => `https://www.cancerrxgene.org/compound/${encodeURIComponent(row.name)}/${row.drug_id}/by-tissue`)
-              .slice(0, 4),
+            sources: [
+              `${CELL_MODEL_PASSPORTS_WEB}/downloads`,
+              `${CELL_MODEL_PASSPORTS_API}/drugs/${encodeURIComponent(selection.selectedRows[0]?.drug_id || "")}`,
+            ].filter(Boolean),
             limitations: [
+              "Current live GDSC sensitivity is served via the Cell Model Passports API, which exposes the active GDSC2 panel for per-compound response summaries.",
               "GDSC sensitivity is measured in cancer cell lines and does not directly estimate patient response.",
-              "GDSC1 and GDSC2 use different screening designs and concentration ranges; cross-dataset comparisons are directional rather than perfectly harmonized.",
+              "Legacy GDSC1 bulk files remain separately downloadable, but this MCP tool currently summarizes the live GDSC2 API path rather than harmonizing both screens.",
               "AUC and IC50 summarize in vitro response; mechanism, exposure, and resistance in vivo can differ substantially.",
             ],
           }),
@@ -19032,10 +19306,10 @@ server.registerTool(
   "get_prism_repurposing_response",
   {
     description:
-      "Summarizes Broad PRISM repurposing primary-screen response for a compound across pooled cancer cell lines, " +
+      "Summarizes Broad PRISM repurposing primary-screen response for a named compound across pooled cancer cell lines, " +
       "including single-dose log2-fold-change viability patterns, top sensitive tissues, and the most sensitive profiled cell lines.",
     inputSchema: {
-      drugQuery: z.string().describe("Drug name, synonym, or PRISM BRD identifier (e.g. 'Sorafenib', 'Paclitaxel', 'BRD:BRD-K23984367-075-15-2')."),
+      drugQuery: z.string().optional().describe("Drug name, synonym, or PRISM BRD identifier (e.g. 'Sorafenib', 'Paclitaxel', 'BRD:BRD-K23984367-075-15-2')."),
       screen: z.string().optional().describe("Optional PRISM screen filter such as 'REP.PRIMARY' or 'REP.300'."),
       tissue: z.string().optional().describe("Optional tissue filter (e.g. 'lung', 'skin', 'pancreas')."),
       topCellLineLimit: z.number().optional().default(5).describe("Maximum sensitive cell lines to return (1-10)."),
@@ -19050,7 +19324,12 @@ server.registerTool(
     const boundedTissueLimit = Math.max(1, Math.min(10, Math.round(topTissueLimit || 5)));
 
     if (!query) {
-      return { content: [{ type: "text", text: "Provide a drug name, synonym, or PRISM BRD identifier (e.g. Sorafenib)." }] };
+      return {
+        content: [{
+          type: "text",
+          text: "Provide a drug name, synonym, or PRISM BRD identifier (e.g. Sorafenib). This tool is compound-first and cannot discover drugs from a model-only prompt.",
+        }],
+      };
     }
 
     try {
@@ -19352,10 +19631,10 @@ server.registerTool(
   "get_pharmacodb_compound_response",
   {
     description:
-      "Summarizes PharmacoDB compound-response evidence across multiple public pharmacogenomic datasets, " +
+      "Summarizes PharmacoDB compound-response evidence for a named compound across multiple public pharmacogenomic datasets, " +
       "including dataset coverage, tissue-level sensitivity patterns, and the most sensitive profiled cell lines.",
     inputSchema: {
-      drugQuery: z.string().describe("Drug name or PharmacoDB compound UID (e.g. 'Paclitaxel', 'Erlotinib', 'PDBC00058')."),
+      drugQuery: z.string().optional().describe("Drug name or PharmacoDB compound UID (e.g. 'Paclitaxel', 'Erlotinib', 'PDBC00058')."),
       dataset: z.string().optional().describe("Optional PharmacoDB dataset filter (e.g. 'GDSC2', 'PRISM', 'CTRPv2')."),
       tissue: z.string().optional().describe("Optional tissue filter (e.g. 'lung', 'breast', 'skin')."),
       topCellLineLimit: z.number().optional().default(5).describe("Maximum sensitive cell lines to return (1-10)."),
@@ -19370,7 +19649,12 @@ server.registerTool(
     const boundedTissueLimit = Math.max(1, Math.min(10, Math.round(topTissueLimit || 5)));
 
     if (!query) {
-      return { content: [{ type: "text", text: "Provide a drug name or PharmacoDB compound UID (e.g. Paclitaxel)." }] };
+      return {
+        content: [{
+          type: "text",
+          text: "Provide a drug name or PharmacoDB compound UID (e.g. Paclitaxel). This tool is compound-first and cannot discover drugs from a model-only prompt.",
+        }],
+      };
     }
 
     try {

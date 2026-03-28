@@ -1455,12 +1455,32 @@ def test_depmap_tool_metadata_mentions_release_level_limits():
     assert "not lineage/mutation-filtered co-dependency discovery" in preferred_for
 
 
+def test_depmap_expression_subset_tool_metadata_mentions_lineage_aliases():
+    desc = tool_registry.TOOL_DESCRIPTIONS["get_depmap_expression_subset_mean"]
+    assert "colorectal / COADREAD" in desc
+    preferred_for = tool_registry.TOOL_ROUTING_METADATA["get_depmap_expression_subset_mean"]["preferred_for"]
+    assert "lineage alias" in preferred_for
+
+
 def test_variant_annotation_tool_metadata_mentions_protein_hgvs_inputs():
     desc = tool_registry.TOOL_DESCRIPTIONS["get_variant_annotations"]
     assert "gene+protein HGVS" in desc
     assert "KRAS G12C" in desc
     preferred_for = tool_registry.TOOL_ROUTING_METADATA["get_variant_annotations"]["preferred_for"]
     assert "KRAS G12C" in preferred_for
+
+
+def test_compound_response_tool_metadata_mentions_named_drug_requirement():
+    for tool_name in [
+        "get_gdsc_drug_sensitivity",
+        "get_prism_repurposing_response",
+        "get_pharmacodb_compound_response",
+    ]:
+        desc = tool_registry.TOOL_DESCRIPTIONS[tool_name]
+        preferred_for = tool_registry.TOOL_ROUTING_METADATA[tool_name]["preferred_for"]
+        assert "named" in desc.lower()
+        assert "model-first drug discovery" in desc.lower()
+        assert "model-first drug discovery" in preferred_for
 
 
 def test_normalize_source_label_candidates_excludes_internal_skill_tools():
@@ -1765,6 +1785,15 @@ def test_react_step_context_instructions_include_pharmacodb_routing_guidance():
     assert "`get_gdsc_drug_sensitivity` (GDSC / CancerRxGene)" in text
     assert "`get_prism_repurposing_response` (PRISM Repurposing)" in text
     assert "Start with `get_pharmacodb_compound_response`" in text
+    assert "compound-first tool" in text
+    assert "named drug/compound query" in text
+
+
+def test_planner_instruction_warns_about_model_first_compound_discovery_steps():
+    assert "model-first or cohort-first drug-discovery steps" in workflow.PLANNER_INSTRUCTION_TEMPLATE
+    assert "`get_gdsc_drug_sensitivity`" in workflow.PLANNER_INSTRUCTION_TEMPLATE
+    assert "`get_prism_repurposing_response`" in workflow.PLANNER_INSTRUCTION_TEMPLATE
+    assert "`get_pharmacodb_compound_response`" in workflow.PLANNER_INSTRUCTION_TEMPLATE
 
 
 def test_apply_step_execution_result_populates_v1_evidence_store_and_metrics():
@@ -2376,9 +2405,44 @@ def test_on_model_error_surfaces_vertex_rate_limit_without_hidden_retry(monkeypa
 
     assert response is not None
     text = workflow._llm_response_text(response)
-    assert "Vertex AI quota or rate limit exhausted." in text
+    assert "Vertex AI rate limits have been hit" in text
+    assert "Please try again later" in text
     assert "USE_VERTEX_AI=false" in text
     assert callback_context.state[workflow.STATE_MODEL_ERROR_PASSTHROUGH] is True
+
+
+def test_on_model_error_surfaces_ai_studio_rate_limit_and_clears_partial_buffers(monkeypatch):
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {
+                workflow.STATE_EXECUTOR_BUFFER: "partial answer",
+                workflow.STATE_EXECUTOR_REASONING_TRACE: "hidden reasoning",
+                workflow.STATE_SYNTH_BUFFER: "partial synthesis",
+            }
+
+    callback_context = DummyCallbackContext()
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "false")
+    monkeypatch.setattr(workflow, "RATE_LIMIT_AUTO_RETRY", True)
+
+    def fail_sleep(_: int) -> None:
+        raise AssertionError("time.sleep should not be called for terminal 429 handling")
+
+    monkeypatch.setattr(workflow.time, "sleep", fail_sleep)
+
+    response = workflow._on_model_error(
+        callback_context=callback_context,
+        llm_request=None,
+        error=RuntimeError("429 RESOURCE_EXHAUSTED"),
+    )
+
+    assert response is not None
+    text = workflow._llm_response_text(response)
+    assert "Google AI Studio rate limits have been hit" in text
+    assert "Please try again later." in text
+    assert callback_context.state[workflow.STATE_EXECUTOR_BUFFER] == ""
+    assert callback_context.state[workflow.STATE_EXECUTOR_REASONING_TRACE] == ""
+    assert callback_context.state[workflow.STATE_SYNTH_BUFFER] == ""
+    assert callback_context.state[workflow.STATE_RATE_LIMIT_RETRY_COUNT] == 0
 
 
 def test_postprocess_synth_markdown_renders_structured_sections_from_claims():

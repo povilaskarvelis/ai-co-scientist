@@ -1,4 +1,5 @@
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -193,6 +194,30 @@ def test_derive_run_error_message_strips_markdown_noise():
     assert message == "Execution Error Vertex AI quota or rate limit exhausted. 429 RESOURCE_EXHAUSTED"
 
 
+def test_visible_event_text_ignores_thought_parts():
+    text = ui_server._visible_event_text(
+        [
+            SimpleNamespace(text="Hidden reasoning", thought=True),
+            SimpleNamespace(text="Visible answer", thought=False),
+            SimpleNamespace(text=" more", thought=False),
+        ]
+    )
+
+    assert text == "Visible answer more"
+
+
+def test_terminal_workflow_error_detection_matches_rate_limit_message():
+    assert ui_server._is_terminal_workflow_error_response(
+        "## Rate Limited\n\nGoogle AI Studio rate limits have been hit, so this run can't continue right now."
+    )
+
+
+def test_transient_workflow_response_matches_current_retry_status_line():
+    assert ui_server._is_transient_workflow_response(
+        "_Rate limit hit from Google AI Studio — retry 1/5, waited 5s…_"
+    )
+
+
 def test_fire_and_forget_threadsafe_does_not_block_on_future_result(monkeypatch):
     class FakeFuture:
         def __init__(self) -> None:
@@ -359,6 +384,78 @@ def test_json_store_persists_runs_and_interrupts_incomplete_runs(tmp_path):
     assert restored["status"] == "failed"
     assert restored["error"] == "Run interrupted because the server restarted."
     assert any(event.get("type") == "run.interrupted" for event in restored["progress_events"])
+
+
+@pytest.mark.asyncio
+async def test_run_new_query_marks_terminal_rate_limit_response_as_failed(runtime):
+    rate_limit_text = (
+        "## Rate Limited\n\n"
+        "Google AI Studio rate limits have been hit, so this run can't continue right now.\n\n"
+        "Please try again later.\n\n"
+        "`429 RESOURCE_EXHAUSTED`"
+    )
+
+    async def fake_get_or_create_session(conversation_id: str):
+        return SimpleNamespace(app_name="test-app", session_id=conversation_id)
+
+    async def fake_turn(conversation_id: str, prompt: str, *, run_id: str):
+        return rate_limit_text, "research_workflow"
+
+    async def fake_read_state(conversation_id: str):
+        return None
+
+    async def fake_plan_pending(conversation_id: str) -> bool:
+        return False
+
+    runtime._get_or_create_session = fake_get_or_create_session  # type: ignore[method-assign]
+    runtime._run_workflow_turn_filtered = fake_turn  # type: ignore[method-assign]
+    runtime._read_workflow_state = fake_read_state  # type: ignore[method-assign]
+    runtime._is_plan_pending_approval = fake_plan_pending  # type: ignore[method-assign]
+
+    run = await runtime._create_run("new_query", query="Assess obesity mechanisms")
+    await runtime._run_new_query(run.run_id, "Assess obesity mechanisms")
+
+    payload = await runtime.get_run(run.run_id)
+    assert payload is not None
+    assert payload["status"] == "failed"
+    assert "Rate Limited" in payload["error"]
+
+    task = runtime.store.get_task(payload["task_id"])
+    assert task is not None
+    assert task["status"] == "failed"
+    assert task["report_markdown"] == rate_limit_text
+
+
+@pytest.mark.asyncio
+async def test_run_start_task_stops_immediately_on_terminal_rate_limit(runtime):
+    rate_limit_text = (
+        "## Rate Limited\n\n"
+        "Google AI Studio rate limits have been hit, so this run can't continue right now.\n\n"
+        "Please try again later.\n\n"
+        "`429 RESOURCE_EXHAUSTED`"
+    )
+
+    async def fake_turn(conversation_id: str, prompt: str, *, run_id: str):
+        return rate_limit_text, "research_workflow"
+
+    runtime._run_workflow_turn_filtered = fake_turn  # type: ignore[method-assign]
+
+    task = ui_server._make_task("task_rate_limit", "Assess obesity mechanisms", "conv_rate_limit")
+    task["awaiting_hitl"] = True
+    runtime.store.save_task(task)
+
+    run = await runtime._create_run("start_task", task_id=task["task_id"])
+    await runtime._run_start_task(run.run_id, task["task_id"])
+
+    payload = await runtime.get_run(run.run_id)
+    assert payload is not None
+    assert payload["status"] == "failed"
+    assert "Rate Limited" in payload["error"]
+
+    stored_task = runtime.store.get_task(task["task_id"])
+    assert stored_task is not None
+    assert stored_task["status"] == "failed"
+    assert stored_task["report_markdown"] == rate_limit_text
 
 
 @pytest.mark.asyncio

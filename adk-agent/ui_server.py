@@ -126,6 +126,30 @@ def _derive_run_error_message(response_text: str, default: str) -> str:
     return _compact_text(cleaned, max_chars=260) or default
 
 
+def _visible_event_text(parts) -> str:
+    """Return only user-visible text from streamed model parts."""
+    if not parts:
+        return ""
+    return "".join(
+        str(getattr(part, "text", "") or "")
+        for part in parts
+        if isinstance(getattr(part, "text", None), str)
+        and not bool(getattr(part, "thought", False))
+    ).strip()
+
+
+def _is_terminal_workflow_error_response(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return False
+    return (
+        normalized.startswith("## execution error")
+        or normalized.startswith("## rate limited")
+        or "quota or rate limit exhausted" in normalized
+        or "rate limits have been hit" in normalized
+    )
+
+
 def _fire_and_forget_threadsafe(coro: Any, loop: asyncio.AbstractEventLoop, *, label: str = "") -> None:
     future = asyncio.run_coroutine_threadsafe(coro, loop)
 
@@ -143,6 +167,8 @@ def _fire_and_forget_threadsafe(coro: Any, loop: asyncio.AbstractEventLoop, *, l
 
 _TRANSIENT_WORKFLOW_RESPONSE_PATTERNS = (
     re.compile(r"^_?\s*rate limit hit\s+[—-]\s+waited\s+\d+s,\s+retrying[.…_ ]*$", re.IGNORECASE),
+    re.compile(r"^_?\s*rate limit hit(?:\s+from\s+.+?)?\s+[—-]\s+retry\s+\d+/\d+,\s+waited\s+\d+s[.…_ ]*$", re.IGNORECASE),
+    re.compile(r"^_?\s*temporary model outage\s+from\s+.+?\s+[—-]\s+retry\s+\d+/\d+,\s+waited\s+\d+s[.…_ ]*$", re.IGNORECASE),
 )
 
 PERSISTED_SESSION_STATE_KEYS = (
@@ -884,19 +910,13 @@ class UiRuntime:
                     metrics=error_metrics,
                 )
 
-            text = "".join(
-                part.text
-                for part in parts
-                if isinstance(getattr(part, "text", None), str)
-            ).strip()
+            text = _visible_event_text(parts)
             if not text:
                 continue
             if _is_transient_workflow_response(text):
                 continue
             if not author:
                 continue
-
-            fallback_chunks.append(text)
 
             if author == "step_executor":
                 accumulated = f"{partial_by_author.get('step_executor', '')}{text}"
@@ -976,11 +996,21 @@ class UiRuntime:
                 partial_by_author[author] = f"{partial_by_author.get(author, '')}{text}"
                 continue
 
+            is_terminal_error = _is_terminal_workflow_error_response(text)
+            if is_terminal_error:
+                partial_by_author.pop(author, None)
+                fallback_chunks.clear()
+
+            fallback_chunks.append(text)
+
             is_final = getattr(event, "is_final_response", None)
             if callable(is_final) and bool(is_final()):
-                final_by_author[author] = (
-                    f"{partial_by_author.pop(author, '')}{text}".strip() or text
+                merged_text = (
+                    text
+                    if is_terminal_error
+                    else (f"{partial_by_author.pop(author, '')}{text}".strip() or text)
                 )
+                final_by_author[author] = merged_text
                 continue
             partial_by_author[author] = f"{partial_by_author.get(author, '')}{text}"
 
@@ -1272,13 +1302,17 @@ class UiRuntime:
             wf_state = await self._read_workflow_state(conv_id)
             plan_pending = await self._is_plan_pending_approval(conv_id)
             has_steps = bool(_steps_from_workflow_state(wf_state))
+            terminal_error = _is_terminal_workflow_error_response(response_text)
 
             direct_response_detected = (
-                responding_author in _DIRECT_RESPONSE_AGENTS
-                or (not wf_state and not plan_pending and not has_steps)
+                not terminal_error
+                and (
+                    responding_author in _DIRECT_RESPONSE_AGENTS
+                    or (not wf_state and not plan_pending and not has_steps)
+                )
             )
 
-            if not direct_response_detected:
+            if not terminal_error and not direct_response_detected:
                 await self._append_progress_event(
                     run_id,
                     phase="intake",
@@ -1334,7 +1368,25 @@ class UiRuntime:
                         if not planner_failed:
                             break
 
-            if direct_response_detected:
+            if terminal_error:
+                run_error = _derive_run_error_message(response_text, "Run failed.")
+                task["status"] = "failed"
+                task["report_markdown"] = response_text
+                await self._save_task_with_progress(task, run_id)
+                await self._update_run(
+                    run_id, status="failed", task_id=task_id,
+                    error=run_error,
+                )
+                await self._append_progress_event(
+                    run_id,
+                    phase="plan",
+                    event_type="run.failed",
+                    status="error",
+                    human_line=run_error,
+                    task_id=task_id,
+                )
+
+            elif direct_response_detected:
                 task["status"] = "completed"
                 task["is_direct_response"] = True
                 task["direct_response_text"] = response_text
@@ -1450,6 +1502,23 @@ class UiRuntime:
                 response_text, _ = await self._run_workflow_turn_filtered(
                     conv_id, "approve", run_id=run_id,
                 )
+                if _is_terminal_workflow_error_response(response_text):
+                    run_error = _derive_run_error_message(response_text, "Run failed.")
+                    task["status"] = "failed"
+                    task["report_markdown"] = response_text
+                    await self._save_task_with_progress(task, run_id)
+                    await self._append_progress_event(
+                        run_id,
+                        phase="execute",
+                        event_type="run.failed",
+                        status="error",
+                        human_line=run_error,
+                        task_id=task_id,
+                    )
+                    await self._update_run(
+                        run_id, status="failed", task_id=task_id, error=run_error,
+                    )
+                    break
 
                 wf_state = await self._read_workflow_state(conv_id)
                 plan_pending = await self._is_plan_pending_approval(conv_id)
@@ -1579,6 +1648,23 @@ class UiRuntime:
             response_text, _ = await self._run_workflow_turn_filtered(
                 conv_id, prompt, run_id=run_id,
             )
+            if _is_terminal_workflow_error_response(response_text):
+                run_error = _derive_run_error_message(response_text, "Run failed.")
+                task["status"] = "failed"
+                task["report_markdown"] = response_text
+                await self._save_task_with_progress(task, run_id)
+                await self._append_progress_event(
+                    run_id,
+                    phase="plan",
+                    event_type="run.failed",
+                    status="error",
+                    human_line=run_error,
+                    task_id=task_id,
+                )
+                await self._update_run(
+                    run_id, status="failed", task_id=task_id, error=run_error,
+                )
+                return
 
             wf_state = await self._read_workflow_state(conv_id)
             plan_pending = await self._is_plan_pending_approval(conv_id)

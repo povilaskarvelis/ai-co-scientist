@@ -11,4 +11,5 @@ Instructions:
 3. Prefer disease-, lineage-, or biomarker-specific interpretation over pan-cancer averages when the question is therapeutic relevance.
 4. If a target appears pan-essential, call that out as a liability unless the user explicitly wants broad essential genes.
 5. Do not present aggregate DepMap release-level results as if they were lineage- or mutation-filtered evidence. If the available tool cannot provide the requested subtype slice, state that limitation explicitly instead of forcing specificity.
-6. Load `references/oncology-target-validation-execution.md` before concluding oncology target-validation steps.
+6. Treat `get_gdsc_drug_sensitivity`, `get_prism_repurposing_response`, and `get_pharmacodb_compound_response` as compound-first tools. They need a named drug/compound query and should not be used to discover unknown compounds from model-only prompts.
+7. Load `references/oncology-target-validation-execution.md` before concluding oncology target-validation steps.

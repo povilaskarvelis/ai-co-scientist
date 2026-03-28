@@ -145,12 +145,12 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "get_biogrid_interactions": "Get broader BioGRID experimental interaction evidence with physical/genetic classes, throughput tags, partners, and PMIDs",
     "get_human_protein_atlas_gene": "Get Human Protein Atlas summaries plus release-aware tissue/cell-type single-cell expression lookups",
     "get_depmap_gene_dependency": "Summarize release-level DepMap dependency metrics for a named gene (CRISPR/RNAi dependency fractions, pan-dependency/selectivity, predictive features). Does not directly slice by lineage, mutation-defined subsets, or discover co-dependencies across other genes.",
-    "get_depmap_expression_subset_mean": "Compute the mean log2(TPM+1) expression for one gene across a named DepMap model subset or molecular subtype from a public release (for example RB1Loss / RB1_LoF in Expression Public 25Q3)",
+    "get_depmap_expression_subset_mean": "Compute the mean log2(TPM+1) expression for one gene across a named DepMap model subset or molecular subtype from a public release using subtype codes or common lineage aliases (for example RB1Loss / RB1_LoF or colorectal / COADREAD in Expression Public 25Q3)",
     "get_depmap_sample_top_expression_gene": "Find the highest-expressed gene for one named DepMap sample / stripped cell-line name in a public expression release using OmicsProfiles plus the public expression matrix",
     "get_biogrid_orcs_gene_summary": "Summarize BioGRID ORCS published CRISPR screen evidence for a gene, including hit status, phenotypes, cell lines, and representative screens",
-    "get_gdsc_drug_sensitivity": "Summarize GDSC / CancerRxGene compound sensitivity profiles across cell lines and tissues using IC50/AUC pharmacogenomic screens",
-    "get_prism_repurposing_response": "Summarize Broad PRISM repurposing primary-screen response using single-dose log2-fold-change viability across pooled cancer cell lines",
-    "get_pharmacodb_compound_response": "Summarize PharmacoDB cross-dataset compound-response evidence across public pharmacogenomic screens such as GDSC, PRISM, and CTRPv2",
+    "get_gdsc_drug_sensitivity": "Summarize GDSC / CancerRxGene compound sensitivity profiles for a named drug across cell lines and tissues using IC50/AUC pharmacogenomic screens. Requires a named compound or drug ID; not for model-first drug discovery.",
+    "get_prism_repurposing_response": "Summarize Broad PRISM repurposing primary-screen response for a named compound using single-dose log2-fold-change viability across pooled cancer cell lines. Requires a named compound or BRD identifier; not for model-first drug discovery.",
+    "get_pharmacodb_compound_response": "Summarize PharmacoDB cross-dataset compound-response evidence for a named compound across public pharmacogenomic screens such as GDSC, PRISM, and CTRPv2. Requires a named compound or PharmacoDB UID; not for model-first drug discovery.",
     "search_cellxgene_datasets": "Search public CELLxGENE Discover/Census-backed single-cell datasets by cell type, tissue, disease, assay, and organism",
     "get_cellxgene_marker_genes": "Get top marker genes for a CELLxGENE / Census cell type within an organism+tissue context using the public WMG marker API. Prefer this for Cell X Gene questions about highest marker genes or marker-effect rankings.",
     "search_pathway_commons_top_pathways": "Search integrated top pathways in Pathway Commons across multiple pathway providers",
@@ -381,7 +381,7 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
     },
     "get_depmap_expression_subset_mean": {
         "overlap_group": "target_vulnerability",
-        "preferred_for": "DepMap public expression questions that ask for a mean log2(TPM+1) value across a named molecular subtype or mutation-defined model subset",
+        "preferred_for": "DepMap public expression questions that ask for a mean log2(TPM+1) value across a named molecular subtype, lineage alias, or mutation-defined model subset",
         "fallback_tools": ["get_depmap_gene_dependency", "get_biogrid_orcs_gene_summary"],
     },
     "get_depmap_sample_top_expression_gene": {
@@ -396,17 +396,17 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
     },
     "get_gdsc_drug_sensitivity": {
         "overlap_group": "target_vulnerability",
-        "preferred_for": "GDSC / CancerRxGene compound sensitivity and pharmacogenomic response across cancer cell lines",
+        "preferred_for": "GDSC / CancerRxGene compound sensitivity and pharmacogenomic response for one named drug across cancer cell lines, not model-first drug discovery",
         "fallback_tools": ["get_prism_repurposing_response", "get_pharmacodb_compound_response", "get_guidetopharmacology_target"],
     },
     "get_prism_repurposing_response": {
         "overlap_group": "target_vulnerability",
-        "preferred_for": "Broad PRISM repurposing primary-screen single-dose log2-fold-change viability across pooled cell lines",
+        "preferred_for": "Broad PRISM repurposing primary-screen single-dose log2-fold-change viability for one named compound across pooled cell lines, not model-first drug discovery",
         "fallback_tools": ["get_gdsc_drug_sensitivity", "get_pharmacodb_compound_response", "get_guidetopharmacology_target"],
     },
     "get_pharmacodb_compound_response": {
         "overlap_group": "target_vulnerability",
-        "preferred_for": "cross-dataset compound-response context across PharmacoDB datasets such as PRISM, GDSC, CTRPv2, and related public screens",
+        "preferred_for": "cross-dataset compound-response context for one named compound across PharmacoDB datasets such as PRISM, GDSC, CTRPv2, and related public screens, not model-first drug discovery",
         "fallback_tools": ["get_gdsc_drug_sensitivity", "get_prism_repurposing_response", "get_guidetopharmacology_target"],
     },
     "search_hpo_terms": {
@@ -582,6 +582,11 @@ SOURCE_PRECEDENCE_RULES: list[dict[str, Any]] = [
         "summary": "Use `get_guidetopharmacology_target` for curated target-ligand summaries; use `get_gtopdb_ligand_reference` for earliest/latest cited GtoPdb ligand references when the ligand ID is known; use `get_chembl_bioactivities` for quantitative potency/selectivity; use `search_drug_gene_interactions` for broad druggability coverage; use `get_pubchem_compound` for compound identity and properties.",
     },
     {
+        "topic": "Target ranking and mechanism comparison",
+        "tools": ["get_open_targets_association", "search_gwas_associations", "search_clinical_trials", "get_guidetopharmacology_target", "search_drug_gene_interactions", "search_pubmed"],
+        "summary": "For disease-level compare/rank/prioritize questions about named mechanisms or targets, do not rely on literature alone. First map mechanism labels to canonical targets or lead programs when needed, then use Open Targets / GWAS for human evidence, ClinicalTrials.gov for development status, Guide to Pharmacology or DGIdb for tractability, and literature for caveats and synthesis.",
+    },
+    {
         "topic": "Drug label vs safety signals",
         "tools": ["get_dailymed_drug_label", "search_fda_adverse_events"],
         "summary": "Use `get_dailymed_drug_label` for current US label language; use `search_fda_adverse_events` for post-marketing adverse-event signals rather than regulatory label text.",
@@ -617,7 +622,7 @@ SOURCE_PRECEDENCE_RULES: list[dict[str, Any]] = [
             "get_prism_repurposing_response",
             "get_pharmacodb_compound_response",
         ],
-        "summary": "Use `get_depmap_gene_dependency` for release-level gene essentiality and vulnerability metrics, `get_depmap_expression_subset_mean` for mean log2(TPM+1) across a named DepMap model subset in a public expression release, `get_depmap_sample_top_expression_gene` for the top/highest-expressed gene in one named DepMap sample, `get_biogrid_orcs_gene_summary` for published CRISPR screens with phenotype and cell-line context, `get_gdsc_drug_sensitivity` for GDSC / CancerRxGene response, `get_prism_repurposing_response` for Broad PRISM single-dose repurposing response, and `get_pharmacodb_compound_response` for harmonized cross-dataset drug-response context across public screens.",
+        "summary": "Use `get_depmap_gene_dependency` for release-level gene essentiality and vulnerability metrics, `get_depmap_expression_subset_mean` for mean log2(TPM+1) across a named DepMap model subset in a public expression release, `get_depmap_sample_top_expression_gene` for the top/highest-expressed gene in one named DepMap sample, `get_biogrid_orcs_gene_summary` for published CRISPR screens with phenotype and cell-line context, and `get_gdsc_drug_sensitivity`, `get_prism_repurposing_response`, or `get_pharmacodb_compound_response` only after a candidate compound is named because those compound-response tools are compound-first rather than model-first discovery tools.",
     },
     {
         "topic": "Phenotype and rare-disease reasoning",
