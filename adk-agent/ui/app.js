@@ -3,6 +3,7 @@ const state = {
   selectedConversationId: null,
   selectedConversationDetail: null,
   selectedReportTaskId: null,
+  selectedInputMode: "report",
   activeRunIds: new Set(),
   runsByRunId: {},
   runsByTaskId: {},
@@ -24,6 +25,7 @@ const state = {
   debugOpen: false,
   debugByTaskId: {},
   graphByTaskId: {},
+  visualsByTaskId: {},
   graphSearchByTaskId: {},
   graphSelectionByTaskId: {},
   graphCy: null,
@@ -44,11 +46,15 @@ const el = {
   composerForm: document.getElementById("composerForm"),
   newChatBtn: document.getElementById("newChatBtn"),
   notice: document.getElementById("notice"),
+  modePicker: document.getElementById("modePicker"),
+  exampleQueriesLabel: document.getElementById("exampleQueriesLabel"),
   reportPanel: document.getElementById("reportPanel"),
   reportTitle: document.getElementById("reportTitle"),
   reportStatus: document.getElementById("reportStatus"),
+  datasetVisualsBtn: document.getElementById("datasetVisualsBtn"),
   evidenceGraphBtn: document.getElementById("evidenceGraphBtn"),
   reportContent: document.getElementById("reportContent"),
+  visualsPanel: document.getElementById("visualsPanel"),
   graphPanel: document.getElementById("graphPanel"),
   graphSearchInput: document.getElementById("graphSearchInput"),
   graphFitBtn: document.getElementById("graphFitBtn"),
@@ -61,6 +67,11 @@ const el = {
   debugSummary: document.getElementById("debugSummary"),
   debugJson: document.getElementById("debugJson"),
   exportPdfBtn: document.getElementById("exportPdfBtn"),
+};
+
+const TASK_MODE_LABELS = {
+  report: "Biomedical Report",
+  analysis: "Open Data Analysis",
 };
 
 const GRAPH_NODE_TYPE_COLORS = {
@@ -88,6 +99,19 @@ const GRAPH_EDGE_COLORS = {
   default: "#8da2b8",
   mixed: "#f3b46f",
 };
+
+function normalizeTaskMode(value) {
+  return String(value || "").trim().toLowerCase() === "analysis" ? "analysis" : "report";
+}
+
+function currentConversationMode() {
+  const detail = state.selectedConversationDetail;
+  const conversationMode = normalizeTaskMode(detail?.conversation?.mode || "");
+  if (state.selectedConversationId && detail?.conversation?.conversation_id) {
+    return conversationMode;
+  }
+  return normalizeTaskMode(state.selectedInputMode);
+}
 
 function formatDate(iso) {
   if (!iso) return "unknown";
@@ -413,7 +437,36 @@ function setExpanded(expanded) {
 }
 
 function updatePromptPlaceholder() {
-  el.promptInput.placeholder = state.selectedConversationId ? "Type a follow-up..." : "Ask any biomedical question....";
+  if (state.selectedConversationId) {
+    el.promptInput.placeholder = "Type a follow-up...";
+    return;
+  }
+  el.promptInput.placeholder = currentConversationMode() === "analysis"
+    ? "Describe the open-data search or analysis task..."
+    : "Ask any biomedical question...";
+}
+
+function renderModePicker() {
+  const showModePicker = !state.selectedConversationId && !state.pendingUserMessage && !state.clarificationMessage;
+  if (el.modePicker) {
+    el.modePicker.classList.toggle("hidden", !showModePicker);
+    el.modePicker.querySelectorAll("[data-mode]").forEach((card) => {
+      const mode = normalizeTaskMode(card.dataset.mode || "");
+      card.classList.toggle("active", mode === currentConversationMode());
+    });
+  }
+  if (el.exampleQueriesLabel) {
+    el.exampleQueriesLabel.textContent = currentConversationMode() === "analysis"
+      ? "Example analysis prompts"
+      : "Example report prompts";
+  }
+  const exampleContainer = document.getElementById("exampleQueries");
+  if (exampleContainer) {
+    exampleContainer.querySelectorAll(".example-query").forEach((chip) => {
+      const chipMode = normalizeTaskMode(chip.dataset.mode || "");
+      chip.classList.toggle("hidden", chipMode !== currentConversationMode());
+    });
+  }
 }
 
 function updateSendVisibility() {
@@ -1094,9 +1147,10 @@ function renderTaskHeader() {
     return;
   }
   const title = conversationTitle(conversation);
+  const modeLabel = TASK_MODE_LABELS[normalizeTaskMode(conversation.mode)] || TASK_MODE_LABELS.report;
   const status = String(conversation.latest_status || "");
   const count = Number(conversation.iteration_count || 0);
-  const nextTitle = `${title} · ${status} · ${count} iteration${count === 1 ? "" : "s"}`;
+  const nextTitle = `${title} · ${modeLabel} · ${status} · ${count} iteration${count === 1 ? "" : "s"}`;
   if (el.taskTitle.textContent !== nextTitle) el.taskTitle.textContent = nextTitle;
 }
 
@@ -1227,6 +1281,10 @@ function currentGraphTaskId() {
   return currentDebugTaskId();
 }
 
+function currentVisualsTaskId() {
+  return currentDebugTaskId();
+}
+
 function destroyGraphInstance() {
   if (state.graphCy && typeof state.graphCy.destroy === "function") {
     state.graphCy.destroy();
@@ -1250,6 +1308,7 @@ function clearRenderedReportPanel() {
   destroyGraphInstance();
   el.reportTitle.textContent = "Research Report";
   el.reportContent.innerHTML = "";
+  if (el.visualsPanel) el.visualsPanel.innerHTML = "";
 }
 
 function setRenderedReportTitle(taskId, title) {
@@ -2314,6 +2373,303 @@ async function refreshCurrentEvidenceGraph({ force = false } = {}) {
   renderReportPanel();
 }
 
+function visualsDimensionMap(payload) {
+  const dimensions = Array.isArray(payload?.visualizations?.dimensions)
+    ? payload.visualizations.dimensions
+    : [];
+  return new Map(dimensions.map((dimension) => [String(dimension?.key || ""), dimension]));
+}
+
+function visualsScoreColor(value, maxScore = 5) {
+  const numeric = Number(value);
+  const ratio = Number.isFinite(numeric) ? Math.max(0, Math.min(1, numeric / maxScore)) : 0;
+  const hue = 10 + ratio * 122;
+  const lightness = 18 + ratio * 22;
+  return `hsla(${hue}, 78%, ${lightness}%, 0.92)`;
+}
+
+function visualsMetricLabel(key) {
+  return String(key || "")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function visualsMetricValue(value) {
+  if (typeof value === "number") {
+    return Number.isInteger(value) ? String(value) : value.toFixed(2);
+  }
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  return String(value || "");
+}
+
+function visualsPanelStateHtml(title, message, kind = "empty") {
+  return `
+    <div class="visuals-empty visuals-empty-${escapeHtml(kind)}">
+      <h4>${escapeHtml(title)}</h4>
+      <p>${escapeHtml(message)}</p>
+    </div>
+  `;
+}
+
+function visualsBarChartSvg(rows, maxScore = 5) {
+  const safeRows = Array.isArray(rows) ? rows.slice(0, 8) : [];
+  const width = 760;
+  const left = 170;
+  const right = 56;
+  const top = 18;
+  const rowHeight = 42;
+  const chartHeight = top + safeRows.length * rowHeight + 26;
+  const innerWidth = width - left - right;
+  const ticks = [0, 1, 2, 3, 4, 5];
+  const tickLines = ticks.map((tick) => {
+    const x = left + (tick / maxScore) * innerWidth;
+    return `
+      <line x1="${x}" y1="${top - 6}" x2="${x}" y2="${chartHeight - 18}" class="visual-axis-line" />
+      <text x="${x}" y="${chartHeight - 2}" text-anchor="middle" class="visual-axis-text">${tick}</text>
+    `;
+  }).join("");
+  const bars = safeRows.map((row, index) => {
+    const score = Number(row?.overall_score || 0);
+    const y = top + index * rowHeight;
+    const barWidth = Math.max(0, Math.min(innerWidth, (score / maxScore) * innerWidth));
+    return `
+      <text x="${left - 10}" y="${y + 17}" text-anchor="end" class="visual-label-text">${escapeHtml(row?.short_label || row?.dataset_label || `Dataset ${index + 1}`)}</text>
+      <rect x="${left}" y="${y}" width="${innerWidth}" height="22" rx="10" class="visual-bar-track" />
+      <rect x="${left}" y="${y}" width="${barWidth}" height="22" rx="10" fill="${visualsScoreColor(score, maxScore)}" />
+      <text x="${left + barWidth + 8}" y="${y + 16}" class="visual-value-text">${escapeHtml(score.toFixed(2))}</text>
+    `;
+  }).join("");
+  return `
+    <svg viewBox="0 0 ${width} ${chartHeight}" class="visual-svg" role="img" aria-label="Overall dataset ranking">
+      ${tickLines}
+      ${bars}
+    </svg>
+  `;
+}
+
+function visualsScatterPlotSvg(payload) {
+  const bundle = payload?.visualizations || {};
+  const rows = Array.isArray(bundle.rows) ? bundle.rows.slice(0, 10) : [];
+  const scatter = bundle?.charts?.scatter || {};
+  const dimensions = visualsDimensionMap(payload);
+  const xKey = String(scatter?.x_dimension || "");
+  const yKey = String(scatter?.y_dimension || "");
+  const sizeKey = String(scatter?.size_key || "overall_score");
+  const sizeKind = String(scatter?.size_kind || "overall");
+  if (!xKey || !yKey || rows.length < 2) {
+    return visualsPanelStateHtml("Scatter unavailable", "Need at least two datasets and two scored dimensions to plot the comparison landscape.");
+  }
+
+  const width = 760;
+  const height = 360;
+  const left = 66;
+  const right = 34;
+  const top = 18;
+  const bottom = 48;
+  const innerWidth = width - left - right;
+  const innerHeight = height - top - bottom;
+  const ticks = [0, 1, 2, 3, 4, 5];
+  const sizeValues = rows.map((row) => {
+    if (sizeKind === "metric") return Number(row?.metrics?.[sizeKey] || 0);
+    if (sizeKind === "dimension") return Number(row?.scores?.[sizeKey] || 0);
+    return Number(row?.overall_score || 0);
+  });
+  const minSize = Math.min(...sizeValues);
+  const maxSize = Math.max(...sizeValues);
+  const normalizeRadius = (value) => {
+    if (!Number.isFinite(value)) return 9;
+    if (Math.abs(maxSize - minSize) < 1e-6) return 11;
+    return 7 + ((value - minSize) / (maxSize - minSize)) * 13;
+  };
+  const grid = ticks.map((tick) => {
+    const x = left + (tick / 5) * innerWidth;
+    const y = top + innerHeight - (tick / 5) * innerHeight;
+    return `
+      <line x1="${x}" y1="${top}" x2="${x}" y2="${top + innerHeight}" class="visual-axis-line" />
+      <line x1="${left}" y1="${y}" x2="${left + innerWidth}" y2="${y}" class="visual-axis-line" />
+      <text x="${x}" y="${height - 12}" text-anchor="middle" class="visual-axis-text">${tick}</text>
+      <text x="${left - 12}" y="${y + 4}" text-anchor="end" class="visual-axis-text">${tick}</text>
+    `;
+  }).join("");
+  const points = rows.map((row, index) => {
+    const xScore = Number(row?.scores?.[xKey] || 0);
+    const yScore = Number(row?.scores?.[yKey] || 0);
+    const sizeValue = sizeValues[index];
+    const cx = left + (xScore / 5) * innerWidth;
+    const cy = top + innerHeight - (yScore / 5) * innerHeight;
+    const r = normalizeRadius(sizeValue);
+    return `
+      <circle cx="${cx}" cy="${cy}" r="${r}" fill="${visualsScoreColor(row?.overall_score || 0, 5)}" class="visual-point" />
+      <text x="${cx}" y="${cy - r - 6}" text-anchor="middle" class="visual-point-label">${escapeHtml(row?.short_label || row?.dataset_label || `Dataset ${index + 1}`)}</text>
+    `;
+  }).join("");
+  const xLabel = dimensions.get(xKey)?.label || visualsMetricLabel(xKey);
+  const yLabel = dimensions.get(yKey)?.label || visualsMetricLabel(yKey);
+  const sizeLabel = sizeKind === "metric"
+    ? visualsMetricLabel(sizeKey)
+    : (dimensions.get(sizeKey)?.label || visualsMetricLabel(sizeKey));
+  return `
+    <div class="visual-scatter-meta">Bubble size: ${escapeHtml(sizeLabel)}</div>
+    <svg viewBox="0 0 ${width} ${height}" class="visual-svg" role="img" aria-label="Dataset comparison scatter plot">
+      ${grid}
+      <line x1="${left}" y1="${top + innerHeight}" x2="${left + innerWidth}" y2="${top + innerHeight}" class="visual-axis-strong" />
+      <line x1="${left}" y1="${top}" x2="${left}" y2="${top + innerHeight}" class="visual-axis-strong" />
+      ${points}
+      <text x="${left + innerWidth / 2}" y="${height - 2}" text-anchor="middle" class="visual-axis-label">${escapeHtml(xLabel)}</text>
+      <text x="18" y="${top + innerHeight / 2}" transform="rotate(-90 18 ${top + innerHeight / 2})" text-anchor="middle" class="visual-axis-label">${escapeHtml(yLabel)}</text>
+    </svg>
+  `;
+}
+
+function visualsHeatmapHtml(payload) {
+  const bundle = payload?.visualizations || {};
+  const rows = Array.isArray(bundle.rows) ? bundle.rows.slice(0, 10) : [];
+  const dimensions = Array.isArray(bundle.dimensions) ? bundle.dimensions : [];
+  if (!rows.length || !dimensions.length) {
+    return visualsPanelStateHtml("Heatmap unavailable", "No comparison matrix is available yet.");
+  }
+  const head = dimensions.map((dimension) => `<th>${escapeHtml(String(dimension?.label || ""))}</th>`).join("");
+  const body = rows.map((row) => `
+    <tr>
+      <th>${escapeHtml(row?.dataset_label || "")}</th>
+      ${dimensions.map((dimension) => {
+        const score = Number(row?.scores?.[dimension?.key] || 0);
+        return `<td><span class="visual-heat-cell" style="background:${visualsScoreColor(score, 5)}">${escapeHtml(score.toFixed(1))}</span></td>`;
+      }).join("")}
+    </tr>
+  `).join("");
+  return `
+    <div class="visual-heatmap-wrap">
+      <table class="visual-heatmap-table">
+        <thead>
+          <tr>
+            <th>Dataset</th>
+            ${head}
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function datasetVisualizationsHtml(payload) {
+  const bundle = payload?.visualizations || {};
+  const rows = Array.isArray(bundle.rows) ? bundle.rows : [];
+  if (!payload?.available || !rows.length) {
+    return visualsPanelStateHtml("No visual summary yet", payload?.message || "No analysis visuals are available for this task yet.");
+  }
+
+  const summaryCards = bundle.summary_cards || {};
+  const notes = Array.isArray(bundle.notes) ? bundle.notes : [];
+  const warnings = Array.isArray(bundle.warnings) ? bundle.warnings : [];
+  const metricCards = [
+    { label: "Datasets", value: String(summaryCards.dataset_count || rows.length) },
+    { label: "Dimensions", value: String(summaryCards.dimension_count || 0) },
+    { label: "Sources", value: String(summaryCards.source_count || 0) },
+    { label: "Top Candidate", value: String(summaryCards.top_dataset || rows[0]?.dataset_label || "") },
+  ].map((item) => `
+    <div class="visual-stat-card">
+      <span class="visual-stat-label">${escapeHtml(item.label)}</span>
+      <span class="visual-stat-value">${escapeHtml(item.value)}</span>
+    </div>
+  `).join("");
+
+  const datasetCards = rows.slice(0, 8).map((row) => {
+    const metrics = row?.metrics && typeof row.metrics === "object"
+      ? Object.entries(row.metrics).slice(0, 4)
+      : [];
+    const tags = Array.isArray(row?.tags) ? row.tags : [];
+    return `
+      <article class="visual-dataset-card">
+        <div class="visual-dataset-head">
+          <div>
+            <h5>${escapeHtml(row?.dataset_label || "")}</h5>
+            <p>${escapeHtml([row?.source, row?.accession].filter(Boolean).join(" • "))}</p>
+          </div>
+          <span class="visual-score-pill">${escapeHtml(Number(row?.overall_score || 0).toFixed(2))}/5</span>
+        </div>
+        ${row?.notes ? `<p class="visual-dataset-notes">${escapeHtml(row.notes)}</p>` : ""}
+        ${tags.length ? `<div class="visual-tag-row">${tags.map((tag) => `<span class="visual-tag">${escapeHtml(String(tag || ""))}</span>`).join("")}</div>` : ""}
+        ${metrics.length ? `<div class="visual-metric-row">${metrics.map(([key, value]) => `<span class="visual-metric-chip"><strong>${escapeHtml(visualsMetricLabel(key))}:</strong> ${escapeHtml(visualsMetricValue(value))}</span>`).join("")}</div>` : ""}
+      </article>
+    `;
+  }).join("");
+
+  return `
+    <div class="visuals-shell">
+      <section class="visuals-intro">
+        <div>
+          <h4>${escapeHtml(bundle.summary || bundle.objective || "Dataset comparison")}</h4>
+          <p>${escapeHtml(bundle.objective || "Analysis-mode visual summary generated from the current dataset comparison.")}</p>
+        </div>
+        <div class="visual-stat-grid">${metricCards}</div>
+      </section>
+      <section class="visual-chart-card">
+        <div class="visual-card-head">
+          <h5>Overall ranking</h5>
+          <p>Weighted comparison across the selected reuse-readiness dimensions.</p>
+        </div>
+        ${visualsBarChartSvg(rows, Number(bundle?.charts?.bar?.max_score || 5))}
+      </section>
+      <div class="visual-grid-two">
+        <section class="visual-chart-card">
+          <div class="visual-card-head">
+            <h5>Dimension heatmap</h5>
+            <p>How each dataset scores on each comparison dimension.</p>
+          </div>
+          ${visualsHeatmapHtml(payload)}
+        </section>
+        <section class="visual-chart-card">
+          <div class="visual-card-head">
+            <h5>Comparison landscape</h5>
+            <p>Higher-right candidates perform better across the plotted dimensions.</p>
+          </div>
+          ${visualsScatterPlotSvg(payload)}
+        </section>
+      </div>
+      <section class="visual-chart-card">
+        <div class="visual-card-head">
+          <h5>Dataset notes</h5>
+          <p>Compact rationale and metadata for the strongest candidates in the current shortlist.</p>
+        </div>
+        <div class="visual-dataset-grid">${datasetCards}</div>
+      </section>
+      ${notes.length ? `<section class="visual-text-block"><h5>Analysis Notes</h5><ul>${notes.map((note) => `<li>${escapeHtml(String(note || ""))}</li>`).join("")}</ul></section>` : ""}
+      ${warnings.length ? `<section class="visual-text-block warning"><h5>Warnings</h5><ul>${warnings.map((warning) => `<li>${escapeHtml(String(warning || ""))}</li>`).join("")}</ul></section>` : ""}
+    </div>
+  `;
+}
+
+async function refreshCurrentDatasetVisuals({ force = false } = {}) {
+  const taskId = currentVisualsTaskId();
+  if (!taskId || state.reportPanelMode !== "visuals") return;
+  const existing = state.visualsByTaskId[taskId];
+  if (existing?.loading) return;
+  if (!force && existing && existing.data) return;
+
+  const hasExistingData = Boolean(existing?.data);
+  state.visualsByTaskId[taskId] = hasExistingData
+    ? { loading: true, error: "", data: existing.data }
+    : { loading: true, error: "", data: null };
+  if (!hasExistingData) renderReportPanel();
+
+  try {
+    const payload = await api(`/api/tasks/${encodeURIComponent(taskId)}/dataset-visualizations`);
+    state.visualsByTaskId[taskId] = { loading: false, error: "", data: payload };
+  } catch (err) {
+    state.visualsByTaskId[taskId] = hasExistingData
+      ? { loading: false, error: "", data: existing.data }
+      : {
+          loading: false,
+          error: String(err?.message || "Failed to load dataset visualizations."),
+          data: null,
+        };
+  }
+
+  renderReportPanel();
+}
+
 function renderReportPanel() {
   const iteration = currentReportIteration();
   const showPanel = Boolean(state.selectedConversationId && iteration && iteration?.report?.has_report);
@@ -2323,7 +2679,18 @@ function renderReportPanel() {
   const showDebugPanel = Boolean(showPanel && state.debugOpen && debugTaskId);
   const graphTaskId = currentGraphTaskId();
   const graphEntry = graphTaskId ? state.graphByTaskId[graphTaskId] : null;
+  const visualsTaskId = currentVisualsTaskId();
+  const visualsEntry = visualsTaskId ? state.visualsByTaskId[visualsTaskId] : null;
   const showGraphMode = Boolean(showPanel && state.reportPanelMode === "graph" && graphTaskId);
+  const taskMode = normalizeTaskMode(iteration?.task?.mode || iteration?.report?.mode || "");
+  const hasDatasetVisuals = Boolean(iteration?.report?.has_dataset_visualizations);
+  const showVisualsMode = Boolean(
+    showPanel
+    && taskMode === "analysis"
+    && state.reportPanelMode === "visuals"
+    && visualsTaskId
+    && hasDatasetVisuals
+  );
 
   el.workspace.classList.toggle("report-open", showPanel);
   el.reportPanel.classList.toggle("hidden", !showPanel);
@@ -2331,12 +2698,15 @@ function renderReportPanel() {
   if (!showPanel) {
     clearRenderedReportPanel();
     el.exportPdfBtn.classList.add("hidden");
+    el.datasetVisualsBtn.classList.add("hidden");
     el.evidenceGraphBtn.classList.add("hidden");
     el.debugToggleBtn.classList.add("hidden");
     el.reportStatus.classList.add("hidden");
     el.reportStatus.classList.remove("error");
     el.debugPanel.classList.add("hidden");
     el.graphPanel.classList.add("hidden");
+    el.visualsPanel.classList.add("hidden");
+    setInnerHtmlIfChanged(el.visualsPanel, "");
     setDebugSummaryHtml("", "");
     setDebugJsonText("", "");
     return;
@@ -2346,11 +2716,14 @@ function renderReportPanel() {
   const taskId = String(task.task_id || "");
   const reportMarkdown = String(iteration?.report?.report_markdown || "").trim();
   const reportTaskChanged = state.renderedReportTaskId !== taskId;
-  setRenderedReportTitle(taskId, String(task.title || task.user_query || "Research Report"));
+  const titleFallback = taskMode === "analysis" ? "Analysis Workspace" : "Research Report";
+  setRenderedReportTitle(taskId, String(task.title || task.user_query || titleFallback));
   setRenderedReportMarkdown(taskId, reportMarkdown, { preserveScroll: !reportTaskChanged });
-  el.exportPdfBtn.classList.toggle("hidden", !taskId);
+  el.exportPdfBtn.classList.toggle("hidden", !taskId || taskMode === "analysis");
   el.exportPdfBtn.disabled = state.exportingPdf;
-  el.evidenceGraphBtn.classList.toggle("hidden", !taskId);
+  el.datasetVisualsBtn.classList.toggle("hidden", !(taskId && taskMode === "analysis" && hasDatasetVisuals));
+  el.datasetVisualsBtn.textContent = showVisualsMode ? "Show Notes" : "Visual Summary";
+  el.evidenceGraphBtn.classList.toggle("hidden", !taskId || taskMode === "analysis");
   el.evidenceGraphBtn.textContent = showGraphMode ? "Show Report" : "Evidence Graph";
   el.debugToggleBtn.classList.toggle("hidden", !showDebugToggle);
   el.debugToggleBtn.textContent = state.debugOpen ? "Hide Debug" : "Show Debug";
@@ -2360,8 +2733,9 @@ function renderReportPanel() {
   el.reportStatus.classList.toggle("error", shouldShowStatus && state.reportStatusError);
   el.reportStatus.textContent = shouldShowStatus ? state.reportStatusText : "";
 
-  el.reportContent.classList.toggle("hidden", showGraphMode);
+  el.reportContent.classList.toggle("hidden", showGraphMode || showVisualsMode);
   el.graphPanel.classList.toggle("hidden", !showGraphMode);
+  el.visualsPanel.classList.toggle("hidden", !showVisualsMode);
   if (showGraphMode) {
     el.graphLegend.innerHTML = graphLegendHtml(graphEntry?.data || state.graphRenderedPayload || null);
     const searchValue = String(state.graphSearchByTaskId[graphTaskId] || "");
@@ -2394,6 +2768,24 @@ function renderReportPanel() {
       if (searchTerm) applyGraphSearch(graphTaskId, searchTerm, { refit: false });
     }
   }
+  if (showVisualsMode) {
+    if (!visualsEntry || (visualsEntry.loading && !visualsEntry.data)) {
+      setInnerHtmlIfChanged(
+        el.visualsPanel,
+        visualsPanelStateHtml("Loading visual summary", "Building the analysis dashboard for this task.", "loading"),
+      );
+      refreshCurrentDatasetVisuals().catch((err) => setNotice(`Failed to load visual summary: ${err.message}`, true));
+    } else if (visualsEntry.error && !visualsEntry.data) {
+      setInnerHtmlIfChanged(
+        el.visualsPanel,
+        visualsPanelStateHtml("Visual summary unavailable", visualsEntry.error, "error"),
+      );
+    } else {
+      setInnerHtmlIfChanged(el.visualsPanel, datasetVisualizationsHtml(visualsEntry.data || {}));
+    }
+  } else {
+    setInnerHtmlIfChanged(el.visualsPanel, "");
+  }
 
   el.debugPanel.classList.toggle("hidden", !showDebugPanel);
   if (showDebugPanel) {
@@ -2421,6 +2813,7 @@ function renderReportPanel() {
 function renderAll() {
   const expanded = Boolean(state.selectedConversationId || state.pendingUserMessage || state.clarificationMessage);
   setExpanded(expanded);
+  renderModePicker();
   renderSidebar();
   renderTaskHeader();
   renderMessages();
@@ -2482,6 +2875,7 @@ async function selectConversation(conversationId, { silent = false, skipRender =
   try {
     const detail = await api(`/api/conversations/${encodeURIComponent(conversationId)}`);
     state.selectedConversationDetail = detail;
+    state.selectedInputMode = normalizeTaskMode(detail?.conversation?.mode || state.selectedInputMode);
     const iterations = Array.isArray(detail?.iterations) ? detail.iterations : [];
     for (const it of iterations) {
       const runId = it?.task?.active_run_id;
@@ -2674,6 +3068,8 @@ async function handleTerminalRunState(run) {
         await refreshConversations({ keepSelection: true, skipRender: true });
         if (status === "completed" && shouldAutoFocus) {
           state.selectedReportTaskId = run.task_id;
+          const isAnalysisMode = normalizeTaskMode(taskDetail?.task?.mode || "") === "analysis";
+          state.reportPanelMode = isAnalysisMode && taskDetail?.task?.has_dataset_visualizations ? "visuals" : "report";
         }
       } catch (err) {
         setNotice(`Could not refresh conversations: ${err.message}`, true);
@@ -2706,7 +3102,7 @@ async function submitNewQuery(query, { conversationId = null, parentTaskId = nul
   setActivityExpanded("pending", false);
   renderAll();
 
-  const requestBody = { query };
+  const requestBody = { query, mode: currentConversationMode() };
   if (conversationId) requestBody.conversation_id = conversationId;
   if (parentTaskId) requestBody.parent_task_id = parentTaskId;
 
@@ -2784,6 +3180,7 @@ function clearDraft() {
   state.debugOpen = false;
   state.debugByTaskId = {};
   state.graphByTaskId = {};
+  state.visualsByTaskId = {};
   state.graphSearchByTaskId = {};
   state.graphSelectionByTaskId = {};
   stopRunPolling();
@@ -2841,6 +3238,13 @@ function bindEvents() {
       if (!taskId) return;
       const scrollTop = el.messages.scrollTop;
       state.selectedReportTaskId = taskId;
+      const iteration = findIteration(state.selectedConversationDetail, taskId);
+      state.reportPanelMode = (
+        normalizeTaskMode(iteration?.task?.mode || iteration?.report?.mode || "") === "analysis"
+        && iteration?.report?.has_dataset_visualizations
+      )
+        ? "visuals"
+        : "report";
       renderAll();
       refreshCurrentDebugState().catch((err) => setNotice(`Failed to load debug state: ${err.message}`, true));
       el.messages.scrollTop = scrollTop;
@@ -2870,6 +3274,13 @@ function bindEvents() {
     if (!taskId) return;
     const scrollTop = el.messages.scrollTop;
     state.selectedReportTaskId = taskId;
+    const iteration = findIteration(state.selectedConversationDetail, taskId);
+    state.reportPanelMode = (
+      normalizeTaskMode(iteration?.task?.mode || iteration?.report?.mode || "") === "analysis"
+      && iteration?.report?.has_dataset_visualizations
+    )
+      ? "visuals"
+      : "report";
     renderAll();
     refreshCurrentDebugState().catch((err) => setNotice(`Failed to load debug state: ${err.message}`, true));
     el.messages.scrollTop = scrollTop;
@@ -2925,6 +3336,24 @@ function bindEvents() {
     exportFinalReportPdf(taskId);
   });
 
+  if (el.modePicker) {
+    el.modePicker.addEventListener("click", (event) => {
+      const card = event.target.closest("[data-mode]");
+      if (!card || state.selectedConversationId) return;
+      state.selectedInputMode = normalizeTaskMode(card.dataset.mode || "");
+      updatePromptPlaceholder();
+      renderModePicker();
+    });
+  }
+
+  el.datasetVisualsBtn.addEventListener("click", () => {
+    state.reportPanelMode = state.reportPanelMode === "visuals" ? "report" : "visuals";
+    renderReportPanel();
+    if (state.reportPanelMode === "visuals") {
+      refreshCurrentDatasetVisuals().catch((err) => setNotice(`Failed to load visual summary: ${err.message}`, true));
+    }
+  });
+
   el.evidenceGraphBtn.addEventListener("click", () => {
     state.reportPanelMode = state.reportPanelMode === "graph" ? "report" : "graph";
     renderReportPanel();
@@ -2968,8 +3397,10 @@ function bindEvents() {
     exampleContainer.addEventListener("click", (event) => {
       const chip = event.target.closest(".example-query");
       if (!chip) return;
+      state.selectedInputMode = normalizeTaskMode(chip.dataset.mode || state.selectedInputMode);
       const query = chip.dataset.query || chip.textContent.trim();
       el.promptInput.value = query;
+      renderModePicker();
       updateSendVisibility();
       el.promptInput.focus();
     });

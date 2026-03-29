@@ -37,7 +37,7 @@ from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
-from google.adk.tools import McpToolset
+from google.adk.tools import FunctionTool, McpToolset
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.base_toolset import ToolPredicate
 from google.adk.tools.mcp_tool.mcp_toolset import StdioConnectionParams
@@ -46,6 +46,10 @@ from google.genai import types
 from mcp.client.stdio import StdioServerParameters
 
 from . import tool_registry
+from .dataset_visualization import (
+    build_dataset_visualization_bundle,
+    parse_visualization_json_array,
+)
 from .skill_loader import create_execution_skill_toolset
 from .skill_loader import create_planner_skill_toolset
 from .skill_loader import create_report_assistant_skill_toolset
@@ -69,6 +73,9 @@ DEFAULT_EXECUTION_SKILLS_ENABLED = (
 DEFAULT_REPORT_ASSISTANT_SKILLS_ENABLED = (
     str(os.getenv("ADK_REPORT_ASSISTANT_SKILLS_ENABLED", "1")).strip().lower() not in {"0", "false", "no"}
 )
+WORKFLOW_MODE_REPORT = "report"
+WORKFLOW_MODE_ANALYSIS = "analysis"
+VALID_WORKFLOW_MODES = {WORKFLOW_MODE_REPORT, WORKFLOW_MODE_ANALYSIS}
 
 
 @dataclass
@@ -465,22 +472,7 @@ Rules:
 - NEVER put example values or IDs in the goal or completion_condition.
 - Use step ids S1, S2, S3, ... in order.
 
-Citation requirement:
-- A final report without citations is incomplete. Every plan MUST include at least one step
-  whose tool_hint is a source that returns individual citable identifiers:
-  search_pubmed, search_pubmed_advanced, get_pubmed_abstract, get_paper_fulltext, search_openalex_works,
-  search_clinical_trials.
-- If ALL steps use only aggregate or structured-data tools (run_bigquery_select_query,
-  list_bigquery_tables, summarize_clinical_trials_landscape, search_reactome_pathways,
-  get_string_interactions, search_uniprot_proteins, get_uniprot_protein_profile,
-  search_openalex_authors, rank_researchers_by_activity), you MUST append a dedicated
-  literature corroboration step:
-    - tool_hint: search_pubmed (or search_openalex_works or search_clinical_trials)
-    - goal: "Find and record PMIDs / DOIs / NCT numbers for the key claims from the preceding steps."
-    - completion_condition: "At least 3 specific identifiers (PMID, DOI, or NCT) are recorded."
-- Place the literature step AFTER the aggregate steps so it can incorporate their findings.
-- For compare / rank / prioritize questions about named mechanisms, targets, or modalities, do NOT make a literature-only plan unless the user explicitly asked for literature-only review. Use at least one structured evidence source (for example Open Targets or GWAS), at least one clinical / pharmacology / tractability source (for example ClinicalTrials.gov, Guide to Pharmacology, DGIdb, or DailyMed when relevant), and literature for caveats or synthesis.
-- When the query names mechanism classes rather than canonical targets or genes (for example amylin, glucagon, MC4R, or GDF15-based approaches), add an explicit mapping step first so later steps can query structured sources against the correct targets, receptors, or lead programs.
+__PLAN_EVIDENCE_POLICY__
 
 __BQ_POLICY__
 
@@ -548,9 +540,7 @@ Evidence identifiers:
               Reactome:R-HSA-NNNNNNN, GCSTNNNNNN
 - When a tool returns a database record identifier (UniProt accession, PubChem CID, PDB code,
   rsID, ChEMBL ID, Reactome stable ID, GWAS Catalog study ID), always mention it in your summary.
-- If the primary tool for this step does not return individual document IDs (e.g. BigQuery
-  aggregate queries), make a secondary call to search_pubmed or search_openalex_works using
-  key terms from the findings to harvest supporting PMIDs or DOIs.
+__EXECUTION_EVIDENCE_POLICY__
 __BQ_POLICY__
 
 Output guidance:
@@ -639,6 +629,26 @@ Rules:
 - For database records, include identifiers with their canonical prefix so they can be linked: UniProt:P00533, PubChem:2244, PDB:1ABC, rs7903146, CHEMBL25, Reactome:R-HSA-1234567, GCST000001.
 - NEVER include raw URLs, API endpoints, or links to JSON output.
 - Return user-facing Markdown only (not JSON).
+"""
+
+ANALYSIS_VISUALIZATION_POLICY = """
+When this conversation is running in analysis mode and the answer compares or ranks two or more datasets,
+call `store_dataset_visualizations` before you finalize the markdown.
+
+Use the tool only when you have enough evidence to compare concrete dataset candidates. When you call it:
+- Pass `dimensions_json` and `datasets_json` as compact JSON arrays encoded as strings.
+- Provide 3-6 comparison dimensions with clear human labels.
+- Use coarse 0-5 scores where higher is better.
+- Keep the scores evidence-grounded and heuristic. Do not pretend the scale is perfectly objective.
+- Include a short note for each dataset describing the main reason for its score pattern.
+- Normalize source-specific records before calling the tool. Do not pass raw archive payloads from NEMAR,
+  OpenNeuro, DANDI, GEO, or other sources. Reduce each candidate to:
+  `dataset_label`, `source`, `accession`, `notes`, `scores`, optional scalar `metrics`, short `tags`,
+  and optional `evidence_ids`.
+- Prefer dimensions that reflect reuse readiness, such as modality fit, disease/task match, sample scale,
+  metadata richness, access friction, annotation quality, or public-download readiness when the evidence supports them.
+
+Do not mention the tool name in the user-facing answer. The tool is only for storing a visual summary for the analysis UI.
 """
 
 
@@ -1329,13 +1339,29 @@ def _is_obvious_research_workflow_query(user_text: str) -> bool:
         " brain-code ",
         " braincode ",
     )
+    dataset_scope_terms = (
+        " dataset ",
+        " datasets ",
+        " mri ",
+        " fmri ",
+        " eeg ",
+        " meg ",
+        " openneuro ",
+        " nemar ",
+        " dandi ",
+        " brain-code ",
+        " braincode ",
+    )
     dataset_evaluation_terms = (
         " most usable ",
         " strongest ",
         " benchmark ",
         " first study ",
+        " analysis-ready ",
         " reuse ",
         " reusable ",
+        " public-download readiness ",
+        " download friction ",
         " realistic ",
         " replication study ",
         " metadata quality ",
@@ -1383,12 +1409,15 @@ def _is_obvious_research_workflow_query(user_text: str) -> bool:
         return True
 
     if (
-        stripped.startswith(("which ", "for "))
-        and any(term in normalized for term in (" dataset ", " datasets ", " mri ", " fmri ", " eeg ", " meg ", " openneuro ", " nemar ", " dandi ", " brain-code ", " braincode "))
+        stripped.startswith(("which ", "for ", "find ", "search ", "identify "))
+        and any(term in normalized for term in dataset_scope_terms)
         and (
             any(term in normalized for term in dataset_evaluation_terms)
             or " rank " in normalized
             or " rank them " in normalized
+            or " compare " in normalized
+            or " visual comparison " in normalized
+            or " visual summary " in normalized
         )
     ):
         return True
@@ -3442,6 +3471,7 @@ def _initialize_task_state_from_plan(plan: dict[str, Any], *, objective_text: st
         "steps": steps,
         "success_criteria": validated["success_criteria"],
         "latest_synthesis": None,
+        "latest_dataset_visualizations": None,
         "evidence_store": _new_evidence_store(),
         "execution_metrics": _new_execution_metrics_bundle(),
     }
@@ -10486,16 +10516,50 @@ class _ActiveStepToolPredicate:
 
 
 def _build_step_executor_instruction(tool_hints: list[str], *, prefer_bigquery: bool) -> str:
+    return _build_step_executor_instruction_for_mode(
+        tool_hints,
+        prefer_bigquery=prefer_bigquery,
+        workflow_mode=WORKFLOW_MODE_REPORT,
+    )
+
+
+def _step_execution_evidence_policy(*, workflow_mode: str) -> str:
+    if _normalize_workflow_mode(workflow_mode) == WORKFLOW_MODE_ANALYSIS:
+        return (
+            "- For analysis-mode dataset discovery and comparison work, archive/repository identifiers "
+            "(dataset accessions, repo names, DOIs already attached to the dataset record, or source-native IDs) "
+            "count as sufficient evidence identifiers.\n"
+            "- Do NOT make a secondary call to search_pubmed or search_openalex_works just to harvest PMIDs/DOIs "
+            "after a dataset-metadata step.\n"
+            "- Use literature tools only when the step explicitly asks for associated papers/manuscripts, or when "
+            "a critical comparison field cannot be resolved from archive metadata, dataset detail pages, or other "
+            "source-native tools."
+        )
+    return (
+        "- If the primary tool for this step does not return individual document IDs (e.g. BigQuery\n"
+        "  aggregate queries), make a secondary call to search_pubmed or search_openalex_works using\n"
+        "  key terms from the findings to harvest supporting PMIDs or DOIs."
+    )
+
+
+def _build_step_executor_instruction_for_mode(
+    tool_hints: list[str],
+    *,
+    prefer_bigquery: bool,
+    workflow_mode: str,
+) -> str:
     routing_policy = _format_source_precedence_rules(tool_hints)
     if prefer_bigquery:
         bq_policy = BQ_EXECUTOR_POLICY
     else:
         bq_policy = "- BigQuery-first policy is disabled for this run."
+    evidence_policy = _step_execution_evidence_policy(workflow_mode=workflow_mode)
 
     return (
         STEP_EXECUTOR_INSTRUCTION_TEMPLATE
         .replace("__ROUTING_POLICY__", routing_policy)
         .replace("__BQ_POLICY__", bq_policy)
+        .replace("__EXECUTION_EVIDENCE_POLICY__", evidence_policy)
     )
 
 
@@ -10538,17 +10602,51 @@ def _build_planner_instruction(
     *,
     prefer_bigquery: bool,
     planner_skills_enabled: bool,
+    workflow_mode: str = WORKFLOW_MODE_REPORT,
 ) -> str:
     tool_catalog = _format_tool_catalog(tool_hints)
     domain_catalog = _format_domain_catalog()
     routing_policy = _format_source_precedence_rules(tool_hints)
     skill_policy = _planner_skill_guidance(planner_skills_enabled=planner_skills_enabled)
+    normalized_mode = _normalize_workflow_mode(workflow_mode)
+    if normalized_mode == WORKFLOW_MODE_ANALYSIS:
+        evidence_policy = (
+            "Evidence policy for analysis mode:\n"
+            "- Archive metadata, dataset detail records, source-native dataset identifiers, and repository pages are sufficient evidence for open-data discovery and comparison plans.\n"
+            "- Do NOT append a terminal PubMed/OpenAlex/Europe PMC corroboration step just to obtain citations.\n"
+            "- Add a literature step only if the user explicitly asks for papers/manuscripts, or if a key comparison dimension cannot be resolved from archive metadata and source-native dataset tools alone.\n"
+            "- For archive comparison tasks, prioritize source-native dataset detail steps over literature-only follow-up.\n"
+            "- When the objective is to find, shortlist, compare, QC, or prepare public datasets for reuse, a plan with only archive/source-native steps is acceptable."
+        )
+    else:
+        evidence_policy = (
+            "Citation requirement:\n"
+            "- A final report without citations is incomplete. Every plan MUST include at least one step\n"
+            "  whose tool_hint is a source that returns individual citable identifiers:\n"
+            "  search_pubmed, search_pubmed_advanced, get_pubmed_abstract, get_paper_fulltext, search_openalex_works,\n"
+            "  search_clinical_trials.\n"
+            "- If ALL steps use only aggregate or structured-data tools (run_bigquery_select_query,\n"
+            "  list_bigquery_tables, summarize_clinical_trials_landscape, search_reactome_pathways,\n"
+            "  get_string_interactions, search_uniprot_proteins, get_uniprot_protein_profile,\n"
+            "  search_openalex_authors, rank_researchers_by_activity), you MUST append a dedicated\n"
+            "  literature corroboration step:\n"
+            "    - tool_hint: search_pubmed (or search_openalex_works or search_clinical_trials)\n"
+            "    - goal: \"Find and record PMIDs / DOIs / NCT numbers for the key claims from the preceding steps.\"\n"
+            "    - completion_condition: \"At least 3 specific identifiers (PMID, DOI, or NCT) are recorded.\"\n"
+            "- Place the literature step AFTER the aggregate steps so it can incorporate their findings.\n"
+            "- For compare / rank / prioritize questions about named mechanisms, targets, or modalities, do NOT make a literature-only plan unless the user explicitly asked for literature-only review. Use at least one structured evidence source (for example Open Targets or GWAS), at least one clinical / pharmacology / tractability source (for example ClinicalTrials.gov, Guide to Pharmacology, DGIdb, or DailyMed when relevant), and literature for caveats or synthesis.\n"
+            "- When the query names mechanism classes rather than canonical targets or genes (for example amylin, glucagon, MC4R, or GDF15-based approaches), add an explicit mapping step first so later steps can query structured sources against the correct targets, receptors, or lead programs."
+        )
     if prefer_bigquery:
         bq_policy = (
             "- BigQuery-first policy applies when the task is genuinely structured-data or identifier-ready.\n"
             "- For BigQuery-backed steps, use the specific dataset name as `tool_hint` (for example `open_targets_platform`, `gnomad`, `ebi_chembl`, `human_variant_annotation`, `human_genome_variants`, `umiami_lincs`) rather than `run_bigquery_select_query`.\n"
             "- Keep schema discovery inside an evidence step unless the user explicitly asked about schemas.\n"
-            "- If a structured source is likely to produce aggregate or dataset-level findings without direct paper identifiers, add a later literature corroboration step."
+            + (
+                "- If a structured source is likely to produce aggregate or dataset-level findings without direct paper identifiers, add a later literature corroboration step."
+                if normalized_mode != WORKFLOW_MODE_ANALYSIS
+                else "- For analysis mode, a structured or source-native dataset step does not need a later literature corroboration step unless the user explicitly asks for literature context."
+            )
         )
     else:
         bq_policy = "- BigQuery-first policy is disabled for this run."
@@ -10559,6 +10657,7 @@ def _build_planner_instruction(
         .replace("__DOMAIN_CATALOG__", domain_catalog)
         .replace("__ROUTING_POLICY__", routing_policy)
         .replace("__SKILL_POLICY__", skill_policy)
+        .replace("__PLAN_EVIDENCE_POLICY__", evidence_policy)
         .replace("__BQ_POLICY__", bq_policy)
     )
 
@@ -10745,6 +10844,100 @@ def _report_assistant_after_model_callback(
     )
 
 
+def _normalize_workflow_mode(mode: str | None) -> str:
+    normalized = str(mode or "").strip().lower()
+    if normalized in VALID_WORKFLOW_MODES:
+        return normalized
+    return WORKFLOW_MODE_REPORT
+
+
+def store_dataset_visualizations(
+    dimensions_json: str,
+    datasets_json: str,
+    objective: str = "",
+    summary: str = "",
+    notes_json: str = "",
+    tool_context: ToolContext | None = None,
+) -> dict[str, Any]:
+    """Store an analysis-mode dataset comparison visual summary for the current task.
+
+    Use this only for analysis-mode answers that compare or rank concrete dataset
+    candidates. Supply compact JSON arrays encoded as strings:
+      - dimensions_json: 3-6 objects with key/label/(optional) description, weight, low_label, high_label
+      - datasets_json: 2+ objects with dataset_label/source/accession/notes/scores/(optional) metrics, tags, evidence_ids
+      - notes_json: optional JSON array of short strings
+
+    The input should already be normalized across sources. Do not pass raw
+    archive payloads from NEMAR, OpenNeuro, DANDI, GEO, or other source APIs.
+    """
+    if tool_context is None:
+        return {
+            "ok": False,
+            "message": "Visualization storage is unavailable because no tool context was provided.",
+        }
+
+    task_state = _get_task_state_from_state_map(tool_context.state)
+    if not task_state:
+        return {
+            "ok": False,
+            "message": "No workflow task state is available for this visualization request.",
+        }
+
+    try:
+        dimensions = parse_visualization_json_array(
+            dimensions_json,
+            field_name="dimensions_json",
+        )
+        datasets = parse_visualization_json_array(
+            datasets_json,
+            field_name="datasets_json",
+        )
+        notes_raw = parse_visualization_json_array(
+            notes_json,
+            field_name="notes_json",
+        )
+        notes = [
+            str(note).strip()
+            for note in notes_raw
+            if str(note).strip()
+        ]
+        bundle = build_dataset_visualization_bundle(
+            objective=objective or str(task_state.get("objective", "") or ""),
+            summary=summary,
+            dimensions=dimensions,
+            datasets=datasets,
+            notes=notes,
+        )
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "message": str(exc),
+        }
+
+    task_state["latest_dataset_visualizations"] = bundle
+    tool_context.state[STATE_WORKFLOW_TASK] = task_state
+
+    summary_cards = dict(bundle.get("summary_cards", {}) or {})
+    top_dataset = str(summary_cards.get("top_dataset", "") or "").strip()
+    dataset_count = int(summary_cards.get("dataset_count", 0) or 0)
+    dimension_count = int(summary_cards.get("dimension_count", 0) or 0)
+    top_score = summary_cards.get("top_score")
+
+    message = f"Stored dataset visuals comparing {dataset_count} datasets across {dimension_count} dimensions."
+    if top_dataset:
+        if isinstance(top_score, (int, float)):
+            message += f" Current top candidate: {top_dataset} ({float(top_score):.2f}/5)."
+        else:
+            message += f" Current top candidate: {top_dataset}."
+
+    return {
+        "ok": True,
+        "message": message,
+        "summary_cards": summary_cards,
+        "warnings": list(bundle.get("warnings", []) or []),
+    }
+
+
 def create_mcp_toolset(tool_filter: list[str] | ToolPredicate | None = None) -> McpToolset | None:
     """Build an MCP toolset for the native evidence-executor agent."""
     if isinstance(tool_filter, list) and len(tool_filter) == 0:
@@ -10776,6 +10969,7 @@ def create_workflow_agent(
     report_assistant_skills_enabled: bool | None = None,
     require_plan_approval: bool = False,
     benchmark_mode: bool = False,
+    workflow_mode: str = WORKFLOW_MODE_REPORT,
 ) -> tuple[LlmAgent | SequentialAgent, McpToolset | None]:
     """Create the routed ADK agent graph and return (root_agent, managed_mcp_toolsets).
 
@@ -10786,6 +10980,9 @@ def create_workflow_agent(
       - research_workflow: full plan → execute → synthesize pipeline
 
     Args:
+        workflow_mode: ``report`` for the current cited-report workflow, or
+            ``analysis`` for the open-data analysis mode that can persist
+            dataset-comparison visual summaries.
         require_plan_approval: When True, the research_workflow pauses after
             plan generation and waits for the user to ``approve`` or
             ``revise: <feedback>`` before executing the plan.
@@ -10797,6 +10994,8 @@ def create_workflow_agent(
     planner_model = PLANNER_MODEL
     synthesizer_model = SYNTHESIZER_MODEL
     router_model = ROUTER_MODEL
+    normalized_mode = _normalize_workflow_mode(workflow_mode)
+    analysis_mode = normalized_mode == WORKFLOW_MODE_ANALYSIS
     use_bigquery_priority = DEFAULT_PREFER_BIGQUERY if prefer_bigquery is None else bool(prefer_bigquery)
     use_planner_skills = (
         DEFAULT_PLANNER_SKILLS_ENABLED if planner_skills_enabled is None else bool(planner_skills_enabled)
@@ -10882,6 +11081,11 @@ def create_workflow_agent(
         executor_tool_hints = base_tool_hints
 
     hitl_agent_gate = _hitl_skip_agent if require_plan_approval else None
+    synthesizer_instruction = SYNTHESIZER_INSTRUCTION
+    synthesizer_tools: list[Any] = []
+    if analysis_mode:
+        synthesizer_instruction = f"{SYNTHESIZER_INSTRUCTION.rstrip()}\n\n{ANALYSIS_VISUALIZATION_POLICY.strip()}"
+        synthesizer_tools = [FunctionTool(store_dataset_visualizations)]
 
     # ── Research workflow agents (plan → execute → synthesize) ────────────
 
@@ -10892,6 +11096,7 @@ def create_workflow_agent(
             executor_tool_hints,
             prefer_bigquery=use_bigquery_priority,
             planner_skills_enabled=use_planner_skills,
+            workflow_mode=normalized_mode,
         ),
         tools=planner_tools,
         disallow_transfer_to_parent=True,
@@ -10907,9 +11112,10 @@ def create_workflow_agent(
     step_executor = LlmAgent(
         name="step_executor",
         model=runtime_model,
-        instruction=_build_step_executor_instruction(
+        instruction=_build_step_executor_instruction_for_mode(
             executor_tool_hints,
             prefer_bigquery=use_bigquery_priority,
+            workflow_mode=normalized_mode,
         ),
         tools=workflow_lookup_tools,
         include_contents="none",
@@ -10928,8 +11134,8 @@ def create_workflow_agent(
     report_synthesizer = LlmAgent(
         name="report_synthesizer",
         model=synthesizer_model,
-        instruction=SYNTHESIZER_INSTRUCTION,
-        tools=[],
+        instruction=synthesizer_instruction,
+        tools=synthesizer_tools,
         include_contents="none",
         before_agent_callback=hitl_agent_gate,
         before_model_callback=_synth_before_model_callback,

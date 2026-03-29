@@ -34,7 +34,7 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ui_server,
         "create_workflow_agent",
-        lambda require_plan_approval=True: (object(), None),
+        lambda require_plan_approval=True, workflow_mode="report": (object(), None),
     )
     monkeypatch.setattr(ui_server, "Runner", DummyRunner)
 
@@ -358,6 +358,52 @@ async def test_get_task_evidence_graph_falls_back_to_persisted_state(runtime):
     assert payload["elements"]["nodes"][0]["data"]["type"] in {"disease", "phenotype"}
 
 
+@pytest.mark.asyncio
+async def test_get_task_dataset_visualizations_reads_task_payload(runtime):
+    task = ui_server._make_task(
+        "task_analysis_viz",
+        "Compare reusable schizophrenia datasets",
+        "conv_analysis_viz",
+        mode="analysis",
+    )
+    task["dataset_visualizations"] = {
+        "schema": "dataset_visualizations.v1",
+        "rows": [
+            {
+                "dataset_label": "OpenNeuro ds000115",
+                "overall_score": 4.52,
+                "scores": {"disease_match": 4.8, "metadata_quality": 4.2},
+            },
+            {
+                "dataset_label": "NEMAR nm000104",
+                "overall_score": 3.94,
+                "scores": {"disease_match": 4.1, "metadata_quality": 3.7},
+            },
+        ],
+        "dimensions": [
+            {"key": "disease_match", "label": "Disease match"},
+            {"key": "metadata_quality", "label": "Metadata quality"},
+        ],
+        "summary_cards": {
+            "dataset_count": 2,
+            "dimension_count": 2,
+            "source_count": 2,
+            "top_dataset": "OpenNeuro ds000115",
+            "top_score": 4.52,
+        },
+        "charts": {"bar": {"score_key": "overall_score"}},
+    }
+    runtime.store.save_task(task)
+
+    payload = await runtime.get_task_dataset_visualizations("task_analysis_viz")
+
+    assert payload is not None
+    assert payload["available"] is True
+    assert payload["mode"] == "analysis"
+    assert payload["source"] == "task"
+    assert payload["visualizations"]["summary_cards"]["top_dataset"] == "OpenNeuro ds000115"
+
+
 def test_json_store_persists_runs_and_interrupts_incomplete_runs(tmp_path):
     store = JsonTaskStore(tmp_path / "workflow_tasks.json")
     store.save_run(
@@ -395,7 +441,7 @@ async def test_run_new_query_marks_terminal_rate_limit_response_as_failed(runtim
         "`429 RESOURCE_EXHAUSTED`"
     )
 
-    async def fake_get_or_create_session(conversation_id: str):
+    async def fake_get_or_create_session(conversation_id: str, *, mode: str = "report"):
         return SimpleNamespace(app_name="test-app", session_id=conversation_id)
 
     async def fake_turn(conversation_id: str, prompt: str, *, run_id: str):

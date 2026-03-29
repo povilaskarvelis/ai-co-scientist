@@ -2,15 +2,17 @@ import html
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 from google.adk.models.llm_request import LlmRequest
-from google.adk.tools import McpToolset
+from google.adk.tools import FunctionTool, McpToolset
 from google.adk.tools.skill_toolset import SkillToolset
 from google.genai import types
 
 import co_scientist.tool_registry as tool_registry
 import co_scientist.workflow as workflow
+from co_scientist.dataset_visualization import DatasetVisualizationDimension, DatasetVisualizationRow
 from co_scientist.workflow import create_workflow_agent
 
 
@@ -187,6 +189,153 @@ def test_create_workflow_agent_benchmark_mode_returns_single_tool_enabled_agent(
     assert isinstance(benchmark_executor.tools[0], McpToolset)
     assert isinstance(mcp_tools, workflow.ManagedMcpToolsets)
     assert len(mcp_tools.toolsets) == 1
+
+
+def test_analysis_mode_enables_dataset_visualization_tool_on_report_synth():
+    root_agent, _ = create_workflow_agent(tool_filter=[], workflow_mode="analysis")
+    research_workflow = next(a for a in root_agent.sub_agents if a.name == "research_workflow")
+    report_agent = research_workflow.sub_agents[2]
+
+    assert any(getattr(tool, "name", "") == "store_dataset_visualizations" for tool in report_agent.tools)
+    assert any(isinstance(tool, FunctionTool) for tool in report_agent.tools)
+
+
+def test_report_mode_does_not_enable_dataset_visualization_tool():
+    root_agent, _ = create_workflow_agent(tool_filter=[], workflow_mode="report")
+    research_workflow = next(a for a in root_agent.sub_agents if a.name == "research_workflow")
+    report_agent = research_workflow.sub_agents[2]
+
+    assert all(getattr(tool, "name", "") != "store_dataset_visualizations" for tool in report_agent.tools)
+
+
+def test_store_dataset_visualizations_persists_bundle_into_task_state():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Compare open schizophrenia datasets",
+        "success_criteria": ["Rank reusable public datasets"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Compare public datasets",
+                "tool_hint": "search_openneuro_datasets",
+                "domains": ["neuroscience"],
+                "completion_condition": "Return a ranked shortlist",
+            }
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Compare open schizophrenia datasets",
+    )
+    ctx = SimpleNamespace(state={workflow.STATE_WORKFLOW_TASK: task_state})
+
+    response = workflow.store_dataset_visualizations(
+        dimensions_json=[
+            DatasetVisualizationDimension(key="disease_match", label="Disease match"),
+            DatasetVisualizationDimension(key="metadata_quality", label="Metadata quality"),
+            DatasetVisualizationDimension(key="access_friction", label="Low access friction"),
+        ],
+        datasets_json=[
+            DatasetVisualizationRow(
+                dataset_label="OpenNeuro ds000115",
+                source="OpenNeuro",
+                accession="ds000115",
+                notes="Large public schizophrenia MRI cohort with reusable metadata.",
+                scores={"disease_match": 4.8, "metadata_quality": 4.5, "access_friction": 4.4},
+                metrics={"subject_count": 111},
+                tags=["MRI", "BIDS"],
+            ),
+            DatasetVisualizationRow(
+                dataset_label="NEMAR nm000104",
+                source="NEMAR",
+                accession="nm000104",
+                notes="Public EEG cohort with useful annotations but smaller sample scale.",
+                scores={"disease_match": 4.1, "metadata_quality": 3.9, "access_friction": 4.2},
+                metrics={"subject_count": 32},
+                tags=["EEG", "public"],
+            ),
+        ],
+        objective="Compare open schizophrenia datasets",
+        summary="Shortlist the most analysis-ready public datasets.",
+        tool_context=ctx,
+    )
+
+    assert response["ok"] is True
+    bundle = ctx.state[workflow.STATE_WORKFLOW_TASK]["latest_dataset_visualizations"]
+    assert bundle["summary_cards"]["dataset_count"] == 2
+    assert bundle["summary_cards"]["top_dataset"] == "OpenNeuro ds000115"
+    assert bundle["charts"]["scatter"]["x_dimension"]
+
+
+def test_store_dataset_visualizations_accepts_json_string_payloads():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Compare open schizophrenia datasets",
+        "success_criteria": ["Rank reusable public datasets"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Compare public datasets",
+                "tool_hint": "search_openneuro_datasets",
+                "domains": ["neuroscience"],
+                "completion_condition": "Return a ranked shortlist",
+            }
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Compare open schizophrenia datasets",
+    )
+    ctx = SimpleNamespace(state={workflow.STATE_WORKFLOW_TASK: task_state})
+
+    response = workflow.store_dataset_visualizations(
+        dimensions_json=json.dumps(
+            [
+                {"key": "disease_match", "label": "Disease match"},
+                {"key": "metadata_quality", "label": "Metadata quality", "weight": 1.2},
+                {"key": "access_friction", "label": "Low access friction"},
+            ]
+        ),
+        datasets_json=json.dumps(
+            [
+                {
+                    "dataset_label": "OpenNeuro ds000115",
+                    "source": "OpenNeuro",
+                    "accession": "ds000115",
+                    "notes": "Large public schizophrenia MRI cohort with reusable metadata.",
+                    "scores": {
+                        "disease_match": 4.8,
+                        "metadata_quality": 4.5,
+                        "access_friction": 4.4,
+                    },
+                    "metrics": {"subject_count": 111},
+                    "tags": ["MRI", "BIDS"],
+                },
+                {
+                    "dataset_label": "NEMAR nm000104",
+                    "source": "NEMAR",
+                    "accession": "nm000104",
+                    "notes": "Public EEG cohort with useful annotations but smaller sample scale.",
+                    "scores": {
+                        "disease_match": 4.1,
+                        "metadata_quality": 3.9,
+                        "access_friction": 4.2,
+                    },
+                    "metrics": {"subject_count": 32},
+                    "tags": ["EEG", "public"],
+                },
+            ]
+        ),
+        objective="Compare open schizophrenia datasets",
+        summary="Shortlist the most analysis-ready public datasets.",
+        notes_json=json.dumps(["Normalized from source-specific archive metadata."]),
+        tool_context=ctx,
+    )
+
+    assert response["ok"] is True
+    bundle = ctx.state[workflow.STATE_WORKFLOW_TASK]["latest_dataset_visualizations"]
+    assert bundle["summary_cards"]["dataset_count"] == 2
+    assert bundle["summary_cards"]["top_dataset"] == "OpenNeuro ds000115"
 
 
 def test_known_mcp_tools_and_benchmark_instruction_cover_ensembl_tss_lookup():
@@ -556,6 +705,32 @@ def test_planner_instruction_preserves_core_rules_but_trims_large_playbooks():
     assert "Available BigQuery datasets" not in instruction
     assert "open_targets_platform.target" not in instruction
     assert "Avoid boolean strings like `A OR B`" not in instruction
+
+
+def test_analysis_mode_planner_instruction_does_not_require_pubmed_corroboration_step():
+    instruction = workflow._build_planner_instruction(
+        ["search_openneuro_datasets", "search_nemar_datasets", "search_pubmed"],
+        prefer_bigquery=False,
+        planner_skills_enabled=True,
+        workflow_mode="analysis",
+    )
+
+    assert "Do NOT append a terminal PubMed/OpenAlex/Europe PMC corroboration step" in instruction
+    assert "a plan with only archive/source-native steps is acceptable" in instruction
+    assert "Every plan MUST include at least one step" not in instruction
+    assert "you MUST append a dedicated" not in instruction
+
+
+def test_analysis_mode_step_executor_instruction_does_not_force_pubmed_harvest():
+    instruction = workflow._build_step_executor_instruction_for_mode(
+        ["search_openneuro_datasets", "search_nemar_datasets", "search_pubmed"],
+        prefer_bigquery=False,
+        workflow_mode="analysis",
+    )
+
+    assert "Do NOT make a secondary call to search_pubmed or search_openalex_works" in instruction
+    assert "archive/repository identifiers" in instruction
+    assert "If the primary tool for this step does not return individual document IDs" not in instruction
 
 
 def test_trimmed_tool_registry_descriptions_remove_strategy_prose():

@@ -55,6 +55,9 @@ logger = logging.getLogger(__name__)
 RATE_LIMIT_QUERIES = int(os.environ.get("RATE_LIMIT_QUERIES", "20"))
 RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "3600"))
 MAX_CONCURRENT_TURNS = int(os.environ.get("ADK_MAX_CONCURRENT_TURNS", "6"))
+TASK_MODE_REPORT = "report"
+TASK_MODE_ANALYSIS = "analysis"
+VALID_TASK_MODES = {TASK_MODE_REPORT, TASK_MODE_ANALYSIS}
 _global_turn_semaphore = threading.Semaphore(MAX_CONCURRENT_TURNS)
 GA4_MEASUREMENT_ID = os.environ.get("GA4_MEASUREMENT_ID", "").strip()
 _GA4_ID_PATTERN = re.compile(r"^G-[A-Z0-9]+$")
@@ -114,6 +117,13 @@ def _compact_text(value: str, *, max_chars: int = 180) -> str:
     if len(text) <= max_chars:
         return text
     return f"{text[: max_chars - 3].rstrip()}..."
+
+
+def _normalize_task_mode(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in VALID_TASK_MODES:
+        return normalized
+    return TASK_MODE_REPORT
 
 
 def _derive_run_error_message(response_text: str, default: str) -> str:
@@ -330,6 +340,7 @@ class ConversationSession:
     session_id: str
     app_name: str
     mcp_tools: object | None
+    mode: str = TASK_MODE_REPORT
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +389,7 @@ class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=5000)
     conversation_id: str | None = Field(default=None, max_length=128)
     parent_task_id: str | None = Field(default=None, max_length=128)
+    mode: str = Field(default=TASK_MODE_REPORT, max_length=32)
 
 
 class FeedbackRequest(BaseModel):
@@ -408,6 +420,7 @@ def _make_task(
     title: str = "",
     user_query: str = "",
     parent_task_id: str | None = None,
+    mode: str = TASK_MODE_REPORT,
 ) -> dict:
     now = _utc_now()
     return {
@@ -415,6 +428,7 @@ def _make_task(
         "title": title or _generate_chat_title(objective),
         "conversation_id": conversation_id,
         "parent_task_id": parent_task_id,
+        "mode": _normalize_task_mode(mode),
         "objective": objective,
         "user_query": user_query or objective,
         "status": "in_progress",
@@ -428,6 +442,7 @@ def _make_task(
         "updated_at": now,
         "progress_events": [],
         "progress_summaries": [],
+        "dataset_visualizations": None,
     }
 
 
@@ -459,6 +474,26 @@ def _steps_from_workflow_state(wf_state: dict | None) -> list[dict]:
         }
         for step in wf_state.get("steps", [])
     ]
+
+
+def _dataset_visualizations_from_workflow_state(wf_state: dict | None) -> dict | None:
+    if not isinstance(wf_state, dict):
+        return None
+    bundle = wf_state.get("latest_dataset_visualizations")
+    if not isinstance(bundle, dict):
+        return None
+    rows = list(bundle.get("rows", []) or [])
+    if not rows:
+        return None
+    return copy.deepcopy(bundle)
+
+
+def _sync_task_dataset_visualizations(task: dict, wf_state: dict | None) -> None:
+    bundle = _dataset_visualizations_from_workflow_state(wf_state)
+    if bundle is None:
+        task["dataset_visualizations"] = None
+        return
+    task["dataset_visualizations"] = bundle
 
 
 def _normalize_steps_for_ui(steps: list[dict] | None) -> list[dict]:
@@ -521,8 +556,16 @@ def _task_summary(task: dict) -> dict:
 
 
 def _task_detail(task: dict) -> dict:
+    mode = _normalize_task_mode(task.get("mode"))
+    dataset_visualizations = task.get("dataset_visualizations")
+    has_dataset_visualizations = bool(
+        isinstance(dataset_visualizations, dict)
+        and list((dataset_visualizations.get("rows", []) or []))
+    )
     return {
         **task,
+        "mode": mode,
+        "has_dataset_visualizations": has_dataset_visualizations,
         "status_text": f"Status: {task.get('status', 'unknown')}",
         "quality_snapshot": {
             "passed": task.get("status") == "completed",
@@ -543,6 +586,11 @@ def _task_detail(task: dict) -> dict:
 
 def _iteration_from_task(task: dict, idx: int = 1) -> dict:
     steps = _normalize_steps_for_ui(task.get("steps", []))
+    mode = _normalize_task_mode(task.get("mode"))
+    has_dataset_visualizations = bool(
+        isinstance(task.get("dataset_visualizations"), dict)
+        and list(((task.get("dataset_visualizations") or {}).get("rows", []) or []))
+    )
     active_plan = {
         "version_id": f"plan_{task['task_id']}",
         "steps": steps,
@@ -573,6 +621,8 @@ def _iteration_from_task(task: dict, idx: int = 1) -> dict:
             "report_markdown": report_md,
             "report_pdf_path": None,
             "has_report": bool(report_md and str(report_md).strip()),
+            "mode": mode,
+            "has_dataset_visualizations": has_dataset_visualizations,
         },
         "follow_up_suggestions": task.get("follow_up_suggestions", []),
         "branch_label": task.get("branch_label", ""),
@@ -631,12 +681,21 @@ class UiRuntime:
             self.conv_thread_locks[conversation_id] = threading.Lock()
         return self.conv_thread_locks[conversation_id]
 
-    async def _get_or_create_session(self, conversation_id: str) -> ConversationSession:
+    async def _get_or_create_session(
+        self,
+        conversation_id: str,
+        *,
+        mode: str = TASK_MODE_REPORT,
+    ) -> ConversationSession:
+        normalized_mode = _normalize_task_mode(mode)
         if conversation_id in self.conv_sessions:
             return self.conv_sessions[conversation_id]
         if not self.session_service:
             raise RuntimeError("Session service is not initialized.")
-        workflow_agent, mcp_tools = create_workflow_agent(require_plan_approval=True)
+        workflow_agent, mcp_tools = create_workflow_agent(
+            require_plan_approval=True,
+            workflow_mode=normalized_mode,
+        )
         app_name = f"co_scientist_ui_{conversation_id}"
         runner = Runner(
             agent=workflow_agent,
@@ -659,6 +718,7 @@ class UiRuntime:
             session_id=session.id,
             app_name=app_name,
             mcp_tools=mcp_tools,
+            mode=normalized_mode,
         )
         self.conv_sessions[conversation_id] = cs
         return cs
@@ -1226,6 +1286,7 @@ class UiRuntime:
         *,
         conversation_id: str | None = None,
         parent_task_id: str | None = None,
+        mode: str = TASK_MODE_REPORT,
         owner_ip: str = "",
     ) -> RunRecord:
         run = await self._create_run("new_query", query=query)
@@ -1235,6 +1296,7 @@ class UiRuntime:
                 query,
                 conversation_id=conversation_id,
                 parent_task_id=parent_task_id,
+                mode=mode,
                 owner_ip=owner_ip,
             )
         )
@@ -1260,6 +1322,7 @@ class UiRuntime:
         *,
         conversation_id: str | None = None,
         parent_task_id: str | None = None,
+        mode: str = TASK_MODE_REPORT,
         owner_ip: str = "",
     ) -> None:
         await self._update_run(run_id, status="running")
@@ -1270,7 +1333,8 @@ class UiRuntime:
         try:
             task_id = f"task_{uuid.uuid4().hex[:10]}"
             conv_id = conversation_id or f"conv_{task_id}"
-            await self._get_or_create_session(conv_id)
+            normalized_mode = _normalize_task_mode(mode)
+            await self._get_or_create_session(conv_id, mode=normalized_mode)
 
             title = _generate_chat_title(query)
             parent = parent_task_id.strip() if parent_task_id else None
@@ -1283,6 +1347,7 @@ class UiRuntime:
                 title=title,
                 user_query=query,
                 parent_task_id=parent,
+                mode=normalized_mode,
             )
             task["branch_label"] = branch_label
             await self._save_task_with_progress(task, run_id, owner_ip=owner_ip)
@@ -1372,6 +1437,7 @@ class UiRuntime:
                 run_error = _derive_run_error_message(response_text, "Run failed.")
                 task["status"] = "failed"
                 task["report_markdown"] = response_text
+                _sync_task_dataset_visualizations(task, wf_state)
                 await self._save_task_with_progress(task, run_id)
                 await self._update_run(
                     run_id, status="failed", task_id=task_id,
@@ -1392,6 +1458,7 @@ class UiRuntime:
                 task["direct_response_text"] = response_text
                 task["progress_events"] = []
                 task["progress_summaries"] = []
+                task["dataset_visualizations"] = None
                 await self._save_task_with_progress(task, run_id, merge_progress=False)
                 async with self.runs_lock:
                     run = self.runs.get(run_id)
@@ -1410,6 +1477,7 @@ class UiRuntime:
                 )
                 task["status"] = "failed"
                 task["report_markdown"] = response_text
+                _sync_task_dataset_visualizations(task, wf_state)
                 await self._save_task_with_progress(task, run_id)
                 await self._update_run(
                     run_id, status="failed", task_id=task_id,
@@ -1426,6 +1494,7 @@ class UiRuntime:
             elif plan_pending:
                 task["awaiting_hitl"] = True
                 task["status"] = "in_progress"
+                _sync_task_dataset_visualizations(task, wf_state)
                 await self._append_progress_event(
                     run_id,
                     phase="plan",
@@ -1441,6 +1510,7 @@ class UiRuntime:
                 task["status"] = "completed"
                 task["follow_up_suggestions"] = _extract_next_steps(response_text)
                 task["report_markdown"] = _strip_next_steps_section(response_text)
+                _sync_task_dataset_visualizations(task, wf_state)
                 await self._save_task_with_progress(task, run_id)
                 await self._update_run(
                     run_id, status="completed", task_id=task_id,
@@ -1483,6 +1553,7 @@ class UiRuntime:
                 return
 
             conv_id = task["conversation_id"]
+            await self._get_or_create_session(conv_id, mode=_normalize_task_mode(task.get("mode")))
             await self._update_run(run_id, task_id=task_id, title=task.get("title", ""))
             task["hitl_history"].append("approve")
             task["awaiting_hitl"] = False
@@ -1535,6 +1606,7 @@ class UiRuntime:
                     and wf_state.get("latest_synthesis", {})
                     and wf_state["latest_synthesis"].get("markdown", "").strip()
                 )
+                _sync_task_dataset_visualizations(task, wf_state)
 
                 if plan_status == "completed" and has_synthesis:
                     task["status"] = "completed"
@@ -1633,6 +1705,7 @@ class UiRuntime:
                 return
 
             conv_id = task["conversation_id"]
+            await self._get_or_create_session(conv_id, mode=_normalize_task_mode(task.get("mode")))
             await self._update_run(run_id, task_id=task_id, title=task.get("title", ""))
 
             prompt = f"revise: {message}"
@@ -1783,6 +1856,7 @@ class UiRuntime:
             "conversation": {
                 "conversation_id": conversation_id,
                 "title": latest.get("title") or root.get("title") or "Research",
+                "mode": _normalize_task_mode(root.get("mode")),
                 "root_task_id": root["task_id"],
                 "latest_task_id": latest["task_id"],
                 "latest_status": latest.get("status", ""),
@@ -1877,6 +1951,44 @@ class UiRuntime:
             },
             "persisted_updated_at": str((persisted or {}).get("updated_at", "") or ""),
             "persisted_task_id": str((persisted or {}).get("task_id", "") or ""),
+        }
+
+    async def get_task_dataset_visualizations(self, task_id: str) -> dict | None:
+        task = self.store.get_task(task_id)
+        if not task:
+            return None
+        conversation_id = str(task.get("conversation_id", "") or "").strip()
+        mode = _normalize_task_mode(task.get("mode"))
+        bundle = task.get("dataset_visualizations")
+        source = "task"
+
+        if not isinstance(bundle, dict) or not list((bundle.get("rows", []) or [])):
+            live_state = await self._read_persistable_session_state(conversation_id)
+            persisted = self.store.get_workflow_session(conversation_id) if conversation_id else None
+            source = "none"
+            state: dict[str, object] = {}
+            if live_state:
+                source = "live"
+                state = live_state
+            elif isinstance(persisted, dict) and isinstance(persisted.get("state"), dict):
+                source = "persisted"
+                state = copy.deepcopy(persisted["state"])
+            task_state = state.get(STATE_WORKFLOW_TASK) if isinstance(state, dict) else None
+            bundle = _dataset_visualizations_from_workflow_state(task_state if isinstance(task_state, dict) else None)
+
+        available = bool(isinstance(bundle, dict) and list((bundle.get("rows", []) or [])))
+        return {
+            "task_id": task_id,
+            "conversation_id": conversation_id,
+            "mode": mode,
+            "source": source,
+            "available": available,
+            "visualizations": copy.deepcopy(bundle) if isinstance(bundle, dict) else None,
+            "message": (
+                "Dataset visual summary is available."
+                if available
+                else "No dataset visual summary is available for this task yet."
+            ),
         }
 
     async def get_run(self, run_id: str) -> dict | None:
@@ -2087,6 +2199,15 @@ async def task_evidence_graph(task_id: str, request: Request) -> dict:
     return detail
 
 
+@app.get("/api/tasks/{task_id}/dataset-visualizations")
+async def task_dataset_visualizations(task_id: str, request: Request) -> dict:
+    _check_task_ownership(task_id.strip(), request)
+    detail = await runtime.get_task_dataset_visualizations(task_id.strip())
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
+    return detail
+
+
 @app.post("/api/query")
 async def start_query(payload: QueryRequest, request: Request) -> dict:
     if not runtime.ready:
@@ -2097,6 +2218,7 @@ async def start_query(payload: QueryRequest, request: Request) -> dict:
         payload.query.strip(),
         conversation_id=payload.conversation_id.strip() if payload.conversation_id else None,
         parent_task_id=payload.parent_task_id.strip() if payload.parent_task_id else None,
+        mode=_normalize_task_mode(payload.mode),
         owner_ip=ip,
     )
     return run.to_dict()
