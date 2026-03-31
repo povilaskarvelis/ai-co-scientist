@@ -191,12 +191,73 @@ def test_create_workflow_agent_benchmark_mode_returns_single_tool_enabled_agent(
     assert len(mcp_tools.toolsets) == 1
 
 
-def test_analysis_mode_enables_dataset_visualization_tool_on_report_synth():
-    root_agent, _ = create_workflow_agent(tool_filter=[], workflow_mode="analysis")
-    research_workflow = next(a for a in root_agent.sub_agents if a.name == "research_workflow")
-    report_agent = research_workflow.sub_agents[2]
+def test_create_report_workflow_agent_builds_report_graph():
+    root_agent, mcp_tools = workflow.create_report_workflow_agent(tool_filter=[])
 
-    assert any(getattr(tool, "name", "") == "store_dataset_visualizations" for tool in report_agent.tools)
+    assert mcp_tools is None
+    assert isinstance(root_agent, LlmAgent)
+    top_level_names = [sub_agent.name for sub_agent in root_agent.sub_agents]
+    assert top_level_names == ["general_qa", "clarifier", "report_assistant", "research_workflow"]
+
+
+def test_create_analysis_workflow_agent_builds_analysis_graph():
+    root_agent, mcp_tools = workflow.create_analysis_workflow_agent(tool_filter=[])
+
+    assert mcp_tools is None
+    assert isinstance(root_agent, LlmAgent)
+    top_level_names = [sub_agent.name for sub_agent in root_agent.sub_agents]
+    assert top_level_names == ["general_qa", "clarifier", "analysis_workflow"]
+
+
+def test_report_and_analysis_tool_profiles_use_different_default_hint_sets():
+    report_profile = workflow.build_report_tool_profile(
+        base_tool_hints=workflow._resolve_base_tool_hints(None, workflow_mode=workflow.WORKFLOW_MODE_REPORT),
+        prefer_bigquery=False,
+        planner_skills_enabled=False,
+        execution_skills_enabled=False,
+        report_assistant_skills_enabled=False,
+    )
+    analysis_profile = workflow.build_analysis_tool_profile(
+        base_tool_hints=workflow._resolve_base_tool_hints(None, workflow_mode=workflow.WORKFLOW_MODE_ANALYSIS),
+        prefer_bigquery=False,
+        planner_skills_enabled=False,
+        execution_skills_enabled=False,
+    )
+
+    assert "search_clinical_trials" in report_profile.base_tool_hints
+    assert "search_clinical_trials" not in analysis_profile.base_tool_hints
+    assert "search_openneuro_datasets" in analysis_profile.base_tool_hints
+    assert analysis_profile.report_assistant_tools == []
+
+
+def test_analysis_mode_manages_only_executor_mcp_toolset_by_default():
+    root_agent, mcp_tools = create_workflow_agent(
+        execution_skills_enabled=False,
+        workflow_mode="analysis",
+    )
+
+    assert isinstance(root_agent, LlmAgent)
+    assert isinstance(mcp_tools, workflow.ManagedMcpToolsets)
+    assert len(mcp_tools.toolsets) == 1
+
+
+def test_analysis_mode_uses_dedicated_notebook_workflow_and_tools():
+    root_agent, _ = create_workflow_agent(tool_filter=[], workflow_mode="analysis")
+    analysis_workflow = next(a for a in root_agent.sub_agents if a.name == "analysis_workflow")
+    assert isinstance(analysis_workflow, SequentialAgent)
+    assert [a.name for a in analysis_workflow.sub_agents] == [
+        "analysis_planner",
+        "analysis_executor_loop",
+        "analysis_notebook_synthesizer",
+    ]
+    report_agent = analysis_workflow.sub_agents[2]
+
+    tool_names = {getattr(tool, "name", "") for tool in report_agent.tools}
+    assert {
+        "store_dataset_catalog",
+        "store_dataset_metadata_profile",
+        "append_analysis_note",
+    }.issubset(tool_names)
     assert any(isinstance(tool, FunctionTool) for tool in report_agent.tools)
 
 
@@ -336,6 +397,755 @@ def test_store_dataset_visualizations_accepts_json_string_payloads():
     bundle = ctx.state[workflow.STATE_WORKFLOW_TASK]["latest_dataset_visualizations"]
     assert bundle["summary_cards"]["dataset_count"] == 2
     assert bundle["summary_cards"]["top_dataset"] == "OpenNeuro ds000115"
+
+
+def test_store_dataset_catalog_appends_analysis_workspace_cell_and_visual_bundle():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Compare public EEG datasets",
+        "success_criteria": ["Rank public candidates"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Compare public EEG datasets",
+                "tool_hint": "search_nemar_datasets",
+                "domains": ["neuroscience"],
+                "completion_condition": "Return a ranked shortlist",
+            }
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Compare public EEG datasets",
+    )
+    ctx = SimpleNamespace(
+        state={
+            workflow.STATE_WORKFLOW_TASK: task_state,
+            workflow.STATE_ACTIVE_TASK_CONTEXT: {
+                "conversation_id": "conv_analysis_workspace",
+                "task_id": "task_analysis_workspace",
+                "user_prompt": "Compare public EEG datasets",
+                "mode": "analysis",
+            },
+        }
+    )
+
+    response = workflow.store_dataset_catalog(
+        dimensions_json=json.dumps([]),
+        datasets_json=json.dumps(
+            [
+                {
+                    "dataset_label": "NEMAR nm000104",
+                    "source": "NEMAR",
+                    "accession": "nm000104",
+                    "title": "NEMAR nm000104",
+                    "description": "EEG dataset with public download path.",
+                    "participant_count": 32,
+                    "modalities": ["EEG"],
+                    "diagnoses": ["Schizophrenia"],
+                    "public_download": True,
+                    "license": "CC-BY",
+                    "tags": ["EEG", "public", "BIDS"],
+                },
+                {
+                    "dataset_label": "OpenNeuro ds005522",
+                    "source": "OpenNeuro",
+                    "accession": "ds005522",
+                    "title": "OpenNeuro ds005522",
+                    "description": "BIDS-aligned EEG cohort with richer metadata.",
+                    "participant_count": 24,
+                    "modalities": ["EEG"],
+                    "public_download": True,
+                    "bids": True,
+                    "doi": "10.18112/openneuro.ds005522.v1.0.0",
+                    "tags": ["EEG", "BIDS"],
+                },
+            ]
+        ),
+        objective="Compare public EEG datasets",
+        summary="Shortlist analysis-ready public EEG datasets.",
+        tool_context=ctx,
+    )
+
+    assert response["ok"] is True
+    workspace = ctx.state[workflow.STATE_ANALYSIS_WORKSPACE]
+    assert workspace["schema"] == "analysis_workspace.v1"
+    assert len(workspace["cells"]) == 1
+    assert workspace["cells"][0]["type"] == "dataset_comparison"
+    assert len(workspace["operations"]) == 1
+    assert workspace["operations"][0]["intent"] == "dataset_search_compare"
+    assert ctx.state[workflow.STATE_WORKFLOW_TASK]["latest_dataset_visualizations"]["summary_cards"]["dataset_count"] == 2
+    notebook_state = ctx.state[workflow.STATE_ANALYSIS_NOTEBOOK]
+    notebook_cells = list((notebook_state.get("notebook") or {}).get("cells", []) or [])
+    assert notebook_state["schema"] == "analysis_notebook.v1"
+    assert any(cell.get("cell_type") == "code" for cell in notebook_cells)
+    comparison_cell = next(cell for cell in notebook_cells if cell.get("cell_type") == "code")
+    source = "".join(comparison_cell.get("source", []))
+    assert "import pandas as pd" in source
+    assert "import matplotlib.pyplot as plt" in source
+    assert "participant_count" in source
+    assert "metadata_completeness" not in source
+    assert "Metadata field presence matrix" in source
+    assert "Access and standards matrix" in source
+    assert "Modality-by-dataset matrix" in source
+    assert "score_columns" not in source
+    assert len(list(comparison_cell.get("outputs", []) or [])) >= 5
+
+
+def test_openneuro_fallback_catalog_uses_raw_metadata_fields():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Find schizophrenia datasets on OpenNeuro",
+        "success_criteria": ["Return dataset metadata for plotting"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Find schizophrenia datasets on OpenNeuro",
+                "tool_hint": "search_openneuro_datasets",
+                "domains": ["neuroscience"],
+                "completion_condition": "Return matching OpenNeuro datasets",
+            }
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Find schizophrenia datasets on OpenNeuro",
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Collected OpenNeuro matches.",
+            "result_summary": (
+                "OpenNeuro: Brain correlates of speech perception in schizophrenia patients "
+                "with and without auditory hallucinations (ds004302). 71 participants. "
+                "modality: MRI. DOI:10.18112/openneuro.ds004302.v1.0.1\n"
+                "OpenNeuro: Fribourg Ultimatum Game in Schizophrenia Study (ds004000). "
+                "43 participants. modality: EEG. DOI:10.18112/openneuro.ds004000.v1.0.0"
+            ),
+            "evidence_ids": [],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["search_openneuro_datasets"],
+            "structured_observations": [],
+        },
+    )
+
+    payload = workflow._build_openneuro_fallback_catalog_payloads(
+        task_state,
+        user_prompt="Find schizophrenia datasets on OpenNeuro and plot their metadata",
+    )
+
+    assert payload is not None
+    assert payload["dimensions"] == []
+    assert len(payload["datasets"]) == 2
+    first = payload["datasets"][0]
+    assert "participant_count" in first
+    assert "modalities" in first
+    assert "doi" in first
+    assert "scores" not in first
+
+
+def test_analysis_fallback_replaces_legacy_generic_dataset_comparison_cell():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Find schizophrenia datasets on OpenNeuro",
+        "success_criteria": ["Return dataset metadata for plotting"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Find schizophrenia datasets on OpenNeuro",
+                "tool_hint": "search_openneuro_datasets",
+                "domains": ["neuroscience"],
+                "completion_condition": "Return matching OpenNeuro datasets",
+            }
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Find schizophrenia datasets on OpenNeuro",
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Collected OpenNeuro matches.",
+            "result_summary": (
+                "OpenNeuro: Brain correlates of speech perception in schizophrenia patients "
+                "with and without auditory hallucinations (ds004302). 71 participants. "
+                "modality: MRI. DOI:10.18112/openneuro.ds004302.v1.0.1\n"
+                "OpenNeuro: Fribourg Ultimatum Game in Schizophrenia Study (ds004000). "
+                "43 participants. modality: EEG. DOI:10.18112/openneuro.ds004000.v1.0.0"
+            ),
+            "evidence_ids": [],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["search_openneuro_datasets"],
+            "structured_observations": [],
+        },
+    )
+    ctx = SimpleNamespace(
+        state={
+            workflow.STATE_WORKFLOW_TASK: task_state,
+            workflow.STATE_ACTIVE_TASK_CONTEXT: {
+                "conversation_id": "conv_legacy_cleanup",
+                "task_id": "task_legacy_cleanup",
+                "user_prompt": "Find schizophrenia datasets on OpenNeuro and plot their metadata",
+                "mode": "analysis",
+            },
+            workflow.STATE_ANALYSIS_WORKSPACE: {
+                "schema": "analysis_workspace.v1",
+                "conversation_id": "conv_legacy_cleanup",
+                "mode": "analysis",
+                "title": "Open Data Analysis",
+                "revision": 1,
+                "selected_dataset_id": None,
+                "datasets": {},
+                "artifacts": {
+                    "artifact_legacy": {
+                        "artifact_id": "artifact_legacy",
+                        "type": "dataset_catalog",
+                        "schema": "dataset_catalog.v1",
+                        "title": "Legacy comparison",
+                        "task_id": "task_legacy_cleanup",
+                        "operation_id": "op_legacy",
+                        "created_at": "2026-03-30T00:00:00Z",
+                        "summary": "Legacy bundle output",
+                        "depends_on": [],
+                        "evidence_ids": [],
+                        "payload": {
+                            "datasets": [
+                                {
+                                    "dataset_label": "Dataset",
+                                    "source": "",
+                                    "accession": "",
+                                    "notes": "",
+                                    "modalities": ["mri"],
+                                }
+                            ]
+                        },
+                    }
+                },
+                "cells": [
+                    {
+                        "cell_id": "cell_legacy",
+                        "type": "dataset_comparison",
+                        "task_id": "task_legacy_cleanup",
+                        "operation_id": "op_legacy",
+                        "created_at": "2026-03-30T00:00:00Z",
+                        "title": "Legacy comparison",
+                        "artifact_id": "artifact_legacy",
+                        "status": "completed",
+                        "selected_dataset_id": None,
+                    }
+                ],
+                "operations": [
+                    {
+                        "operation_id": "op_legacy",
+                        "task_id": "task_legacy_cleanup",
+                        "user_prompt": "legacy",
+                        "intent": "dataset_search_compare",
+                        "status": "completed",
+                        "created_at": "2026-03-30T00:00:00Z",
+                        "produced_cell_ids": ["cell_legacy"],
+                        "target_dataset_ids": [],
+                    }
+                ],
+            },
+            workflow.STATE_SYNTH_BUFFER: "",
+        }
+    )
+
+    llm_response = workflow._make_text_response(
+        "Detailed metadata for 2 OpenNeuro datasets related to schizophrenia has been retrieved."
+    )
+    updated = workflow._analysis_synth_after_model_callback(
+        callback_context=ctx,
+        llm_response=llm_response,
+    )
+
+    assert updated is not None
+    workspace = ctx.state[workflow.STATE_ANALYSIS_WORKSPACE]
+    comparison_cells = [
+        cell for cell in workspace["cells"]
+        if cell.get("task_id") == "task_legacy_cleanup" and cell.get("type") == "dataset_comparison"
+    ]
+    assert len(comparison_cells) == 1
+    artifact = workspace["artifacts"][comparison_cells[0]["artifact_id"]]
+    datasets = list((artifact.get("payload") or {}).get("datasets", []) or [])
+    assert datasets
+    assert datasets[0]["dataset_label"] != "Dataset"
+    assert datasets[0]["accession"] in {"ds004302", "ds004000"}
+
+
+def test_build_analysis_notebook_skips_underspecified_and_older_duplicate_comparisons():
+    workspace = {
+        "schema": "analysis_workspace.v1",
+        "conversation_id": "conv_nb_dedupe",
+        "mode": "analysis",
+        "title": "Open Data Analysis",
+        "revision": 3,
+        "selected_dataset_id": None,
+        "datasets": {},
+        "artifacts": {
+            "artifact_bad": {
+                "artifact_id": "artifact_bad",
+                "type": "dataset_catalog",
+                "schema": "dataset_catalog.v1",
+                "title": "Bad comparison",
+                "summary": "Bad comparison",
+                "payload": {
+                    "datasets": [
+                        {"dataset_label": "Dataset", "source": "", "accession": "", "notes": ""}
+                    ]
+                },
+            },
+            "artifact_old": {
+                "artifact_id": "artifact_old",
+                "type": "dataset_catalog",
+                "schema": "dataset_catalog.v1",
+                "title": "Old comparison",
+                "summary": "Old comparison",
+                "payload": {
+                    "datasets": [
+                        {
+                            "dataset_label": "Older dataset",
+                            "source": "OpenNeuro",
+                            "accession": "ds000001",
+                            "public_download": True,
+                        }
+                    ]
+                },
+            },
+            "artifact_new": {
+                "artifact_id": "artifact_new",
+                "type": "dataset_catalog",
+                "schema": "dataset_catalog.v1",
+                "title": "New comparison",
+                "summary": "New comparison",
+                "payload": {
+                    "datasets": [
+                        {
+                            "dataset_label": "New dataset",
+                            "source": "OpenNeuro",
+                            "accession": "ds000002",
+                            "public_download": True,
+                        }
+                    ]
+                },
+            },
+        },
+        "cells": [
+            {
+                "cell_id": "cell_bad",
+                "type": "dataset_comparison",
+                "task_id": "task_same",
+                "title": "Bad comparison",
+                "artifact_id": "artifact_bad",
+            },
+            {
+                "cell_id": "cell_old",
+                "type": "dataset_comparison",
+                "task_id": "task_same",
+                "title": "Old comparison",
+                "artifact_id": "artifact_old",
+            },
+            {
+                "cell_id": "cell_new",
+                "type": "dataset_comparison",
+                "task_id": "task_same",
+                "title": "New comparison",
+                "artifact_id": "artifact_new",
+            },
+        ],
+        "operations": [],
+    }
+
+    notebook_payload = workflow.build_analysis_notebook(workspace, conversation_id="conv_nb_dedupe")
+    notebook_cells = list((notebook_payload.get("notebook") or {}).get("cells", []) or [])
+    code_cells = [cell for cell in notebook_cells if cell.get("cell_type") == "code"]
+
+    assert len(code_cells) == 1
+    source = "".join(code_cells[0].get("source", []))
+    assert "ds000002" in source
+    assert "ds000001" not in source
+    assert '"dataset_label": "Dataset"' not in source
+
+
+def test_build_analysis_notebook_renders_valid_comparison_without_task_id():
+    workspace = {
+        "schema": "analysis_workspace.v1",
+        "conversation_id": "conv_nb_missing_task",
+        "mode": "analysis",
+        "title": "Open Data Analysis",
+        "revision": 1,
+        "selected_dataset_id": None,
+        "datasets": {},
+        "artifacts": {
+            "artifact_1": {
+                "artifact_id": "artifact_1",
+                "type": "dataset_catalog",
+                "schema": "dataset_catalog.v1",
+                "title": "Recovered comparison",
+                "summary": "Recovered comparison",
+                "payload": {
+                    "datasets": [
+                        {
+                            "dataset_label": "Recovered dataset",
+                            "source": "OpenNeuro",
+                            "accession": "ds009999",
+                            "participant_count": 12,
+                            "modalities": ["EEG"],
+                            "public_download": True,
+                        }
+                    ]
+                },
+            }
+        },
+        "cells": [
+            {
+                "cell_id": "cell_1",
+                "type": "dataset_comparison",
+                "task_id": "",
+                "title": "Recovered comparison",
+                "artifact_id": "artifact_1",
+            }
+        ],
+        "operations": [],
+    }
+
+    notebook_payload = workflow.build_analysis_notebook(workspace, conversation_id="conv_nb_missing_task")
+    notebook_cells = list((notebook_payload.get("notebook") or {}).get("cells", []) or [])
+    code_cells = [cell for cell in notebook_cells if cell.get("cell_type") == "code"]
+
+    assert len(code_cells) == 1
+    source = "".join(code_cells[0].get("source", []))
+    assert "ds009999" in source
+
+
+def test_analysis_synth_after_model_callback_materializes_fallback_notebook_cells():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Compare schizophrenia datasets",
+        "success_criteria": ["Return a reusable shortlist"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Compare public schizophrenia datasets",
+                "tool_hint": "search_openneuro_datasets",
+                "domains": ["neuroscience"],
+                "completion_condition": "Return a ranked shortlist",
+            }
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Compare schizophrenia datasets",
+    )
+    ctx = SimpleNamespace(
+        state={
+            workflow.STATE_WORKFLOW_TASK: task_state,
+            workflow.STATE_ACTIVE_TASK_CONTEXT: {
+                "conversation_id": "conv_analysis_fallback",
+                "task_id": "task_analysis_fallback",
+                "user_prompt": "Find and compare reusable schizophrenia datasets",
+                "mode": "analysis",
+            },
+            workflow.STATE_ANALYSIS_WORKSPACE: {
+                "schema": "analysis_workspace.v1",
+                "conversation_id": "conv_analysis_fallback",
+                "mode": "analysis",
+                "title": "Open Data Analysis",
+                "revision": 0,
+                "selected_dataset_id": None,
+                "datasets": {},
+                "artifacts": {},
+                "cells": [],
+                "operations": [],
+            },
+            workflow.STATE_SYNTH_BUFFER: "",
+        }
+    )
+
+    stored = workflow.store_dataset_visualizations(
+        dimensions_json=json.dumps(
+            [
+                {"key": "disease_match", "label": "Disease match"},
+                {"key": "sample_scale", "label": "Sample scale"},
+                {"key": "metadata_richness", "label": "Metadata richness"},
+            ]
+        ),
+        datasets_json=json.dumps(
+            [
+                {
+                    "dataset_label": "OpenNeuro ds001461",
+                    "source": "OpenNeuro",
+                    "accession": "ds001461",
+                    "notes": "Resting-state fMRI schizophrenia cohort.",
+                    "scores": {
+                        "disease_match": 4.8,
+                        "sample_scale": 4.7,
+                        "metadata_richness": 4.3,
+                    },
+                    "metrics": {"subject_count": 81},
+                    "tags": ["MRI", "rsfMRI"],
+                },
+                {
+                    "dataset_label": "OpenNeuro ds004302",
+                    "source": "OpenNeuro",
+                    "accession": "ds004302",
+                    "notes": "MRI schizophrenia cohort.",
+                    "scores": {
+                        "disease_match": 4.5,
+                        "sample_scale": 4.2,
+                        "metadata_richness": 4.1,
+                    },
+                    "metrics": {"subject_count": 71},
+                    "tags": ["MRI"],
+                },
+            ]
+        ),
+        objective="Compare schizophrenia datasets",
+        summary="Shortlist the most reusable schizophrenia datasets.",
+        tool_context=ctx,
+    )
+
+    assert stored["ok"] is True
+
+    llm_response = workflow._make_text_response(
+        "## Summary\n\nThe OpenNeuro shortlist is ready for comparison and follow-up metadata review."
+    )
+    updated = workflow._analysis_synth_after_model_callback(
+        callback_context=ctx,
+        llm_response=llm_response,
+    )
+
+    assert updated is not None
+    workspace = ctx.state[workflow.STATE_ANALYSIS_WORKSPACE]
+    cell_types = [
+        cell["type"]
+        for cell in workspace["cells"]
+        if cell.get("task_id") == "task_analysis_fallback"
+    ]
+    assert "dataset_comparison" in cell_types
+    assert "analysis_note" in cell_types
+    assert ctx.state[workflow.STATE_WORKFLOW_TASK]["latest_synthesis"]["workspace_revision"] == workspace["revision"]
+    notebook_state = ctx.state[workflow.STATE_ANALYSIS_NOTEBOOK]
+    notebook_cells = list((notebook_state.get("notebook") or {}).get("cells", []) or [])
+    assert any(cell.get("cell_type") == "code" for cell in notebook_cells)
+    assert any(cell.get("cell_type") == "markdown" for cell in notebook_cells)
+
+
+def test_store_dataset_metadata_profile_sets_selected_dataset_and_fixed_sections():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Inspect full metadata for NEMAR nm000104",
+        "success_criteria": ["Return normalized metadata sections"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Fetch detailed metadata",
+                "tool_hint": "get_nemar_dataset_details",
+                "domains": ["neuroscience"],
+                "completion_condition": "Return source-native metadata",
+            }
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Inspect full metadata for NEMAR nm000104",
+    )
+    ctx = SimpleNamespace(
+        state={
+            workflow.STATE_WORKFLOW_TASK: task_state,
+            workflow.STATE_ANALYSIS_WORKSPACE: {
+                "schema": "analysis_workspace.v1",
+                "conversation_id": "conv_meta",
+                "mode": "analysis",
+                "title": "Open Data Analysis",
+                "revision": 1,
+                "selected_dataset_id": None,
+                "datasets": {},
+                "artifacts": {},
+                "cells": [],
+                "operations": [],
+            },
+            workflow.STATE_ACTIVE_TASK_CONTEXT: {
+                "conversation_id": "conv_meta",
+                "task_id": "task_meta",
+                "user_prompt": "Show me full metadata for nm000104",
+                "mode": "analysis",
+            },
+        }
+    )
+
+    response = workflow.store_dataset_metadata_profile(
+        metadata_json=json.dumps(
+            {
+                "source": "NEMAR",
+                "accession": "nm000104",
+                "dataset_label": "NEMAR nm000104",
+                "summary": "Public EEG study with reusable annotations.",
+                "identity": {"description": "Public EEG study"},
+                "access_download": {"public_download": True, "license": "CC-BY"},
+                "subjects_sessions": {"subject_count": 32},
+                "modalities_tasks": {"modalities": ["EEG"], "tasks": ["resting state"]},
+                "standards_file_formats": {"file_formats": ["EEGLAB"]},
+                "links_publications": {"publications": ["PMID:123456"]},
+                "source_raw_highlights": ["repository: NEMAR", "modalities: EEG"],
+            }
+        ),
+        title="Metadata profile · NEMAR nm000104",
+        tool_context=ctx,
+    )
+
+    assert response["ok"] is True
+    workspace = ctx.state[workflow.STATE_ANALYSIS_WORKSPACE]
+    assert workspace["selected_dataset_id"] == "nemar:nm000104"
+    artifact = next(iter(workspace["artifacts"].values()))
+    payload = artifact["payload"]
+    assert payload["schema"] == "dataset_metadata_profile.v1"
+    assert payload["identity"]["dataset_id"] == "nemar:nm000104"
+    assert payload["access_download"]["license"] == "CC-BY"
+    assert payload["subjects_sessions"]["subject_count"] == 32
+    notebook_state = ctx.state[workflow.STATE_ANALYSIS_NOTEBOOK]
+    notebook_cells = list((notebook_state.get("notebook") or {}).get("cells", []) or [])
+    metadata_cell = next(cell for cell in notebook_cells if cell.get("cell_type") == "code")
+    assert "dataset_metadata =" in "".join(metadata_cell.get("source", []))
+    assert list(metadata_cell.get("outputs", []) or [])
+
+
+def test_analysis_mode_planner_before_model_callback_autosynthesizes_plot_followup():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Compare public schizophrenia datasets",
+        "success_criteria": ["Return a ranked shortlist"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Compare public schizophrenia datasets",
+                "tool_hint": "search_openneuro_datasets",
+                "domains": ["neuroscience"],
+                "completion_condition": "Return a ranked shortlist",
+            }
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Compare public schizophrenia datasets",
+    )
+    task_state["plan_status"] = "completed"
+    task_state["current_step_id"] = None
+    task_state["steps"][0]["status"] = "completed"
+    task_state["steps"][0]["result_summary"] = "Identified ds001461 and ds004302 as strong MRI candidates."
+
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {
+                workflow.STATE_WORKFLOW_TASK: task_state,
+                workflow.STATE_ANALYSIS_WORKSPACE: {
+                    "schema": "analysis_workspace.v1",
+                    "conversation_id": "conv_plot_followup",
+                    "mode": "analysis",
+                    "title": "Open Data Analysis",
+                    "revision": 1,
+                    "selected_dataset_id": None,
+                    "datasets": {},
+                    "artifacts": {},
+                    "cells": [],
+                    "operations": [],
+                },
+                workflow.STATE_ACTIVE_TASK_CONTEXT: {
+                    "conversation_id": "conv_plot_followup",
+                    "task_id": "task_plot_followup",
+                    "user_prompt": "Compare public schizophrenia datasets",
+                    "mode": "analysis",
+                },
+            }
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="plot it")],
+            )
+
+    callback = workflow._make_planner_before_model_callback(
+        require_approval=False,
+        workflow_mode="analysis",
+    )
+    callback_context = DummyCallbackContext()
+    llm_request = LlmRequest()
+
+    response = callback(callback_context=callback_context, llm_request=llm_request)
+
+    assert response is not None
+    assert workflow._llm_response_text(response) == ""
+    assert callback_context.state[workflow.STATE_AUTO_SYNTH_REQUESTED] is True
+
+
+def test_analysis_synth_context_requires_dataset_catalog_for_compare_task_without_cell():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Compare public schizophrenia datasets",
+        "success_criteria": ["Return a ranked shortlist"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Compare public schizophrenia datasets",
+                "tool_hint": "search_openneuro_datasets",
+                "domains": ["neuroscience"],
+                "completion_condition": "Return a ranked shortlist",
+            }
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Compare public schizophrenia datasets",
+    )
+    task_state["plan_status"] = "completed"
+    task_state["current_step_id"] = None
+    task_state["steps"][0]["status"] = "completed"
+    task_state["steps"][0]["result_summary"] = "Shortlisted ds001461, ds004302, and nm000104."
+
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {
+                workflow.STATE_WORKFLOW_TASK: task_state,
+                workflow.STATE_ANALYSIS_WORKSPACE: {
+                    "schema": "analysis_workspace.v1",
+                    "conversation_id": "conv_synth_requirements",
+                    "mode": "analysis",
+                    "title": "Open Data Analysis",
+                    "revision": 1,
+                    "selected_dataset_id": None,
+                    "datasets": {},
+                    "artifacts": {},
+                    "cells": [],
+                    "operations": [],
+                },
+                workflow.STATE_ACTIVE_TASK_CONTEXT: {
+                    "conversation_id": "conv_synth_requirements",
+                    "task_id": "task_synth_requirements",
+                    "user_prompt": "Compare public schizophrenia datasets",
+                    "mode": "analysis",
+                },
+            }
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="plot it")],
+            )
+
+    instructions = workflow._analysis_synth_context_instructions(
+        task_state,
+        DummyCallbackContext(),
+    )
+    joined = "\n".join(instructions)
+
+    assert "You MUST call `store_dataset_catalog` before returning Markdown." in joined
+    assert "`append_analysis_note` alone is not sufficient." in joined
+    assert "Reuse the completed-step evidence from this task instead of reopening planning or discovery." in joined
 
 
 def test_known_mcp_tools_and_benchmark_instruction_cover_ensembl_tss_lookup():
@@ -717,8 +1527,46 @@ def test_analysis_mode_planner_instruction_does_not_require_pubmed_corroboration
 
     assert "Do NOT append a terminal PubMed/OpenAlex/Europe PMC corroboration step" in instruction
     assert "a plan with only archive/source-native steps is acceptable" in instruction
+    assert "Do NOT create standalone executor steps whose only purpose is to synthesize, rank, tabulate, chart, or visualize already-collected dataset evidence." in instruction
     assert "Every plan MUST include at least one step" not in instruction
     assert "you MUST append a dedicated" not in instruction
+
+
+def test_repair_analysis_plan_internal_prunes_bigquery_presentation_steps():
+    raw_plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Compare reusable schizophrenia datasets",
+        "success_criteria": ["Return a ranked shortlist"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Search OpenNeuro for schizophrenia MRI datasets",
+                "tool_hint": "search_openneuro_datasets",
+                "domains": ["neuroscience"],
+                "completion_condition": "Return matching dataset accessions",
+            },
+            {
+                "id": "S2",
+                "goal": "Synthesize and compare all candidate datasets across reuse dimensions",
+                "tool_hint": "run_bigquery_select_query",
+                "domains": ["neuroscience"],
+                "completion_condition": "A structured comparison and ranked shortlist is prepared",
+            },
+            {
+                "id": "S3",
+                "goal": "Generate a visual summary of the shortlisted datasets",
+                "tool_hint": "run_bigquery_select_query",
+                "domains": ["neuroscience"],
+                "completion_condition": "A chart or table is produced",
+            },
+        ],
+    }
+
+    repaired = workflow._repair_analysis_plan_internal(raw_plan)
+
+    assert [step["goal"] for step in repaired["steps"]] == [
+        "Search OpenNeuro for schizophrenia MRI datasets",
+    ]
 
 
 def test_analysis_mode_step_executor_instruction_does_not_force_pubmed_harvest():
@@ -882,9 +1730,36 @@ def test_initialize_and_advance_task_state_one_step_at_a_time():
     }
     workflow._apply_step_execution_result_to_task_state(task_state, result_s2)
     assert task_state["steps"][1]["status"] == "blocked"
-    assert task_state["current_step_id"] == "S2"
-    assert task_state["plan_status"] == "blocked"
+    assert task_state["current_step_id"] is None
+    assert task_state["plan_status"] == "completed"
     assert task_state["execution_metrics"]["summary"]["blocked_count"] == 1
+
+
+def test_react_skip_if_done_promotes_terminal_blocked_plan_to_synthesis():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {
+                workflow.STATE_WORKFLOW_TASK: {
+                    "plan_status": "blocked",
+                    "current_step_id": "S3",
+                    "steps": [
+                        {"id": "S1", "status": "completed"},
+                        {"id": "S2", "status": "blocked"},
+                        {"id": "S3", "status": "blocked"},
+                    ],
+                },
+                workflow.STATE_AUTO_SYNTH_REQUESTED: False,
+            }
+
+    callback_context = DummyCallbackContext()
+
+    content = workflow._react_skip_if_done(callback_context=callback_context)
+
+    assert content is not None
+    task_state = callback_context.state[workflow.STATE_WORKFLOW_TASK]
+    assert task_state["plan_status"] == "completed"
+    assert task_state["current_step_id"] is None
+    assert callback_context.state[workflow.STATE_AUTO_SYNTH_REQUESTED] is True
 
 
 def test_initialize_task_state_repairs_blank_tool_hint_from_goal_text():
@@ -3777,6 +4652,88 @@ def test_router_before_model_callback_leaves_ambiguous_query_to_router_model():
     )
 
     assert response is None
+
+
+def test_analysis_mode_router_before_model_callback_forces_analysis_workflow_for_plot_followup():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {
+                workflow.STATE_ANALYSIS_WORKSPACE: {
+                    "schema": "analysis_workspace.v1",
+                    "conversation_id": "conv_analysis_router",
+                    "mode": "analysis",
+                    "title": "Open Data Analysis",
+                    "revision": 2,
+                    "selected_dataset_id": None,
+                    "datasets": {},
+                    "artifacts": {},
+                    "cells": [],
+                    "operations": [],
+                }
+            }
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="plot it")],
+            )
+
+    callback_context = DummyCallbackContext()
+    llm_request = LlmRequest()
+    callback = workflow._make_router_before_model_callback(
+        workflow_agent_name="analysis_workflow",
+        allow_report_assistant=False,
+    )
+
+    response = callback(
+        callback_context=callback_context,
+        llm_request=llm_request,
+    )
+
+    assert response is not None
+    assert response.turn_complete is True
+    call = workflow._extract_function_calls(response)[0]
+    assert call["name"] == "transfer_to_agent"
+    assert call["args"]["agent_name"] == "analysis_workflow"
+
+
+def test_analysis_mode_router_before_model_callback_routes_underspecified_dataset_reference_to_clarifier():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {
+                workflow.STATE_ANALYSIS_WORKSPACE: {
+                    "schema": "analysis_workspace.v1",
+                    "conversation_id": "conv_analysis_router_missing_dataset",
+                    "mode": "analysis",
+                    "title": "Open Data Analysis",
+                    "revision": 2,
+                    "selected_dataset_id": None,
+                    "datasets": {},
+                    "artifacts": {},
+                    "cells": [],
+                    "operations": [],
+                }
+            }
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="Run an analysis on this dataset.")],
+            )
+
+    callback_context = DummyCallbackContext()
+    llm_request = LlmRequest()
+    callback = workflow._make_router_before_model_callback(
+        workflow_agent_name="analysis_workflow",
+        allow_report_assistant=False,
+    )
+
+    response = callback(
+        callback_context=callback_context,
+        llm_request=llm_request,
+    )
+
+    assert response is not None
+    assert response.turn_complete is True
+    call = workflow._extract_function_calls(response)[0]
+    assert call["name"] == "transfer_to_agent"
+    assert call["args"]["agent_name"] == "clarifier"
 
 
 def test_react_after_model_callback_stores_compact_tool_args_for_lookup_provenance():

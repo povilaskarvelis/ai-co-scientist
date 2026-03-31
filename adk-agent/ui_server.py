@@ -22,7 +22,7 @@ import traceback
 import uuid
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from google.adk import Runner
@@ -33,8 +33,23 @@ from pydantic import BaseModel, Field
 from agent import validate_runtime_configuration
 from state_store import SupportsWorkflowStateStore, create_state_store
 from report_pdf import write_markdown_pdf
+from co_scientist.analysis_workspace import (
+    append_analysis_note_artifact,
+    append_dataset_catalog_artifact,
+    ensure_analysis_workspace,
+    set_selected_dataset,
+    task_analysis_snapshot,
+)
+from co_scientist.analysis_notebook import (
+    build_analysis_notebook,
+    notebook_json_for_api,
+    serialize_notebook_ipynb,
+)
 from co_scientist.tool_registry import TOOL_SOURCE_NAMES
 from co_scientist.workflow import (
+    STATE_ACTIVE_TASK_CONTEXT,
+    STATE_ANALYSIS_NOTEBOOK,
+    STATE_ANALYSIS_WORKSPACE,
     STATE_EXECUTOR_ACTIVE_STEP_ID,
     STATE_EXECUTOR_LAST_ERROR,
     STATE_PRIOR_RESEARCH,
@@ -183,6 +198,8 @@ _TRANSIENT_WORKFLOW_RESPONSE_PATTERNS = (
 
 PERSISTED_SESSION_STATE_KEYS = (
     STATE_WORKFLOW_TASK,
+    STATE_ANALYSIS_WORKSPACE,
+    STATE_ANALYSIS_NOTEBOOK,
     STATE_PRIOR_RESEARCH,
     STATE_PLAN_PENDING_APPROVAL,
 )
@@ -311,6 +328,69 @@ def _extract_tool_error_metrics(function_response) -> dict | None:
     }
 
 
+_NOTEBOOK_SYNTH_TOOL_NAMES = frozenset(
+    {
+        "store_dataset_catalog",
+        "store_dataset_visualizations",
+        "store_dataset_metadata_profile",
+        "append_analysis_note",
+    }
+)
+
+
+def _notebook_synthesizer_tool_outcome(function_response, *, author: str) -> dict | None:
+    """Research-log line for analysis notebook tool success or ok=false (plotting / cells)."""
+    if str(author or "").strip() != "analysis_notebook_synthesizer":
+        return None
+    if not function_response:
+        return None
+    tool_name = str(getattr(function_response, "name", "") or "").strip()
+    if tool_name not in _NOTEBOOK_SYNTH_TOOL_NAMES:
+        return None
+    response = getattr(function_response, "response", None)
+    if response is None:
+        return None
+    if not isinstance(response, dict):
+        return {
+            "event_type": "notebook.tool.completed",
+            "status": "done",
+            "human_line": _compact_text(f"{tool_name} returned non-dict response.", max_chars=220),
+            "metrics": {"tool": tool_name},
+        }
+    if bool(response.get("error")):
+        return None
+    message = _compact_text(str(response.get("message") or ""), max_chars=200)
+    if response.get("ok") is False:
+        return {
+            "event_type": "tool.failed",
+            "status": "error",
+            "human_line": _compact_text(
+                f"Notebook: {tool_name} failed — {message or 'ok=false'}",
+                max_chars=220,
+            ),
+            "metrics": {"tool": tool_name, "message": message},
+        }
+    line = message
+    if tool_name == "store_dataset_catalog":
+        cards = response.get("summary_cards") if isinstance(response.get("summary_cards"), dict) else {}
+        line = (
+            f"{message or 'Notebook: stored dataset comparison.'} "
+            f"({cards.get('dataset_count', '?')} datasets × {cards.get('dimension_count', '?')} axes)"
+        )
+    elif tool_name == "store_dataset_visualizations":
+        line = message or "Notebook: stored dataset visualization bundle."
+    elif tool_name == "store_dataset_metadata_profile":
+        line = message or "Notebook: stored metadata profile cell."
+    elif tool_name == "append_analysis_note":
+        line = message or "Notebook: appended analysis note."
+    return {
+        "event_type": "notebook.tool.completed",
+        "status": "done",
+        "human_line": _compact_text(line or f"{tool_name} ok.", max_chars=220),
+        "metrics": {"tool": tool_name, "ok": True},
+    }
+
+
 
 
 def _generate_chat_title(query: str) -> str:
@@ -408,6 +488,10 @@ class RollbackRequest(BaseModel):
     token: str = Field(..., min_length=1, max_length=256)
 
 
+class AnalysisSelectionRequest(BaseModel):
+    dataset_id: str = Field(..., min_length=1, max_length=256)
+
+
 # ---------------------------------------------------------------------------
 # Workflow task helpers
 # ---------------------------------------------------------------------------
@@ -443,6 +527,10 @@ def _make_task(
         "progress_events": [],
         "progress_summaries": [],
         "dataset_visualizations": None,
+        "analysis_operation_id": "",
+        "analysis_cell_ids": [],
+        "analysis_workspace_revision": 0,
+        "selected_dataset_id_snapshot": "",
     }
 
 
@@ -494,6 +582,116 @@ def _sync_task_dataset_visualizations(task: dict, wf_state: dict | None) -> None
         task["dataset_visualizations"] = None
         return
     task["dataset_visualizations"] = bundle
+
+
+def _analysis_workspace_from_session_state(session_state: dict | None) -> dict | None:
+    if not isinstance(session_state, dict):
+        return None
+    workspace = session_state.get(STATE_ANALYSIS_WORKSPACE)
+    if not isinstance(workspace, dict):
+        return None
+    return workspace
+
+
+def _analysis_notebook_from_session_state(session_state: dict | None) -> dict | None:
+    if not isinstance(session_state, dict):
+        return None
+    notebook = session_state.get(STATE_ANALYSIS_NOTEBOOK)
+    if not isinstance(notebook, dict):
+        return None
+    return notebook
+
+
+def _recover_analysis_workspace_from_tasks(
+    tasks: list[dict],
+    *,
+    workspace: dict | None,
+    conversation_id: str,
+) -> tuple[dict | None, bool]:
+    if not tasks:
+        return workspace, False
+    recovered = ensure_analysis_workspace(
+        workspace,
+        conversation_id=conversation_id,
+    )
+    if list(recovered.get("cells", []) or []):
+        return recovered, False
+
+    changed = False
+    ordered_tasks = sorted(
+        tasks,
+        key=lambda task: (
+            str(task.get("created_at", "") or ""),
+            str(task.get("task_id", "") or ""),
+        ),
+    )
+    for task in ordered_tasks:
+        if _normalize_task_mode(task.get("mode")) != TASK_MODE_ANALYSIS:
+            continue
+        task_id = str(task.get("task_id", "") or "").strip()
+        if not task_id:
+            continue
+        user_prompt = str(task.get("user_query", "") or task.get("objective", "") or "").strip()
+        bundle = task.get("dataset_visualizations")
+        if isinstance(bundle, dict) and list(bundle.get("rows", []) or []):
+            try:
+                append_dataset_catalog_artifact(
+                    recovered,
+                    task_id=task_id,
+                    user_prompt=user_prompt,
+                    objective=str(bundle.get("objective") or task.get("objective") or "").strip(),
+                    summary=str(bundle.get("summary") or task.get("objective") or "").strip(),
+                    dimensions=list(bundle.get("dimensions", []) or []),
+                    datasets=list(bundle.get("rows", []) or []),
+                    notes=[
+                        str(note).strip()
+                        for note in list(bundle.get("notes", []) or [])
+                        if str(note).strip()
+                    ],
+                )
+                changed = True
+            except ValueError as exc:
+                logger.warning(
+                    "Failed to recover dataset comparison notebook cell for task %s: %s",
+                    task_id,
+                    exc,
+                )
+        report_markdown = str(task.get("report_markdown", "") or "").strip()
+        if report_markdown:
+            try:
+                append_analysis_note_artifact(
+                    recovered,
+                    task_id=task_id,
+                    user_prompt=user_prompt,
+                    markdown=report_markdown,
+                    title=str(task.get("title", "") or task.get("objective", "") or "Analysis note").strip(),
+                    related_dataset_ids=[],
+                )
+                changed = True
+            except ValueError as exc:
+                logger.warning(
+                    "Failed to recover analysis note notebook cell for task %s: %s",
+                    task_id,
+                    exc,
+                )
+    return recovered, changed
+
+
+def _sync_task_analysis_workspace_fields(task: dict, workspace: dict | None) -> None:
+    if not isinstance(workspace, dict):
+        task["analysis_operation_id"] = ""
+        task["analysis_cell_ids"] = []
+        task["analysis_workspace_revision"] = 0
+        task["selected_dataset_id_snapshot"] = ""
+        return
+    snapshot = task_analysis_snapshot(
+        workspace,
+        task_id=str(task.get("task_id", "") or "").strip(),
+    )
+    task["analysis_operation_id"] = snapshot["analysis_operation_id"]
+    task["analysis_cell_ids"] = list(snapshot["analysis_cell_ids"])
+    task["analysis_workspace_revision"] = int(snapshot["analysis_workspace_revision"] or 0)
+    task["selected_dataset_id_snapshot"] = str(snapshot["selected_dataset_id_snapshot"] or "")
 
 
 def _normalize_steps_for_ui(steps: list[dict] | None) -> list[dict]:
@@ -552,6 +750,10 @@ def _task_summary(task: dict) -> dict:
         "step_count": len(task.get("steps", [])),
         "created_at": task.get("created_at", ""),
         "updated_at": task.get("updated_at", ""),
+        "analysis_operation_id": task.get("analysis_operation_id", ""),
+        "analysis_cell_ids": list(task.get("analysis_cell_ids", []) or []),
+        "analysis_workspace_revision": int(task.get("analysis_workspace_revision", 0) or 0),
+        "selected_dataset_id_snapshot": task.get("selected_dataset_id_snapshot", ""),
     }
 
 
@@ -566,6 +768,7 @@ def _task_detail(task: dict) -> dict:
         **task,
         "mode": mode,
         "has_dataset_visualizations": has_dataset_visualizations,
+        "has_analysis_cells": bool(list(task.get("analysis_cell_ids", []) or [])),
         "status_text": f"Status: {task.get('status', 'unknown')}",
         "quality_snapshot": {
             "passed": task.get("status") == "completed",
@@ -604,6 +807,13 @@ def _iteration_from_task(task: dict, idx: int = 1) -> dict:
         "iteration_index": idx,
         "task": _task_detail(task),
         "task_summary": _task_summary(task),
+        "analysis": {
+            "operation_id": task.get("analysis_operation_id", ""),
+            "cell_ids": list(task.get("analysis_cell_ids", []) or []),
+            "workspace_revision": int(task.get("analysis_workspace_revision", 0) or 0),
+            "selected_dataset_id_snapshot": task.get("selected_dataset_id_snapshot", ""),
+            "has_cells": bool(list(task.get("analysis_cell_ids", []) or [])),
+        },
         "active_plan_version": active_plan,
         "latest_plan_delta": None,
         "is_direct_response": is_direct,
@@ -689,6 +899,17 @@ class UiRuntime:
     ) -> ConversationSession:
         normalized_mode = _normalize_task_mode(mode)
         if conversation_id in self.conv_sessions:
+            if normalized_mode == TASK_MODE_ANALYSIS:
+                await self._update_session_state(
+                    conversation_id,
+                    lambda state: {
+                        **(state or {}),
+                        STATE_ANALYSIS_WORKSPACE: ensure_analysis_workspace(
+                            _analysis_workspace_from_session_state(state),
+                            conversation_id=conversation_id,
+                        ),
+                    },
+                )
             return self.conv_sessions[conversation_id]
         if not self.session_service:
             raise RuntimeError("Session service is not initialized.")
@@ -708,6 +929,12 @@ class UiRuntime:
             payload = restored_session.get("state")
             if isinstance(payload, dict):
                 restored_state = _extract_persistable_session_state(payload) or None
+        if normalized_mode == TASK_MODE_ANALYSIS:
+            restored_state = dict(restored_state or {})
+            restored_state[STATE_ANALYSIS_WORKSPACE] = ensure_analysis_workspace(
+                restored_state.get(STATE_ANALYSIS_WORKSPACE) if isinstance(restored_state, dict) else None,
+                conversation_id=conversation_id,
+            )
         session = await self.session_service.create_session(
             app_name=app_name,
             user_id=self.user_id,
@@ -723,15 +950,38 @@ class UiRuntime:
         self.conv_sessions[conversation_id] = cs
         return cs
 
-    async def _read_session_state(self, conversation_id: str) -> dict | None:
+    async def _get_session(self, conversation_id: str):
         cs = self.conv_sessions.get(conversation_id)
         if not cs or not self.session_service:
             return None
-        session = await self.session_service.get_session(
+        return await self.session_service.get_session(
             app_name=cs.app_name,
             user_id=self.user_id,
             session_id=cs.session_id,
         )
+
+    async def _update_session_state(
+        self,
+        conversation_id: str,
+        updater,
+    ) -> dict | None:
+        session = await self._get_session(conversation_id)
+        if not session:
+            return None
+        state = session.state if isinstance(session.state, dict) else {}
+        updated = updater(state)
+        if isinstance(updated, dict):
+            if isinstance(session.state, dict):
+                if updated is not state:
+                    session.state.clear()
+                    session.state.update(updated)
+                return session.state
+            session.state = updated
+            return updated
+        return session.state if isinstance(session.state, dict) else state
+
+    async def _read_session_state(self, conversation_id: str) -> dict | None:
+        session = await self._get_session(conversation_id)
         if not session:
             return None
         return session.state
@@ -741,6 +991,77 @@ class UiRuntime:
         if not session_state:
             return None
         return session_state.get(STATE_WORKFLOW_TASK)
+
+    async def _read_analysis_workspace(self, conversation_id: str) -> dict | None:
+        session_state = await self._read_session_state(conversation_id)
+        if not session_state:
+            return None
+        workspace = _analysis_workspace_from_session_state(session_state)
+        if workspace is None:
+            return None
+        return workspace
+
+    async def _read_analysis_notebook(self, conversation_id: str) -> dict | None:
+        session_state = await self._read_session_state(conversation_id)
+        if not session_state:
+            return None
+        notebook = _analysis_notebook_from_session_state(session_state)
+        if notebook is None:
+            return None
+        return notebook
+
+    async def _build_analysis_notebook_payload(
+        self,
+        *,
+        conversation_id: str,
+        workspace: dict | None,
+        session_state: dict | None = None,
+    ) -> dict | None:
+        if not isinstance(workspace, dict):
+            return None
+        wf_state = None
+        if isinstance(session_state, dict):
+            wf_state = session_state.get(STATE_WORKFLOW_TASK)
+        diagnostics = []
+        if isinstance(wf_state, dict):
+            diagnostics = [
+                dict(item)
+                for item in list(wf_state.get("notebook_synthesis_diagnostics", []) or [])
+                if isinstance(item, dict)
+            ]
+        return build_analysis_notebook(
+            workspace,
+            conversation_id=conversation_id,
+            diagnostics=diagnostics,
+        )
+
+    async def _set_active_task_context(
+        self,
+        conversation_id: str,
+        *,
+        task_id: str,
+        user_prompt: str,
+        mode: str,
+    ) -> None:
+        normalized_mode = _normalize_task_mode(mode)
+
+        def _updater(state: dict) -> dict:
+            if not isinstance(state, dict):
+                state = {}
+            state[STATE_ACTIVE_TASK_CONTEXT] = {
+                "conversation_id": conversation_id,
+                "task_id": task_id,
+                "user_prompt": user_prompt,
+                "mode": normalized_mode,
+            }
+            if normalized_mode == TASK_MODE_ANALYSIS:
+                state[STATE_ANALYSIS_WORKSPACE] = ensure_analysis_workspace(
+                    _analysis_workspace_from_session_state(state),
+                    conversation_id=conversation_id,
+                )
+            return state
+
+        await self._update_session_state(conversation_id, _updater)
 
     async def _read_persistable_session_state(self, conversation_id: str) -> dict:
         return _extract_persistable_session_state(await self._read_session_state(conversation_id))
@@ -870,7 +1191,7 @@ class UiRuntime:
                     fc = getattr(part, "function_call", None)
                     if fc and getattr(fc, "name", "") == "transfer_to_agent":
                         target = (getattr(fc, "args", None) or {}).get("agent_name", "")
-                        if target == "research_workflow":
+                        if target in {"research_workflow", "analysis_workflow"}:
                             planner_seen = True
                             _fire_progress(
                                 phase="plan",
@@ -895,15 +1216,16 @@ class UiRuntime:
                 except Exception:  # noqa: BLE001
                     pass
                 human = _describe_tool_call(name, args)
+                _tool_phase = "synthesize" if author == "analysis_notebook_synthesizer" else "execute"
                 _fire_progress(
-                    phase="execute",
+                    phase=_tool_phase,
                     event_type="tool.called",
                     status="progress",
                     human_line=human,
-                    metrics={"tool": name},
+                    metrics={"tool": name, "author": author},
                 )
                 # Emit step.started + live step summary so frontend gets tool_log in real time
-                if author == "step_executor":
+                if author in {"step_executor", "analysis_step_executor"}:
                     wf_state = await self._read_workflow_state(conversation_id)
                     sid = ""
                     if wf_state:
@@ -942,33 +1264,43 @@ class UiRuntime:
                         )
             for part in parts:
                 fr = getattr(part, "function_response", None)
+                if not fr:
+                    continue
                 error_metrics = _extract_tool_error_metrics(fr)
-                if not error_metrics:
+                if error_metrics:
+                    signature = (
+                        str(error_metrics.get("tool", "") or "").strip(),
+                        str(error_metrics.get("error_type", "") or "").strip(),
+                        str(error_metrics.get("message", "") or "").strip(),
+                    )
+                    if signature not in tool_error_signatures:
+                        tool_error_signatures.add(signature)
+                        tool_name = str(error_metrics.get("tool", "") or "").strip()
+                        source = _step_source_label(tool_name) if tool_name else ""
+                        error_message = str(error_metrics.get("message", "") or "").strip()
+                        if source:
+                            human = f"{source} error: {error_message or 'tool call failed.'}"
+                        elif tool_name:
+                            human = f"{tool_name} error: {error_message or 'tool call failed.'}"
+                        else:
+                            human = error_message or "Tool call failed."
+                        _fire_progress(
+                            phase="execute",
+                            event_type="tool.failed",
+                            status="error",
+                            human_line=human,
+                            metrics=error_metrics,
+                        )
                     continue
-                signature = (
-                    str(error_metrics.get("tool", "") or "").strip(),
-                    str(error_metrics.get("error_type", "") or "").strip(),
-                    str(error_metrics.get("message", "") or "").strip(),
-                )
-                if signature in tool_error_signatures:
-                    continue
-                tool_error_signatures.add(signature)
-                tool_name = str(error_metrics.get("tool", "") or "").strip()
-                source = _step_source_label(tool_name) if tool_name else ""
-                error_message = str(error_metrics.get("message", "") or "").strip()
-                if source:
-                    human = f"{source} error: {error_message or 'tool call failed.'}"
-                elif tool_name:
-                    human = f"{tool_name} error: {error_message or 'tool call failed.'}"
-                else:
-                    human = error_message or "Tool call failed."
-                _fire_progress(
-                    phase="execute",
-                    event_type="tool.failed",
-                    status="error",
-                    human_line=human,
-                    metrics=error_metrics,
-                )
+                notebook_outcome = _notebook_synthesizer_tool_outcome(fr, author=author)
+                if notebook_outcome:
+                    _fire_progress(
+                        phase="synthesize",
+                        event_type=str(notebook_outcome.get("event_type") or "notebook.tool.completed"),
+                        status=str(notebook_outcome.get("status") or "done"),
+                        human_line=str(notebook_outcome.get("human_line") or ""),
+                        metrics=notebook_outcome.get("metrics") or {},
+                    )
 
             text = _visible_event_text(parts)
             if not text:
@@ -978,8 +1310,8 @@ class UiRuntime:
             if not author:
                 continue
 
-            if author == "step_executor":
-                accumulated = f"{partial_by_author.get('step_executor', '')}{text}"
+            if author in {"step_executor", "analysis_step_executor"}:
+                accumulated = f"{partial_by_author.get(author, '')}{text}"
                 matches = re.findall(r"###\s*(S\d+)", accumulated)
                 if matches:
                     sid = matches[-1]
@@ -1001,7 +1333,7 @@ class UiRuntime:
                             metrics={"step_id": sid},
                         )
 
-            if author == "step_executor" and not bool(getattr(event, "partial", False)):
+            if author in {"step_executor", "analysis_step_executor"} and not bool(getattr(event, "partial", False)):
                 metrics = _build_step_completed_event_metrics(text)
                 if not metrics:
                     logger.debug(
@@ -1036,7 +1368,7 @@ class UiRuntime:
                         label=f"emit_step_summary:{run_id}",
                     )
 
-            elif author == "planner" and not bool(getattr(event, "partial", False)):
+            elif author in {"planner", "analysis_planner"} and not bool(getattr(event, "partial", False)):
                 _fire_progress(
                     phase="plan",
                     event_type="plan.generated",
@@ -1044,12 +1376,17 @@ class UiRuntime:
                     human_line="Research plan generated.",
                 )
 
-            elif author == "report_synthesizer" and not bool(getattr(event, "partial", False)):
+            elif author in {"report_synthesizer", "analysis_notebook_synthesizer"} and not bool(getattr(event, "partial", False)):
+                _synth_done_line = (
+                    "Analysis notebook synthesis completed (check notebook + research log for cell tools)."
+                    if author == "analysis_notebook_synthesizer"
+                    else "Final report synthesized."
+                )
                 _fire_progress(
                     phase="synthesize",
                     event_type="synthesis.completed",
                     status="done",
-                    human_line="Final report synthesized.",
+                    human_line=_synth_done_line,
                 )
 
             if bool(getattr(event, "partial", False)):
@@ -1081,12 +1418,31 @@ class UiRuntime:
                 caller_loop,
                 label=f"emit_step_summary:{run_id}",
             )
+        if wf_state:
+            diagnostics = wf_state.get("notebook_synthesis_diagnostics")
+            if isinstance(diagnostics, list) and diagnostics:
+                for diag in diagnostics:
+                    if not isinstance(diag, dict):
+                        continue
+                    human = str(diag.get("human_line") or "").strip()
+                    if not human:
+                        continue
+                    await self._append_progress_event(
+                        run_id,
+                        phase="synthesize",
+                        event_type=str(diag.get("event_type") or "notebook.diagnostic"),
+                        status=str(diag.get("status") or "progress"),
+                        human_line=human,
+                        metrics=dict(diag.get("metrics") or {}),
+                    )
 
         _preferred_authors = (
+            "analysis_notebook_synthesizer",
             "report_synthesizer",
             "general_qa",
             "clarifier",
             "report_assistant",
+            "analysis_workflow",
             "research_workflow",
             "co_scientist_router",
         )
@@ -1194,8 +1550,13 @@ class UiRuntime:
             task["active_run_id"] = active_run_id
         else:
             task.pop("active_run_id", None)
-        self.store.save_task(task, owner_ip=owner_ip, flush=flush)
         conversation_id = str(task.get("conversation_id", "") or "").strip()
+        if _normalize_task_mode(task.get("mode")) == TASK_MODE_ANALYSIS and conversation_id:
+            workspace = await self._read_analysis_workspace(conversation_id)
+            _sync_task_analysis_workspace_fields(task, workspace)
+        else:
+            _sync_task_analysis_workspace_fields(task, None)
+        self.store.save_task(task, owner_ip=owner_ip, flush=flush)
         if flush and conversation_id:
             await self._persist_conversation_state(
                 conversation_id,
@@ -1352,6 +1713,12 @@ class UiRuntime:
             task["branch_label"] = branch_label
             await self._save_task_with_progress(task, run_id, owner_ip=owner_ip)
             await self._update_run(run_id, task_id=task_id, title=title)
+            await self._set_active_task_context(
+                conv_id,
+                task_id=task_id,
+                user_prompt=query,
+                mode=normalized_mode,
+            )
 
             _DIRECT_RESPONSE_AGENTS = {"general_qa", "clarifier", "report_assistant"}
 
@@ -1558,6 +1925,12 @@ class UiRuntime:
             task["hitl_history"].append("approve")
             task["awaiting_hitl"] = False
             await self._save_task_with_progress(task, run_id)
+            await self._set_active_task_context(
+                conv_id,
+                task_id=task_id,
+                user_prompt=str(task.get("user_query", "") or task.get("objective", "") or "").strip(),
+                mode=_normalize_task_mode(task.get("mode")),
+            )
 
             await self._append_progress_event(
                 run_id,
@@ -1598,6 +1971,9 @@ class UiRuntime:
                 completed_steps = sum(
                     1 for s in task["steps"] if s.get("status") == "completed"
                 )
+                pending_steps = sum(
+                    1 for s in task["steps"] if str(s.get("status", "")).strip() == "pending"
+                )
                 task["current_step_index"] = completed_steps
 
                 plan_status = wf_state.get("plan_status", "") if wf_state else ""
@@ -1606,9 +1982,10 @@ class UiRuntime:
                     and wf_state.get("latest_synthesis", {})
                     and wf_state["latest_synthesis"].get("markdown", "").strip()
                 )
+                terminal_plan = plan_status == "completed" or (not pending_steps and has_synthesis)
                 _sync_task_dataset_visualizations(task, wf_state)
 
-                if plan_status == "completed" and has_synthesis:
+                if terminal_plan and has_synthesis:
                     task["status"] = "completed"
                     final_md = wf_state["latest_synthesis"]["markdown"]
                     task["follow_up_suggestions"] = _extract_next_steps(final_md)
@@ -1646,7 +2023,7 @@ class UiRuntime:
                     )
                     break
 
-                if plan_status != "completed":
+                if not terminal_plan:
                     await self._save_task_with_progress(task, run_id, flush=False)
                     await self._append_progress_event(
                         run_id,
@@ -1707,6 +2084,12 @@ class UiRuntime:
             conv_id = task["conversation_id"]
             await self._get_or_create_session(conv_id, mode=_normalize_task_mode(task.get("mode")))
             await self._update_run(run_id, task_id=task_id, title=task.get("title", ""))
+            await self._set_active_task_context(
+                conv_id,
+                task_id=task_id,
+                user_prompt=str(task.get("user_query", "") or task.get("objective", "") or "").strip(),
+                mode=_normalize_task_mode(task.get("mode")),
+            )
 
             prompt = f"revise: {message}"
             await self._append_progress_event(
@@ -1865,6 +2248,268 @@ class UiRuntime:
                 "selected_report_task_id": selected_report_task_id,
             },
             "iterations": iterations,
+        }
+
+    async def get_conversation_analysis_workspace(self, conversation_id: str) -> dict | None:
+        tasks = self.store.get_conversation_tasks(conversation_id)
+        if not tasks:
+            return None
+        tasks.sort(key=lambda t: (t.get("created_at", ""), t.get("task_id", "")))
+        live_state = await self._read_persistable_session_state(conversation_id)
+        persisted = self.store.get_workflow_session(conversation_id)
+        source = "none"
+        state: dict[str, object] = {}
+        if live_state:
+            source = "live"
+            state = live_state
+        elif isinstance(persisted, dict) and isinstance(persisted.get("state"), dict):
+            source = "persisted"
+            state = copy.deepcopy(persisted["state"])
+
+        workspace = _analysis_workspace_from_session_state(state if isinstance(state, dict) else None)
+        persisted_workspace = None
+        if isinstance(persisted, dict) and isinstance(persisted.get("state"), dict):
+            persisted_workspace = _analysis_workspace_from_session_state(persisted["state"])
+        if persisted_workspace and not dict((workspace or {}).get("datasets") or {}):
+            workspace = copy.deepcopy(persisted_workspace)
+        selected_dataset_snapshot = next(
+            (
+                str(task.get("selected_dataset_id_snapshot", "") or "").strip()
+                for task in reversed(tasks)
+                if str(task.get("selected_dataset_id_snapshot", "") or "").strip()
+            ),
+            "",
+        )
+        if (
+            isinstance(workspace, dict)
+            and selected_dataset_snapshot
+            and not str(workspace.get("selected_dataset_id") or "").strip()
+            and selected_dataset_snapshot in set((workspace.get("datasets") or {}).keys())
+        ):
+            workspace = copy.deepcopy(workspace)
+            workspace["selected_dataset_id"] = selected_dataset_snapshot
+        root = tasks[0]
+        normalized_mode = _normalize_task_mode(root.get("mode"))
+        if normalized_mode == TASK_MODE_ANALYSIS:
+            workspace = ensure_analysis_workspace(
+                workspace,
+                conversation_id=conversation_id,
+            )
+            workspace, recovered = _recover_analysis_workspace_from_tasks(
+                tasks,
+                workspace=workspace,
+                conversation_id=conversation_id,
+            )
+            if recovered and isinstance(workspace, dict):
+                state = dict(state or {})
+                state[STATE_ANALYSIS_WORKSPACE] = copy.deepcopy(workspace)
+                notebook_payload = await self._build_analysis_notebook_payload(
+                    conversation_id=conversation_id,
+                    workspace=workspace,
+                    session_state=state,
+                )
+                if notebook_payload:
+                    state[STATE_ANALYSIS_NOTEBOOK] = copy.deepcopy(notebook_payload)
+                last_task_id = str(tasks[-1].get("task_id", "") or "").strip()
+                if live_state:
+                    await self._update_session_state(
+                        conversation_id,
+                        lambda current_state: {
+                            **(current_state or {}),
+                            STATE_ANALYSIS_WORKSPACE: copy.deepcopy(workspace),
+                            STATE_ANALYSIS_NOTEBOOK: copy.deepcopy(notebook_payload) if notebook_payload else None,
+                        },
+                    )
+                self.store.save_workflow_session(
+                    conversation_id,
+                    task_id=last_task_id,
+                    state=state,
+                )
+                for task in tasks:
+                    updated_task = dict(task)
+                    _sync_task_analysis_workspace_fields(updated_task, workspace)
+                    self.store.save_task(updated_task, flush=False)
+                source = f"{source}+recovered" if source != "none" else "recovered"
+        if not workspace:
+            return {
+                "conversation_id": conversation_id,
+                "mode": normalized_mode,
+                "source": source,
+                "workspace": None,
+            }
+        return {
+            "conversation_id": conversation_id,
+            "mode": normalized_mode,
+            "source": source,
+            "workspace": copy.deepcopy(workspace),
+        }
+
+    async def get_conversation_analysis_notebook(self, conversation_id: str) -> dict | None:
+        tasks = self.store.get_conversation_tasks(conversation_id)
+        if not tasks:
+            return None
+        tasks.sort(key=lambda t: (t.get("created_at", ""), t.get("task_id", "")))
+        live_state = await self._read_persistable_session_state(conversation_id)
+        persisted = self.store.get_workflow_session(conversation_id)
+        source = "none"
+        state: dict[str, object] = {}
+        if live_state:
+            source = "live"
+            state = live_state
+        elif isinstance(persisted, dict) and isinstance(persisted.get("state"), dict):
+            source = "persisted"
+            state = copy.deepcopy(persisted["state"])
+
+        workspace = _analysis_workspace_from_session_state(state if isinstance(state, dict) else None)
+        notebook = _analysis_notebook_from_session_state(state if isinstance(state, dict) else None)
+        persisted_workspace = None
+        persisted_notebook = None
+        if isinstance(persisted, dict) and isinstance(persisted.get("state"), dict):
+            persisted_workspace = _analysis_workspace_from_session_state(persisted["state"])
+            persisted_notebook = _analysis_notebook_from_session_state(persisted["state"])
+        if persisted_workspace and not dict((workspace or {}).get("datasets") or {}):
+            workspace = copy.deepcopy(persisted_workspace)
+        if persisted_notebook and not isinstance(notebook, dict):
+            notebook = copy.deepcopy(persisted_notebook)
+        selected_dataset_snapshot = next(
+            (
+                str(task.get("selected_dataset_id_snapshot", "") or "").strip()
+                for task in reversed(tasks)
+                if str(task.get("selected_dataset_id_snapshot", "") or "").strip()
+            ),
+            "",
+        )
+        if (
+            isinstance(workspace, dict)
+            and selected_dataset_snapshot
+            and not str(workspace.get("selected_dataset_id") or "").strip()
+            and selected_dataset_snapshot in set((workspace.get("datasets") or {}).keys())
+        ):
+            workspace = copy.deepcopy(workspace)
+            workspace["selected_dataset_id"] = selected_dataset_snapshot
+        root = tasks[0]
+        normalized_mode = _normalize_task_mode(root.get("mode"))
+        if normalized_mode == TASK_MODE_ANALYSIS:
+            workspace = ensure_analysis_workspace(
+                workspace,
+                conversation_id=conversation_id,
+            )
+            workspace, recovered = _recover_analysis_workspace_from_tasks(
+                tasks,
+                workspace=workspace,
+                conversation_id=conversation_id,
+            )
+            notebook = await self._build_analysis_notebook_payload(
+                conversation_id=conversation_id,
+                workspace=workspace,
+                session_state=state if isinstance(state, dict) else None,
+            )
+            if notebook:
+                state = dict(state or {})
+                state[STATE_ANALYSIS_WORKSPACE] = copy.deepcopy(workspace)
+                state[STATE_ANALYSIS_NOTEBOOK] = copy.deepcopy(notebook)
+                last_task_id = str(tasks[-1].get("task_id", "") or "").strip()
+                if live_state:
+                    await self._update_session_state(
+                        conversation_id,
+                        lambda current_state: {
+                            **(current_state or {}),
+                            STATE_ANALYSIS_WORKSPACE: copy.deepcopy(workspace),
+                            STATE_ANALYSIS_NOTEBOOK: copy.deepcopy(notebook),
+                        },
+                    )
+                self.store.save_workflow_session(
+                    conversation_id,
+                    task_id=last_task_id,
+                    state=state,
+                )
+                if recovered and isinstance(workspace, dict):
+                    for task in tasks:
+                        updated_task = dict(task)
+                        _sync_task_analysis_workspace_fields(updated_task, workspace)
+                        self.store.save_task(updated_task, flush=False)
+        if not notebook:
+            return {
+                "conversation_id": conversation_id,
+                "mode": normalized_mode,
+                "source": source,
+                "workspace": copy.deepcopy(workspace) if isinstance(workspace, dict) else None,
+                "notebook": None,
+                "download_path": None,
+            }
+        return {
+            "conversation_id": conversation_id,
+            "mode": normalized_mode,
+            "source": source,
+            "workspace": copy.deepcopy(workspace) if isinstance(workspace, dict) else None,
+            "download_path": f"/api/conversations/{conversation_id}/analysis-notebook.ipynb",
+            **notebook_json_for_api(notebook),
+        }
+
+    async def set_conversation_selected_dataset(self, conversation_id: str, dataset_id: str) -> dict | None:
+        tasks = self.store.get_conversation_tasks(conversation_id)
+        if not tasks:
+            return None
+        root = tasks[0]
+        if _normalize_task_mode(root.get("mode")) != TASK_MODE_ANALYSIS:
+            raise ValueError("Selected dataset is only available in analysis mode.")
+
+        persisted_session = self.store.get_workflow_session(conversation_id)
+        persisted_workspace = None
+        if isinstance(persisted_session, dict) and isinstance(persisted_session.get("state"), dict):
+            persisted_workspace = _analysis_workspace_from_session_state(persisted_session["state"])
+
+        await self._get_or_create_session(conversation_id, mode=TASK_MODE_ANALYSIS)
+
+        def _updater(state: dict) -> dict:
+            if not isinstance(state, dict):
+                state = {}
+            live_workspace = _analysis_workspace_from_session_state(state)
+            workspace_seed = live_workspace
+            if persisted_workspace and not dict((live_workspace or {}).get("datasets") or {}):
+                workspace_seed = persisted_workspace
+            workspace = ensure_analysis_workspace(
+                workspace_seed,
+                conversation_id=conversation_id,
+            )
+            if not set_selected_dataset(workspace, dataset_id):
+                raise KeyError(dataset_id)
+            state[STATE_ANALYSIS_WORKSPACE] = workspace
+            state[STATE_ANALYSIS_NOTEBOOK] = build_analysis_notebook(
+                workspace,
+                conversation_id=conversation_id,
+            )
+            return state
+
+        try:
+            state = await self._update_session_state(conversation_id, _updater)
+        except KeyError as exc:
+            raise KeyError(str(exc)) from exc
+        workspace = _analysis_workspace_from_session_state(state if isinstance(state, dict) else None)
+        notebook = _analysis_notebook_from_session_state(state if isinstance(state, dict) else None)
+        for task in tasks:
+            updated_task = dict(task)
+            _sync_task_analysis_workspace_fields(updated_task, workspace)
+            self.store.save_task(updated_task, flush=False)
+        self.store.save_workflow_session(
+            conversation_id,
+            task_id=str(tasks[-1].get("task_id", "") or "").strip(),
+            state=_extract_persistable_session_state(
+                {
+                    **(state or {}),
+                    STATE_ANALYSIS_WORKSPACE: copy.deepcopy(workspace) if isinstance(workspace, dict) else None,
+                    STATE_ANALYSIS_NOTEBOOK: copy.deepcopy(notebook) if isinstance(notebook, dict) else None,
+                }
+            ),
+        )
+        await self._persist_conversation_state(
+            conversation_id,
+            task_id=str(tasks[-1].get("task_id", "") or "").strip(),
+        )
+        return {
+            "conversation_id": conversation_id,
+            "selected_dataset_id": str((workspace or {}).get("selected_dataset_id") or "").strip(),
+            "workspace_revision": int((workspace or {}).get("revision", 0) or 0),
         }
 
     async def get_task_detail(self, task_id: str) -> dict | None:
@@ -2161,6 +2806,68 @@ async def conversation_detail(conversation_id: str, request: Request) -> dict:
     if not runtime.store.conversation_owned_by(conversation_id, ip):
         raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
     detail = await runtime.get_conversation_detail(conversation_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
+    return detail
+
+
+@app.get("/api/conversations/{conversation_id}/analysis-workspace")
+async def conversation_analysis_workspace(conversation_id: str, request: Request) -> dict:
+    ip = _client_ip(request)
+    if not runtime.store.conversation_owned_by(conversation_id, ip):
+        raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
+    detail = await runtime.get_conversation_analysis_workspace(conversation_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
+    return detail
+
+
+@app.get("/api/conversations/{conversation_id}/analysis-notebook")
+async def conversation_analysis_notebook(conversation_id: str, request: Request) -> dict:
+    ip = _client_ip(request)
+    if not runtime.store.conversation_owned_by(conversation_id, ip):
+        raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
+    detail = await runtime.get_conversation_analysis_notebook(conversation_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
+    return detail
+
+
+@app.get("/api/conversations/{conversation_id}/analysis-notebook.ipynb")
+async def conversation_analysis_notebook_download(conversation_id: str, request: Request) -> Response:
+    ip = _client_ip(request)
+    if not runtime.store.conversation_owned_by(conversation_id, ip):
+        raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
+    detail = await runtime.get_conversation_analysis_notebook(conversation_id)
+    if not detail or not isinstance(detail.get("notebook"), dict):
+        raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
+    ipynb_text = serialize_notebook_ipynb({"notebook": detail["notebook"]})
+    filename = f"{conversation_id}-analysis.ipynb"
+    return Response(
+        content=ipynb_text,
+        media_type="application/x-ipynb+json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/conversations/{conversation_id}/analysis-selection")
+async def conversation_analysis_selection(
+    conversation_id: str,
+    request: Request,
+    payload: AnalysisSelectionRequest,
+) -> dict:
+    ip = _client_ip(request)
+    if not runtime.store.conversation_owned_by(conversation_id, ip):
+        raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
+    try:
+        detail = await runtime.set_conversation_selected_dataset(
+            conversation_id,
+            payload.dataset_id.strip(),
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Dataset not found in this analysis workspace.") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not detail:
         raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
     return detail

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -45,8 +46,19 @@ from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 from mcp.client.stdio import StdioServerParameters
 
+from .analysis_workspace import (
+    analysis_context_payload,
+    append_analysis_note_artifact,
+    append_dataset_catalog_artifact,
+    append_dataset_metadata_artifact,
+    ensure_analysis_workspace,
+    parse_json_array_text,
+    parse_json_object_text,
+)
+from .analysis_notebook import build_analysis_notebook
 from . import tool_registry
 from .dataset_visualization import (
+    MAX_DATASETS,
     build_dataset_visualization_bundle,
     parse_visualization_json_array,
 )
@@ -97,6 +109,25 @@ class ManagedMcpToolsets:
             await toolset.close()
 
 
+@dataclass(frozen=True)
+class WorkflowModels:
+    runtime_model: str
+    planner_model: str
+    synthesizer_model: str
+    router_model: str
+
+
+@dataclass
+class WorkflowToolProfile:
+    base_tool_hints: list[str]
+    executor_tool_hints: list[str]
+    planner_tools: list[Any]
+    workflow_lookup_tools: list[Any]
+    report_assistant_tools: list[Any]
+    synthesizer_tools: list[Any]
+    managed_mcp_toolsets: tuple[McpToolset, ...]
+
+
 def _thinking_config_for_model(model: str) -> types.ThinkingConfig | None:
     if "3.1" in model or "3.0" in model:
         return THINKING_CONFIG_V3
@@ -118,7 +149,10 @@ BQ_PRIORITY_TOOLS = [
 
 STATE_WORKFLOW_TASK = "workflow_task_state"
 STATE_WORKFLOW_TASK_LEGACY_APP = "app:workflow_task_state"
+STATE_ANALYSIS_WORKSPACE = "analysis_workspace_state"
+STATE_ANALYSIS_NOTEBOOK = "analysis_notebook_state"
 STATE_PRIOR_RESEARCH = "co_scientist_prior_research"
+STATE_ACTIVE_TASK_CONTEXT = "temp:co_scientist_active_task_context"
 STATE_FINALIZE_REQUESTED = "temp:co_scientist_finalize_requested"
 STATE_AUTO_SYNTH_REQUESTED = "temp:co_scientist_auto_synth_requested"
 STATE_TURN_ABORT_REASON = "temp:co_scientist_turn_abort_reason"
@@ -283,6 +317,39 @@ KNOWN_MCP_TOOLS = [
     "search_zenodo_records",
     "get_zenodo_record",
 ]
+
+ANALYSIS_DEFAULT_TOOL_HINTS = (
+    "search_geo_datasets",
+    "get_geo_dataset",
+    "get_geo_cell_type_proportions",
+    "search_cellxgene_datasets",
+    "get_cellxgene_marker_genes",
+    "search_ebrains_kg",
+    "get_ebrains_kg_document",
+    "search_conp_datasets",
+    "get_conp_dataset_details",
+    "query_neurobagel_cohorts",
+    "search_openneuro_datasets",
+    "get_openneuro_dataset",
+    "search_dandi_datasets",
+    "get_dandi_dataset",
+    "search_nemar_datasets",
+    "get_nemar_dataset_details",
+    "search_braincode_datasets",
+    "get_braincode_dataset_details",
+    "search_enigma_datasets",
+    "get_enigma_dataset_info",
+    "search_zenodo_records",
+    "get_zenodo_record",
+    "search_pubmed",
+    "get_pubmed_abstract",
+    "get_paper_fulltext",
+    "search_openalex_works",
+    "search_europe_pmc_literature",
+    "resolve_gene_identifiers",
+    "map_ontology_terms_oxo",
+    "search_hpo_terms",
+)
 
 DEFAULT_TOOL_HINT_BY_DOMAIN = {
     "literature": "search_pubmed",
@@ -633,22 +700,89 @@ Rules:
 
 ANALYSIS_VISUALIZATION_POLICY = """
 When this conversation is running in analysis mode and the answer compares or ranks two or more datasets,
-call `store_dataset_visualizations` before you finalize the markdown.
+store a normalized dataset catalog before you finalize the markdown.
 
 Use the tool only when you have enough evidence to compare concrete dataset candidates. When you call it:
-- Pass `dimensions_json` and `datasets_json` as compact JSON arrays encoded as strings.
-- Provide 3-6 comparison dimensions with clear human labels.
-- Use coarse 0-5 scores where higher is better.
-- Keep the scores evidence-grounded and heuristic. Do not pretend the scale is perfectly objective.
-- Include a short note for each dataset describing the main reason for its score pattern.
+- Pass `datasets_json` as a compact JSON array encoded as strings.
+- Preserve raw metadata fields when available: `participant_count`, `session_count`, `modalities`,
+  `tasks`, `diagnoses`, `public_download`, `license`, `doi`, `bids`, and short evidence-grounded notes.
+- Only include heuristic comparison dimensions or scores when the user explicitly asks for ranking.
 - Normalize source-specific records before calling the tool. Do not pass raw archive payloads from NEMAR,
-  OpenNeuro, DANDI, GEO, or other sources. Reduce each candidate to:
-  `dataset_label`, `source`, `accession`, `notes`, `scores`, optional scalar `metrics`, short `tags`,
-  and optional `evidence_ids`.
-- Prefer dimensions that reflect reuse readiness, such as modality fit, disease/task match, sample scale,
-  metadata richness, access friction, annotation quality, or public-download readiness when the evidence supports them.
+  OpenNeuro, DANDI, GEO, or other sources. Reduce each candidate to normalized catalog fields plus optional
+  scalar `metrics`, short `tags`, and optional `evidence_ids`.
 
 Do not mention the tool name in the user-facing answer. The tool is only for storing a visual summary for the analysis UI.
+"""
+
+
+ANALYSIS_NOTEBOOK_SYNTHESIZER_INSTRUCTION = """
+You are the notebook synthesizer for the open-data analysis workflow.
+You will receive structured task-state context and analysis-workspace context.
+
+Your job has two outputs:
+1. Append structured notebook artifacts using the provided notebook tools.
+2. Return concise user-facing Markdown summarizing only this analysis operation.
+
+Notebook rules:
+- Every completed analysis task should append at least one notebook cell.
+- For multi-dataset search, shortlist, compare, ranking, or plotting/visualization follow-up tasks, you MUST call `store_dataset_catalog` before returning Markdown unless the current task already has a usable `dataset_comparison` cell.
+- `append_analysis_note` alone is not sufficient for dataset-comparison tasks.
+- For single-dataset inspection tasks, call `store_dataset_metadata_profile`.
+- After storing the main artifact, call `append_analysis_note` with a concise interpretation and next-step framing.
+- Use compact JSON strings only for tool payloads.
+- Do not pass raw source payloads directly into notebook tools. Normalize NEMAR, OpenNeuro, and DANDI records into common fields first.
+- For default dataset discovery and plotting, prefer raw metadata fields over heuristic scores. Use scores only when the user explicitly asks for ranking.
+- Do not auto-select a dataset from a multi-dataset comparison result.
+- When the task explicitly inspects one dataset, ensure the metadata profile clearly identifies that dataset.
+- If the user asks to plot, chart, graph, or visualize an already-completed comparison, reuse the current task's completed-step evidence and notebook context. Do not start a new discovery plan just to render the comparison.
+- Do not claim that visualization generation failed unless a notebook tool actually returned an error in this turn.
+
+Metadata profile rules:
+- The metadata profile should use these fixed sections:
+  `identity`, `access_download`, `subjects_sessions`, `modalities_tasks`,
+  `standards_file_formats`, `links_publications`, and `source_raw_highlights`.
+- Prefer source-native dataset-detail tools over broad search tools when the user asks for full metadata on a specific dataset.
+
+User-facing output rules:
+- Summarize only the new operation; do not rewrite the whole notebook history.
+- Highlight the strongest findings, caveats, and the most relevant next step.
+- Do not use the formal report structure (`## TLDR`, `## Evidence Breakdown`, etc.).
+- Do not mention internal tool names in the user-facing answer.
+- Return Markdown only, not JSON.
+"""
+
+
+ANALYSIS_ROUTER_INSTRUCTION = """You are the intent router for the AI Co-Scientist in open-data analysis mode.
+Your ONLY job is to read the user's message and the session context below, then IMMEDIATELY transfer
+to the correct specialist agent. Never answer questions yourself — always transfer.
+
+Available agents:
+
+1. **general_qa** — Answers straightforward biomedical knowledge questions from background knowledge.
+2. **clarifier** — Asks for clarification on vague, incomplete, or nonsensical requests.
+3. **analysis_workflow** — Plans and executes multi-step open-data analysis work such as dataset discovery,
+   dataset metadata inspection, follow-up analysis planning, and notebook updates. Also handles workflow commands
+   (approve, continue, finalize, revise:, history, rollback, switch).
+
+Routing priority rules (check in order):
+1. If plan_pending_approval is True → transfer to analysis_workflow
+2. Workflow commands (approve, continue, finalize, revise:, history, rollback, switch) → analysis_workflow
+3. If has_pending_steps is True and user sends a continuation-like message → analysis_workflow
+4. If the user refers to "this dataset", "that dataset", or similar unresolved dataset references
+   but no dataset is clearly identified in context → clarifier
+5. If the user asks to find datasets, compare datasets, inspect dataset metadata, continue an analysis, or
+   build on prior notebook state → analysis_workflow
+6. If the query is a straightforward biomedical knowledge question → general_qa
+7. If the query is ambiguous, incomplete, or doesn't make sense → clarifier
+
+Important routing bias:
+- In analysis mode, prefer **analysis_workflow** for anything about datasets, metadata, downloads, reuse readiness,
+  QC planning, or follow-up analysis of a previously selected dataset.
+- If the user says "this dataset" or a similar reference without a resolved dataset in session context, ask for
+  clarification instead of sending the request into planning.
+- If you are unsure between **general_qa** and **analysis_workflow**, choose **analysis_workflow**.
+
+You MUST always transfer. Never respond with text yourself.
 """
 
 
@@ -1440,6 +1574,33 @@ def _is_obvious_research_workflow_query(user_text: str) -> bool:
     return False
 
 
+def _is_underspecified_analysis_request(
+    user_text: str,
+    *,
+    workspace: Mapping[str, Any] | None,
+) -> bool:
+    normalized = f" {_normalize_user_text(user_text)} "
+    if not normalized.strip():
+        return False
+
+    selected_dataset_id = str((workspace or {}).get("selected_dataset_id") or "").strip()
+    if selected_dataset_id:
+        return False
+
+    refers_to_unresolved_dataset = bool(
+        re.search(r"\b(?:this|that)\s+(?:dataset|data|file)\b", normalized)
+    )
+    if not refers_to_unresolved_dataset:
+        return False
+
+    return bool(
+        re.search(
+            r"\b(?:analy[sz]e|analysis|preprocess|pre-process|qc|quality check|pipeline|workflow|metadata|inspect)\b",
+            normalized,
+        )
+    )
+
+
 def _render_lookup_provenance_scope(entry: Mapping[str, Any]) -> str:
     args = entry.get("args")
     if isinstance(args, Mapping):
@@ -1904,6 +2065,24 @@ def _make_content(text: str) -> types.Content:
 
 def _make_text_response(text: str) -> LlmResponse:
     return LlmResponse(content=_make_content(text), partial=False, turn_complete=True)
+
+
+def _make_transfer_response(agent_name: str) -> LlmResponse:
+    return LlmResponse(
+        content=types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(
+                        name="transfer_to_agent",
+                        args={"agent_name": agent_name},
+                    )
+                )
+            ],
+        ),
+        partial=False,
+        turn_complete=True,
+    )
 
 
 def _replace_llm_response_text(llm_response: LlmResponse, text: str) -> LlmResponse:
@@ -3383,6 +3562,80 @@ def _infer_plan_step_tool_hint(step: dict[str, Any], domains: list[str]) -> str:
         if default_tool:
             return default_tool
     return "search_pubmed"
+
+
+def _is_analysis_presentation_step(step: Mapping[str, Any]) -> bool:
+    text = " ".join(
+        re.sub(r"\s+", " ", str(step.get(field, "") or "").strip()).lower()
+        for field in ("goal", "completion_condition", "notes", "rationale", "description")
+    )
+    if not text:
+        return False
+    presentation_terms = (
+        "visual summary",
+        "visual representation",
+        "generate a visual",
+        "generate visual",
+        "table or chart",
+        "chart of",
+        "plot ",
+        "plots ",
+        "graph ",
+        "graphs ",
+        "visualize ",
+        "visualization ",
+        "tabular summary",
+    )
+    synthesis_terms = (
+        "synthesize and compare",
+        "synthesise and compare",
+        "structured comparison",
+        "ranked shortlist",
+        "identify the most reusable",
+    )
+    evidence_terms = (
+        "search ",
+        "retrieve ",
+        "fetch ",
+        "inspect ",
+        "browse ",
+        "query ",
+        "detail records",
+        "metadata for",
+    )
+    if any(term in text for term in presentation_terms):
+        return True
+    if any(term in text for term in synthesis_terms) and not any(term in text for term in evidence_terms):
+        return True
+    return False
+
+
+def _repair_analysis_plan_internal(raw: Mapping[str, Any]) -> dict[str, Any]:
+    repaired = dict(raw or {})
+    steps_raw = repaired.get("steps")
+    if not isinstance(steps_raw, list):
+        return repaired
+
+    filtered_steps: list[Any] = []
+    removed_any = False
+    for step in steps_raw:
+        if not isinstance(step, Mapping):
+            filtered_steps.append(step)
+            continue
+        candidate_hint = _canonicalize_tool_hint_candidate(
+            step.get("tool_hint") or step.get("tool") or step.get("source")
+        )
+        source_label = _resolve_source_label(candidate_hint)
+        if not source_label:
+            source_label = _resolve_source_label(step.get("tool_hint", ""))
+        if _is_analysis_presentation_step(step) and source_label == "BigQuery":
+            removed_any = True
+            continue
+        filtered_steps.append(dict(step))
+
+    if removed_any and filtered_steps:
+        repaired["steps"] = filtered_steps
+    return repaired
 
 
 def _validate_plan_internal(raw: dict[str, Any]) -> dict[str, Any]:
@@ -6302,6 +6555,795 @@ def _get_prior_research(callback_context: CallbackContext) -> list[dict[str, Any
     return prior if isinstance(prior, list) else []
 
 
+def _get_analysis_workspace_from_state_map(state: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if not state:
+        return None
+    workspace = state.get(STATE_ANALYSIS_WORKSPACE)
+    return workspace if isinstance(workspace, dict) else None
+
+
+def _get_analysis_workspace(callback_context: CallbackContext) -> dict[str, Any] | None:
+    workspace = _get_analysis_workspace_from_state_map(callback_context.state)
+    return workspace if isinstance(workspace, dict) else None
+
+
+def _refresh_analysis_notebook_state_from_workspace(
+    state: Mapping[str, Any] | dict[str, Any] | None,
+    *,
+    workspace: dict[str, Any] | None,
+    task_state: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(state, dict) or not isinstance(workspace, dict):
+        return None
+    active_task_context = _get_active_task_context_from_state_map(state)
+    conversation_id = str(active_task_context.get("conversation_id") or workspace.get("conversation_id") or "").strip()
+    diagnostics = []
+    if isinstance(task_state, dict):
+        diagnostics = [
+            dict(item)
+            for item in list(task_state.get("notebook_synthesis_diagnostics", []) or [])
+            if isinstance(item, Mapping)
+        ]
+    payload = build_analysis_notebook(
+        workspace,
+        conversation_id=conversation_id,
+        diagnostics=diagnostics,
+    )
+    state[STATE_ANALYSIS_NOTEBOOK] = payload
+    return payload
+
+
+def _get_active_task_context_from_state_map(state: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not state:
+        return {}
+    context = state.get(STATE_ACTIVE_TASK_CONTEXT)
+    return dict(context) if isinstance(context, Mapping) else {}
+
+
+def _get_active_task_context(callback_context: CallbackContext) -> dict[str, Any]:
+    return _get_active_task_context_from_state_map(callback_context.state)
+
+
+def _derive_analysis_intent_hint(user_text: str, workspace: dict[str, Any] | None = None) -> str:
+    normalized = _normalize_user_text(user_text)
+    selected_dataset_id = (
+        str((workspace or {}).get("selected_dataset_id") or "").strip()
+        if isinstance(workspace, dict)
+        else ""
+    )
+    has_explicit_dataset_id = bool(
+        re.search(r"\b(?:ds\d{6,}|nm\d{6,}|dandi:\d+)\b", user_text or "", flags=re.IGNORECASE)
+    )
+    metadata_terms = (
+        "metadata",
+        "full metadata",
+        "details",
+        "dataset card",
+        "dataset profile",
+        "show me more",
+        "inspect",
+        "describe this dataset",
+    )
+    if has_explicit_dataset_id:
+        return "dataset_metadata"
+    if selected_dataset_id and any(term in normalized for term in metadata_terms):
+        return "dataset_metadata"
+    if selected_dataset_id and any(
+        token in normalized
+        for token in ("this dataset", "selected dataset", "that dataset")
+    ):
+        return "dataset_metadata"
+    return "dataset_search_compare"
+
+
+def _is_analysis_plot_request(user_text: str) -> bool:
+    normalized = f" {_normalize_user_text(user_text)} "
+    if not normalized.strip():
+        return False
+    plot_terms = (
+        " plot ",
+        " plots ",
+        " plotting ",
+        " chart ",
+        " charts ",
+        " charting ",
+        " graph ",
+        " graphs ",
+        " visualize ",
+        " visualizing ",
+        " visualisation ",
+        " visualisations ",
+        " visualization ",
+        " visualizations ",
+        " render ",
+        " show the comparison ",
+        " show comparison ",
+        " radar ",
+        " scatter ",
+    )
+    return any(term in normalized for term in plot_terms)
+
+
+_OPENNEURO_DS_ID = re.compile(r"\b(ds\d{6,})\b", re.IGNORECASE)
+_OPENNEURO_DOI = re.compile(
+    r"(?:DOI:)?(10\.18112/openneuro\.(ds\d{6,})[^\s,)]*)",
+    re.IGNORECASE,
+)
+
+
+def _analysis_completed_step_corpus(task_state: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for step in task_state.get("steps", []) or []:
+        if str(step.get("status", "")).strip() != "completed":
+            continue
+        parts.append(str(step.get("result_summary") or ""))
+        for eid in step.get("evidence_ids") or []:
+            parts.append(str(eid))
+        for entry in step.get("tool_log") or []:
+            parts.append(str(entry.get("summary") or ""))
+            parts.append(str(entry.get("result") or ""))
+    return "\n".join(parts)
+
+
+def _task_state_mentions_openneuro_execution(task_state: dict[str, Any]) -> bool:
+    for step in task_state.get("steps", []) or []:
+        if str(step.get("status", "")).strip() != "completed":
+            continue
+        hint = str(step.get("tool_hint") or "").lower()
+        if "openneuro" in hint:
+            return True
+        for raw in step.get("tools_called") or []:
+            if "openneuro" in str(raw).lower():
+                return True
+    return False
+
+
+def _score_scale_range(value: float, lo: float, hi: float) -> float:
+    if hi <= lo:
+        return 2.5
+    return round(0.75 + 4.25 * (value - lo) / (hi - lo), 2)
+
+
+def _openneuro_chunk_for_accession(corpus: str, accession: str) -> str:
+    esc = re.escape(accession)
+    matches = list(re.finditer(rf"\b{esc}\b", corpus, flags=re.IGNORECASE))
+    if not matches:
+        return accession
+    m0 = matches[0]
+    tail = corpus[m0.start() :]
+    m_next = re.search(r"\bds\d{6,}\b", tail[len(accession) :], flags=re.IGNORECASE)
+    if m_next:
+        return tail[: len(accession) + m_next.start()]
+    return tail[:400]
+
+
+def _openneuro_named_title_for_accession(corpus: str, accession: str) -> str:
+    patterns = (
+        rf"OpenNeuro:\s*(.+?)\s*\(\s*{re.escape(accession)}\s*\)",
+        rf"\b{re.escape(accession)}\s*:\s*([^.\n]+?)(?=\s+\bds\d{{6,}}\b|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, corpus, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = re.sub(r"\s+", " ", str(match.group(1) or "").strip()).strip(" ,.;")
+        if candidate and accession.lower() not in candidate.lower():
+            if len(candidate) > 160:
+                candidate = f"{candidate[:157].rstrip()}..."
+            return candidate
+    return ""
+
+
+def _openneuro_title_from_chunk(chunk: str) -> str:
+    text = str(chunk or "").strip()
+    text = re.sub(r"^ds\d{6,}\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^[:—–-]\s*", "", text)
+    line = text.splitlines()[0] if text else ""
+    if "(" in line:
+        line = line[: line.index("(")]
+    line = re.sub(r"\s+", " ", line).strip(" ,.;")
+    if len(line) > 140:
+        line = f"{line[:137]}..."
+    return line
+
+
+def _openneuro_modalities_from_chunk(chunk: str) -> list[str]:
+    paren = re.search(r"\(([^)]{1,120})\)", str(chunk or ""))
+    if not paren:
+        return []
+    parts = re.split(r"[,;/]", paren.group(1))
+    out: list[str] = []
+    for piece in parts:
+        token = re.sub(r"\s+", " ", piece.strip())
+        if 2 <= len(token) <= 32 and token.isascii():
+            out.append(token)
+    return _dedupe_str_list(out, limit=6)
+
+
+def _openneuro_subject_count_from_chunk(chunk: str) -> int | None:
+    text = str(chunk or "")
+    patterns = (
+        r"(?:approx\.?\s*)?(?:subject|participants?)\s+count\s+of\s+(\d+)",
+        r"\b(\d+)\s*(?:subjects?|participants?)\b",
+    )
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _openneuro_subject_count_for_accession(corpus: str, accession: str) -> int | None:
+    """Search only the accession-local chunk to avoid copying another dataset's subject count."""
+    for match in re.finditer(rf"\b{re.escape(accession)}\b", corpus, flags=re.IGNORECASE):
+        window = _openneuro_chunk_for_accession(corpus[match.start() : match.start() + 280], accession)
+        found = _openneuro_subject_count_from_chunk(window)
+        if found is not None:
+            return found
+    return None
+
+
+def _openneuro_conditions_from_chunk(chunk: str) -> list[str]:
+    text = str(chunk or "")
+    conditions: list[str] = []
+    if re.search(r"\bschizo(phrenia|phrenic)?\b", text, flags=re.IGNORECASE):
+        conditions.append("Schizophrenia")
+    if re.search(r"\bpsychosis\b", text, flags=re.IGNORECASE):
+        conditions.append("Psychosis")
+    if re.search(r"\bbipolar\b", text, flags=re.IGNORECASE):
+        conditions.append("Bipolar disorder")
+    return _dedupe_str_list(conditions, limit=4)
+
+
+def _openneuro_doi_index(corpus: str) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for match in _OPENNEURO_DOI.finditer(corpus):
+        doi = str(match.group(1)).rstrip(".")
+        ds_key = str(match.group(2)).lower()
+        mapping.setdefault(ds_key, doi)
+    return mapping
+
+
+def _build_openneuro_fallback_catalog_payloads(
+    task_state: dict[str, Any],
+    *,
+    user_prompt: str,
+) -> dict[str, Any] | None:
+    """When the notebook synthesizer skips store_dataset_catalog, derive a comparison
+    from completed OpenNeuro executor text so raw metadata plots still render."""
+    if not _task_state_mentions_openneuro_execution(task_state):
+        return None
+    corpus = _analysis_completed_step_corpus(task_state)
+    if not corpus.strip():
+        return None
+    ordered_ids: list[str] = []
+    for hit in _OPENNEURO_DS_ID.finditer(corpus):
+        token = hit.group(1).lower()
+        if token not in ordered_ids:
+            ordered_ids.append(token)
+    if len(ordered_ids) < 2:
+        return None
+
+    doi_by_ds = _openneuro_doi_index(corpus)
+    datasets: list[dict[str, Any]] = []
+    for acc in ordered_ids[:MAX_DATASETS]:
+        chunk = _openneuro_chunk_for_accession(corpus, acc)
+        title = _openneuro_named_title_for_accession(corpus, acc) or _openneuro_title_from_chunk(chunk)
+        modalities = _openneuro_modalities_from_chunk(chunk)
+        diagnoses = _openneuro_conditions_from_chunk(f"{chunk}\n{title}")
+        n_sub = _openneuro_subject_count_for_accession(corpus, acc)
+        doi = doi_by_ds.get(acc, "")
+        label = title or f"OpenNeuro {acc}"
+        description_parts: list[str] = []
+        if title:
+            description_parts.append(title)
+        if n_sub is not None:
+            description_parts.append(f"{n_sub} participants")
+        if modalities:
+            description_parts.append(f"modalities: {', '.join(modalities)}")
+        datasets.append(
+            {
+                "dataset_label": label,
+                "short_label": acc,
+                "title": title or label,
+                "description": ". ".join(description_parts) or "Parsed from completed OpenNeuro step summaries.",
+                "source": "OpenNeuro",
+                "accession": acc,
+                "participant_count": n_sub,
+                "modalities": modalities,
+                "diagnoses": diagnoses,
+                "public_download": True,
+                "bids": True,
+                "doi": doi,
+                "notes": "Parsed from executor summaries; verify against the OpenNeuro dataset page before downstream analysis.",
+                "tags": _dedupe_str_list(["OpenNeuro", *modalities, *diagnoses, "public download"], limit=8),
+                "metrics": ({"subject_count": n_sub} if n_sub is not None else {}),
+                "evidence_ids": ([f"DOI:{doi}"] if doi else []),
+            }
+        )
+
+    objective = str(task_state.get("objective") or user_prompt or "").strip()
+    return {
+        "dimensions": [],
+        "datasets": datasets,
+        "objective": objective,
+        "summary": (
+            f"Raw metadata view of {len(datasets)} OpenNeuro datasets parsed from step outputs "
+            "(auto-generated because the synthesizer did not call store_dataset_catalog)."
+        ),
+        "notes": [
+            "Participant counts, modalities, and DOI fields were heuristically parsed from completed step text.",
+            "Open each dataset on OpenNeuro to verify metadata before download, QC, or preprocessing.",
+        ],
+    }
+
+
+def _analysis_task_cell_types(
+    workspace: dict[str, Any] | None,
+    *,
+    task_id: str,
+) -> list[str]:
+    if not workspace:
+        return []
+    normalized_task_id = str(task_id or "").strip()
+    if not normalized_task_id:
+        return []
+    cell_types = [
+        str(cell.get("type") or "").strip()
+        for cell in list(workspace.get("cells", []) or [])
+        if str(cell.get("task_id") or "").strip() == normalized_task_id
+    ]
+    return _dedupe_str_list(cell_types, limit=10)
+
+
+def _analysis_task_has_cell_type(
+    workspace: dict[str, Any] | None,
+    *,
+    task_id: str,
+    cell_type: str,
+) -> bool:
+    normalized_cell_type = str(cell_type or "").strip()
+    if not normalized_cell_type:
+        return False
+    return normalized_cell_type in set(
+        _analysis_task_cell_types(workspace, task_id=task_id)
+    )
+
+
+def _dataset_catalog_payload_is_underspecified(payload: Mapping[str, Any] | None) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    datasets = [item for item in list(payload.get("datasets", []) or []) if isinstance(item, Mapping)]
+    if not datasets:
+        return False
+    generic_rows = 0
+    for row in datasets:
+        label = str(row.get("dataset_label") or "").strip()
+        source = str(row.get("source") or "").strip()
+        accession = str(row.get("accession") or "").strip()
+        dataset_id = str(row.get("dataset_id") or "").strip()
+        doi = str(row.get("doi") or "").strip()
+        notes = str(row.get("notes") or "").strip()
+        generic_label = label.casefold() in {"", "dataset"}
+        has_identifier = bool(source or accession or dataset_id or doi)
+        if generic_label and not has_identifier and not notes:
+            generic_rows += 1
+    return generic_rows == len(datasets)
+
+
+def _remove_task_dataset_comparison_cells(
+    workspace: dict[str, Any] | None,
+    *,
+    task_id: str,
+    only_if_underspecified: bool = False,
+) -> int:
+    if not workspace:
+        return 0
+    normalized_task_id = str(task_id or "").strip()
+    if not normalized_task_id:
+        return 0
+    cells = list(workspace.get("cells", []) or [])
+    artifacts = dict(workspace.get("artifacts") or {})
+    removed_cell_ids: set[str] = set()
+    removed_artifact_ids: set[str] = set()
+    kept_cells: list[dict[str, Any]] = []
+    for cell in cells:
+        if str(cell.get("task_id") or "").strip() != normalized_task_id or str(cell.get("type") or "").strip() != "dataset_comparison":
+            kept_cells.append(cell)
+            continue
+        artifact_id = str(cell.get("artifact_id") or "").strip()
+        artifact = dict(artifacts.get(artifact_id) or {})
+        payload = artifact.get("payload") if isinstance(artifact.get("payload"), Mapping) else {}
+        if only_if_underspecified and not _dataset_catalog_payload_is_underspecified(payload):
+            kept_cells.append(cell)
+            continue
+        removed_cell_ids.add(str(cell.get("cell_id") or "").strip())
+        if artifact_id:
+            removed_artifact_ids.add(artifact_id)
+    if not removed_cell_ids and not removed_artifact_ids:
+        return 0
+    workspace["cells"] = kept_cells
+    if removed_artifact_ids:
+        workspace["artifacts"] = {
+            key: value
+            for key, value in artifacts.items()
+            if key not in removed_artifact_ids
+        }
+    for operation in list(workspace.get("operations", []) or []):
+        produced = [
+            cell_id
+            for cell_id in list(operation.get("produced_cell_ids", []) or [])
+            if str(cell_id or "").strip() not in removed_cell_ids
+        ]
+        operation["produced_cell_ids"] = produced
+    if removed_cell_ids or removed_artifact_ids:
+        workspace["revision"] = int(workspace.get("revision", 0) or 0) + 1
+    return len(removed_cell_ids)
+
+
+def _record_notebook_synthesis_diagnostic(
+    task_state: dict[str, Any],
+    *,
+    human_line: str,
+    status: str = "progress",
+    event_type: str = "notebook.diagnostic",
+    **metrics: Any,
+) -> None:
+    """Buffered lines surfaced in the UI research log after each notebook synthesis turn."""
+    line = re.sub(r"\s+", " ", str(human_line or "").strip())
+    if len(line) > 480:
+        line = f"{line[:477]}..."
+    row: dict[str, Any] = {
+        "event_type": event_type,
+        "status": status,
+        "human_line": line,
+        "metrics": {k: v for k, v in metrics.items() if v is not None},
+    }
+    bucket = task_state.setdefault("notebook_synthesis_diagnostics", [])
+    if not isinstance(bucket, list):
+        task_state["notebook_synthesis_diagnostics"] = [row]
+        return
+    bucket.append(row)
+    if len(bucket) > 24:
+        del bucket[:-24]
+
+
+def _materialize_analysis_notebook_fallback(
+    *,
+    callback_context: CallbackContext,
+    task_state: dict[str, Any],
+    final_markdown: str,
+) -> dict[str, Any] | None:
+    active_task_context = _get_active_task_context(callback_context)
+    conversation_id = str(active_task_context.get("conversation_id") or "").strip()
+    task_id = str(active_task_context.get("task_id") or "").strip()
+    user_prompt = str(
+        active_task_context.get("user_prompt")
+        or task_state.get("objective")
+        or ""
+    ).strip()
+
+    workspace = _get_analysis_workspace(callback_context)
+    if workspace is None and conversation_id:
+        workspace = ensure_analysis_workspace(
+            None,
+            conversation_id=conversation_id,
+        )
+        callback_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
+    if workspace is None:
+        return None
+
+    removed_legacy = _remove_task_dataset_comparison_cells(
+        workspace,
+        task_id=task_id,
+        only_if_underspecified=True,
+    )
+    if removed_legacy:
+        _record_notebook_synthesis_diagnostic(
+            task_state,
+            human_line=(
+                f"Notebook: removed {removed_legacy} underspecified legacy dataset comparison cell(s) "
+                "before rebuilding notebook output."
+            ),
+            status="done",
+            kind="legacy_catalog_removed",
+            removed_count=removed_legacy,
+        )
+
+    current_cell_types = set(_analysis_task_cell_types(workspace, task_id=task_id))
+    bundle = task_state.get("latest_dataset_visualizations")
+
+    if (
+        isinstance(bundle, dict)
+        and list(bundle.get("rows", []) or [])
+        and "dataset_comparison" not in current_cell_types
+    ):
+        bundle_payload = {
+            "datasets": list(bundle.get("rows", []) or []),
+            "dimensions": list(bundle.get("dimensions", []) or []),
+        }
+        if _dataset_catalog_payload_is_underspecified(bundle_payload):
+            _record_notebook_synthesis_diagnostic(
+                task_state,
+                human_line=(
+                    "Notebook: skipped legacy visualization bundle because it lacked dataset identifiers "
+                    "and usable raw metadata."
+                ),
+                status="progress",
+                kind="catalog_from_bundle_skipped",
+            )
+        else:
+            try:
+                append_dataset_catalog_artifact(
+                    workspace,
+                    task_id=task_id,
+                    user_prompt=user_prompt,
+                    objective=str(bundle.get("objective") or task_state.get("objective") or "").strip(),
+                    summary=str(bundle.get("summary") or task_state.get("objective") or "").strip(),
+                    dimensions=list(bundle.get("dimensions", []) or []),
+                    datasets=list(bundle.get("rows", []) or []),
+                    notes=[
+                        str(note).strip()
+                        for note in list(bundle.get("notes", []) or [])
+                        if str(note).strip()
+                    ],
+                )
+                _record_notebook_synthesis_diagnostic(
+                    task_state,
+                    human_line=(
+                        "Notebook: appended dataset_comparison from stored visualization bundle "
+                        "(latest_dataset_visualizations)."
+                    ),
+                    status="done",
+                    kind="catalog_from_bundle",
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "Analysis notebook fallback failed to append dataset catalog for task %s: %s",
+                    task_id or "<unknown>",
+                    exc,
+                )
+                _record_notebook_synthesis_diagnostic(
+                    task_state,
+                    human_line=f"Notebook: could not build comparison from visualization bundle — {exc}",
+                    status="error",
+                    kind="catalog_bundle_error",
+                    error=str(exc),
+                )
+        current_cell_types = set(_analysis_task_cell_types(workspace, task_id=task_id))
+
+    if "dataset_comparison" not in current_cell_types and (
+        _derive_analysis_intent_hint(user_prompt, workspace) == "dataset_search_compare"
+        or _is_analysis_plot_request(user_prompt)
+    ):
+        fallback_payload = _build_openneuro_fallback_catalog_payloads(
+            task_state,
+            user_prompt=user_prompt,
+        )
+        if fallback_payload:
+            try:
+                catalog_result = append_dataset_catalog_artifact(
+                    workspace,
+                    task_id=task_id,
+                    user_prompt=user_prompt,
+                    objective=str(fallback_payload.get("objective") or "").strip(),
+                    summary=str(fallback_payload.get("summary") or "").strip(),
+                    dimensions=list(fallback_payload.get("dimensions") or []),
+                    datasets=list(fallback_payload.get("datasets") or []),
+                    notes=list(fallback_payload.get("notes") or []),
+                )
+                viz_bundle = dict(
+                    (catalog_result.get("payload") or {}).get("visualizations") or {}
+                )
+                if viz_bundle:
+                    task_state["latest_dataset_visualizations"] = viz_bundle
+                n_ds = len(list(fallback_payload.get("datasets") or []))
+                _record_notebook_synthesis_diagnostic(
+                    task_state,
+                    human_line=(
+                        f"Notebook: auto-built dataset_comparison for {n_ds} OpenNeuro dataset(s) "
+                        "(synthesizer did not call store_dataset_catalog; parsed executor summaries)."
+                    ),
+                    status="done",
+                    kind="openneuro_catalog_fallback",
+                    dataset_count=n_ds,
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "OpenNeuro dataset catalog fallback failed for task %s: %s",
+                    task_id or "<unknown>",
+                    exc,
+                )
+                _record_notebook_synthesis_diagnostic(
+                    task_state,
+                    human_line=f"Notebook: OpenNeuro comparison auto-build failed — {exc}",
+                    status="error",
+                    kind="openneuro_fallback_error",
+                    error=str(exc),
+                )
+        elif _task_state_mentions_openneuro_execution(task_state):
+            _record_notebook_synthesis_diagnostic(
+                task_state,
+                human_line=(
+                    "Notebook: skipped OpenNeuro auto-comparison (need ≥2 dataset ids in completed step text)."
+                ),
+                status="progress",
+                kind="openneuro_fallback_skipped",
+            )
+        current_cell_types = set(_analysis_task_cell_types(workspace, task_id=task_id))
+
+    if final_markdown and "analysis_note" not in current_cell_types:
+        related_dataset_ids: list[str] = []
+        if _derive_analysis_intent_hint(user_prompt, workspace) == "dataset_metadata":
+            selected_dataset_id = str(workspace.get("selected_dataset_id") or "").strip()
+            if selected_dataset_id:
+                related_dataset_ids = [selected_dataset_id]
+        try:
+            append_analysis_note_artifact(
+                workspace,
+                task_id=task_id,
+                user_prompt=user_prompt,
+                markdown=final_markdown,
+                title=str(task_state.get("objective") or "Analysis note").strip(),
+                related_dataset_ids=related_dataset_ids,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "Analysis notebook fallback failed to append note for task %s: %s",
+                task_id or "<unknown>",
+                exc,
+            )
+            _record_notebook_synthesis_diagnostic(
+                task_state,
+                human_line=f"Notebook: failed to append analysis note — {exc}",
+                status="error",
+                kind="analysis_note_error",
+                error=str(exc),
+            )
+
+    final_cell_types = set(_analysis_task_cell_types(workspace, task_id=task_id))
+    wants_comparison_cell = (
+        _derive_analysis_intent_hint(user_prompt, workspace) == "dataset_search_compare"
+        or _is_analysis_plot_request(user_prompt)
+    )
+    if wants_comparison_cell and "dataset_comparison" not in final_cell_types:
+        already_recorded = any(
+            str((item.get("metrics") or {}).get("kind") or "").strip() in {
+                "catalog_from_bundle",
+                "openneuro_catalog_fallback",
+            }
+            and str(item.get("status") or "").strip() == "done"
+            for item in list(task_state.get("notebook_synthesis_diagnostics", []) or [])
+            if isinstance(item, Mapping)
+        )
+        if already_recorded:
+            callback_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
+            _refresh_analysis_notebook_state_from_workspace(
+                callback_context.state,
+                workspace=workspace,
+                task_state=task_state,
+            )
+            return workspace
+        _record_notebook_synthesis_diagnostic(
+            task_state,
+            human_line=(
+                "Notebook: no dataset_comparison cell after synthesis "
+                "(check whether the model called store_dataset_catalog and whether step text included ≥2 ds ids)."
+            ),
+            status="error",
+            kind="notebook_comparison_missing",
+        )
+
+    callback_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
+    _refresh_analysis_notebook_state_from_workspace(
+        callback_context.state,
+        workspace=workspace,
+        task_state=task_state,
+    )
+    return workspace
+
+
+def _is_obvious_analysis_followup_query(
+    user_text: str,
+    *,
+    workspace: dict[str, Any] | None,
+) -> bool:
+    if not workspace:
+        return False
+    normalized = f" {_normalize_user_text(user_text)} "
+    if not normalized.strip():
+        return False
+    if _is_analysis_plot_request(user_text):
+        return True
+
+    selected_dataset_id = str((workspace or {}).get("selected_dataset_id") or "").strip()
+    has_explicit_dataset_id = bool(
+        re.search(r"\b(?:ds\d{6,}|nm\d{6,}|dandi:\d+)\b", user_text or "", flags=re.IGNORECASE)
+    )
+    metadata_terms = (
+        " metadata ",
+        " full metadata ",
+        " dataset card ",
+        " dataset profile ",
+        " show me more ",
+        " inspect ",
+        " details ",
+    )
+    if has_explicit_dataset_id and any(term in normalized for term in metadata_terms):
+        return True
+    if selected_dataset_id and any(term in normalized for term in metadata_terms):
+        return True
+    if selected_dataset_id and any(
+        token in normalized
+        for token in (" this dataset ", " selected dataset ", " that dataset ")
+    ):
+        return True
+    return False
+
+
+def _should_autosynth_analysis_followup(
+    user_text: str,
+    *,
+    task_state: dict[str, Any] | None,
+    workspace: dict[str, Any] | None,
+) -> bool:
+    if not task_state or not workspace:
+        return False
+    if not _is_analysis_plot_request(user_text):
+        return False
+    if any(str(step.get("status", "")).strip() == "pending" for step in task_state.get("steps", [])):
+        return False
+    if str(task_state.get("plan_status", "")).strip() not in {"completed", "ready"}:
+        return False
+    if not any(str(step.get("status", "")).strip() == "completed" for step in task_state.get("steps", [])):
+        return False
+    objective = f" {_normalize_user_text(str(task_state.get('objective', '') or ''))} "
+    return any(
+        token in objective
+        for token in (" dataset ", " datasets ", " compare ", " comparison ", " shortlist ", " rank ")
+    )
+
+
+def _analysis_context_instructions(
+    callback_context: CallbackContext,
+    *,
+    user_text: str,
+    include_resolution_guidance: bool = True,
+) -> list[str]:
+    workspace = _get_analysis_workspace(callback_context)
+    if not workspace:
+        return []
+    payload = analysis_context_payload(workspace)
+    instructions = [
+        "Analysis workspace context (authoritative for notebook history and selected-dataset state):",
+        _serialize_pretty_json(payload),
+    ]
+    if include_resolution_guidance:
+        intent_hint = _derive_analysis_intent_hint(user_text, workspace)
+        instructions.append(
+            f"Intent hint for this turn: {intent_hint}. "
+            "Use the selected_dataset summary above when the user refers to 'this dataset', "
+            "'selected dataset', 'show me more', or similar follow-up phrasing."
+        )
+        if _is_analysis_plot_request(user_text):
+            instructions.append(
+                "Notebook rendering guardrail for plotting follow-ups:\n"
+                "- Treat plot/chart/graph/visualize requests as notebook actions that operate on the current analysis state.\n"
+                "- Prefer reusing the completed comparison from this conversation over starting a fresh discovery plan."
+            )
+        if intent_hint == "dataset_metadata":
+            instructions.append(
+                "Planning/execution guardrail for dataset-metadata follow-ups:\n"
+                "- Do not rerun broad multi-dataset discovery unless the user explicitly asks to compare or search again.\n"
+                "- Prefer source-native dataset detail tools (for example OpenNeuro, NEMAR, DANDI) for the selected or named dataset.\n"
+                "- A short metadata-focused plan is acceptable."
+            )
+    return instructions
+
+
 def _find_step(task_state: dict[str, Any], step_id: str) -> tuple[int, dict[str, Any]]:
     for idx, step in enumerate(task_state.get("steps", [])):
         if str(step.get("id")) == str(step_id):
@@ -8521,6 +9563,80 @@ def _synth_context_instructions(task_state: dict[str, Any], callback_context: Ca
     return instructions
 
 
+def _analysis_synth_context_instructions(
+    task_state: dict[str, Any],
+    callback_context: CallbackContext | None = None,
+) -> list[str]:
+    workspace = _get_analysis_workspace(callback_context) if callback_context is not None else None
+    active_task_context = _get_active_task_context(callback_context) if callback_context is not None else {}
+    current_task_id = str(active_task_context.get("task_id") or "").strip()
+    user_text = _extract_user_turn_text(callback_context) if callback_context is not None else ""
+    intent_hint = _derive_analysis_intent_hint(user_text, workspace)
+    current_task_cell_types = _analysis_task_cell_types(workspace, task_id=current_task_id)
+    has_comparison_cell = _analysis_task_has_cell_type(
+        workspace,
+        task_id=current_task_id,
+        cell_type="dataset_comparison",
+    )
+    payload = {
+        "schema": "analysis_synthesis_context.v1",
+        "objective": task_state.get("objective", ""),
+        "plan_status": task_state.get("plan_status", "ready"),
+        "intent_hint": intent_hint,
+        "current_task": {
+            "task_id": current_task_id,
+            "cell_types": current_task_cell_types,
+            "has_dataset_comparison_cell": has_comparison_cell,
+            "plot_followup_requested": _is_analysis_plot_request(user_text),
+        },
+        "steps": [
+            {
+                "id": step.get("id"),
+                "goal": step.get("goal"),
+                "source": _preferred_step_source_label(step, str(step.get("tool_hint", ""))),
+                "status": step.get("status"),
+                "result_summary": _sanitize_internal_report_text(str(step.get("result_summary", "") or "")),
+                "evidence_ids": list(step.get("evidence_ids", []) or [])[:20],
+                "open_gaps": list(step.get("open_gaps", []) or [])[:8],
+                "structured_observations": list(step.get("structured_observations", []) or [])[:8],
+            }
+            for step in task_state.get("steps", [])
+        ],
+        "latest_dataset_visualizations": task_state.get("latest_dataset_visualizations"),
+    }
+    instructions = [
+        "Analysis task context (authoritative for this operation):",
+        _serialize_pretty_json(payload),
+    ]
+    if callback_context is not None:
+        instructions.extend(
+            _analysis_context_instructions(
+                callback_context,
+                user_text=_extract_user_turn_text(callback_context),
+            )
+        )
+    if intent_hint == "dataset_search_compare":
+        if not has_comparison_cell:
+            instructions.append(
+                "Notebook requirement for this turn:\n"
+                "- This task is acting as a dataset-search/compare operation and it does not yet have a `dataset_comparison` cell.\n"
+                "- You MUST call `store_dataset_catalog` before returning Markdown.\n"
+                "- `append_analysis_note` alone is not sufficient.\n"
+                "- Reuse the completed-step evidence from this task instead of reopening planning or discovery."
+            )
+        elif _is_analysis_plot_request(user_text):
+            instructions.append(
+                "Notebook requirement for this turn:\n"
+                "- A comparison cell already exists for this task. Do not create a duplicate unless you are materially updating the comparison.\n"
+                "- Use the Markdown to orient the user to the existing notebook visuals."
+            )
+    instructions.append(
+        "Return user-facing Markdown summarizing only this new analysis operation. "
+        "Store notebook artifacts before finalizing the text."
+    )
+    return instructions
+
+
 def _validate_step_execution_result(raw: dict[str, Any]) -> dict[str, Any]:
     if str(raw.get("schema", "")).strip() != STEP_RESULT_SCHEMA:
         raise ValueError(f"schema must be {STEP_RESULT_SCHEMA}")
@@ -8583,20 +9699,31 @@ def _apply_step_execution_result_to_task_state(
         task_state["current_step_id"] = next_step_id
         task_state["plan_status"] = "completed" if next_step_id is None else "ready"
     else:
-        task_state["current_step_id"] = validated["step_id"]
-        task_state["plan_status"] = "blocked"
+        next_step_id = _next_pending_step_id(task_state)
+        if next_step_id is None:
+            task_state["current_step_id"] = None
+            task_state["plan_status"] = "completed"
+        else:
+            task_state["current_step_id"] = validated["step_id"]
+            task_state["plan_status"] = "blocked"
 
     _refresh_task_state_derived_state(task_state)
     return validated
 
 
-def _make_planner_before_model_callback(*, require_approval: bool, model_name: str = PLANNER_MODEL):
+def _make_planner_before_model_callback(
+    *,
+    require_approval: bool,
+    model_name: str = PLANNER_MODEL,
+    workflow_mode: str = WORKFLOW_MODE_REPORT,
+):
     """Factory: returns a planner before-model callback.
 
     When ``require_approval`` is True, the callback recognises ``approve``,
     ``revise: <feedback>`` and ``continue``-style commands so the workflow
     can pause after planning and resume after human review.
     """
+    normalized_mode = _normalize_workflow_mode(workflow_mode)
 
     def _callback(*, callback_context: CallbackContext, llm_request: LlmRequest) -> LlmResponse | None:
         _clear_turn_temp_state(callback_context)
@@ -8606,6 +9733,17 @@ def _make_planner_before_model_callback(*, require_approval: bool, model_name: s
 
         if is_finalize:
             return _make_text_response("")
+
+        if normalized_mode == WORKFLOW_MODE_ANALYSIS:
+            task_state = _get_task_state(callback_context)
+            workspace = _get_analysis_workspace(callback_context)
+            if _should_autosynth_analysis_followup(
+                user_text,
+                task_state=task_state,
+                workspace=workspace,
+            ):
+                callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
+                return _make_text_response("")
 
         # --- History command ---
         if _normalize_user_text(user_text) in ("history", "/history", "list cycles"):
@@ -8690,6 +9828,13 @@ def _make_planner_before_model_callback(*, require_approval: bool, model_name: s
                     "Generate an updated plan that addresses the feedback.",
                     _planner_json_instruction_suffix(),
                 ])
+                if normalized_mode == WORKFLOW_MODE_ANALYSIS:
+                    llm_request.append_instructions(
+                        _analysis_context_instructions(
+                            callback_context,
+                            user_text=user_text,
+                        )
+                    )
                 return None
 
             callback_context.state[STATE_PLAN_PENDING_APPROVAL] = False
@@ -8720,12 +9865,23 @@ def _make_planner_before_model_callback(*, require_approval: bool, model_name: s
             llm_request.config.thinking_config = tc
         llm_request.config.response_mime_type = None
         llm_request.append_instructions([_planner_json_instruction_suffix()])
+        if normalized_mode == WORKFLOW_MODE_ANALYSIS:
+            llm_request.append_instructions(
+                _analysis_context_instructions(
+                    callback_context,
+                    user_text=user_text,
+                )
+            )
         return None
 
     return _callback
 
 
-def _make_planner_after_model_callback(*, require_approval: bool):
+def _make_planner_after_model_callback(
+    *,
+    require_approval: bool,
+    workflow_mode: str = WORKFLOW_MODE_REPORT,
+):
     """Factory: returns a planner after-model callback.
 
     When ``require_approval`` is True the rendered plan is appended with
@@ -8756,6 +9912,10 @@ def _make_planner_after_model_callback(*, require_approval: bool):
             rendered = _render_parse_error_markdown("Planner", parse_error or "Failed to parse plan JSON", text)
             _set_turn_rendered_output(callback_context, key=STATE_PLANNER_RENDERED, text=rendered)
             return _replace_llm_response_text(llm_response, rendered)
+
+        normalized_mode = _normalize_workflow_mode(workflow_mode)
+        if normalized_mode == WORKFLOW_MODE_ANALYSIS:
+            parsed = _repair_analysis_plan_internal(parsed)
 
         objective_text = _extract_user_turn_text(callback_context)
         try:
@@ -8945,9 +10105,13 @@ def _react_skip_if_done(*, callback_context: CallbackContext) -> types.Content |
         return types.Content(role="model", parts=[])
     plan_status = str(task_state.get("plan_status", ""))
     current_step = str(task_state.get("current_step_id") or "").strip()
-    if plan_status == "completed" or not current_step:
-        return types.Content(role="model", parts=[])
     if plan_status == "blocked" and not _next_pending_step_id(task_state):
+        task_state["current_step_id"] = None
+        task_state["plan_status"] = "completed"
+        callback_context.state[STATE_WORKFLOW_TASK] = task_state
+        callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
+        return types.Content(role="model", parts=[])
+    if plan_status == "completed" or not current_step:
         return types.Content(role="model", parts=[])
     return None
 
@@ -9049,6 +10213,13 @@ def _react_before_model_callback(*, callback_context: CallbackContext, llm_reque
     llm_request.config.response_mime_type = None
     instructions = _react_step_context_instructions(task_state, active_step)
     llm_request.append_instructions(instructions)
+    if _get_analysis_workspace(callback_context):
+        llm_request.append_instructions(
+            _analysis_context_instructions(
+                callback_context,
+                user_text=_extract_user_turn_text(callback_context),
+            )
+        )
     return None
 
 
@@ -10199,6 +11370,77 @@ def _synth_after_model_callback(*, callback_context: CallbackContext, llm_respon
     return _replace_llm_response_text(llm_response, final_markdown)
 
 
+def _analysis_synth_before_model_callback(
+    *,
+    callback_context: CallbackContext,
+    llm_request: LlmRequest,
+) -> LlmResponse | None:
+    wants_finalize = bool(callback_context.state.get(STATE_FINALIZE_REQUESTED, False))
+    wants_auto_synth = bool(callback_context.state.get(STATE_AUTO_SYNTH_REQUESTED, False))
+    abort_reason = str(callback_context.state.get(STATE_TURN_ABORT_REASON, "")).strip()
+
+    if not wants_finalize and not wants_auto_synth:
+        return _make_text_response(_compose_non_finalize_turn_output(callback_context))
+
+    if abort_reason:
+        return _make_text_response(_compose_non_finalize_turn_output(callback_context))
+
+    task_state = _get_task_state(callback_context)
+    if not task_state:
+        return _make_text_response(_render_no_plan_to_finalize_message())
+
+    task_state["notebook_synthesis_diagnostics"] = []
+    callback_context.state[STATE_WORKFLOW_TASK] = task_state
+
+    callback_context.state[STATE_SYNTH_BUFFER] = ""
+    llm_request.config = llm_request.config or types.GenerateContentConfig()
+    llm_request.config.response_mime_type = None
+    llm_request.append_instructions(
+        _analysis_synth_context_instructions(task_state, callback_context)
+    )
+    return None
+
+
+def _analysis_synth_after_model_callback(
+    *,
+    callback_context: CallbackContext,
+    llm_response: LlmResponse,
+) -> LlmResponse | None:
+    if bool(callback_context.state.get(STATE_MODEL_ERROR_PASSTHROUGH, False)):
+        callback_context.state[STATE_MODEL_ERROR_PASSTHROUGH] = False
+        callback_context.state[STATE_SYNTH_BUFFER] = ""
+        return None
+
+    if _llm_response_has_function_call(llm_response):
+        return None
+
+    text = _llm_response_text(llm_response)
+    if bool(getattr(llm_response, "partial", False)):
+        _buffer_partial_text(callback_context, STATE_SYNTH_BUFFER, text)
+        return _replace_llm_response_text(llm_response, "")
+
+    task_state = _get_task_state(callback_context)
+    if task_state is None:
+        return None
+
+    buffered = str(callback_context.state.get(STATE_SYNTH_BUFFER, "") or "")
+    callback_context.state[STATE_SYNTH_BUFFER] = ""
+    final_markdown = (buffered + text).strip()
+    workspace = _materialize_analysis_notebook_fallback(
+        callback_context=callback_context,
+        task_state=task_state,
+        final_markdown=final_markdown,
+    )
+    task_state["latest_synthesis"] = {
+        "schema": "analysis_turn_summary.v1",
+        "coverage_status": _compute_coverage_status(task_state),
+        "markdown": final_markdown,
+        "workspace_revision": int((workspace or {}).get("revision", 0) or 0),
+    }
+    callback_context.state[STATE_WORKFLOW_TASK] = task_state
+    return _replace_llm_response_text(llm_response, final_markdown)
+
+
 BQ_EXECUTOR_POLICY = """- BigQuery-first policy: For any structured data lookup, prefer `list_bigquery_tables` \
 and `run_bigquery_select_query` over non-BQ tools. \
 Available datasets: open_targets_platform (targets, diseases, drugs, evidence), ebi_chembl (bioactivity), \
@@ -10555,12 +11797,25 @@ def _build_step_executor_instruction_for_mode(
         bq_policy = "- BigQuery-first policy is disabled for this run."
     evidence_policy = _step_execution_evidence_policy(workflow_mode=workflow_mode)
 
-    return (
-        STEP_EXECUTOR_INSTRUCTION_TEMPLATE
-        .replace("__ROUTING_POLICY__", routing_policy)
+    body = (
+        STEP_EXECUTOR_INSTRUCTION_TEMPLATE.replace("__ROUTING_POLICY__", routing_policy)
         .replace("__BQ_POLICY__", bq_policy)
         .replace("__EXECUTION_EVIDENCE_POLICY__", evidence_policy)
     )
+    if _normalize_workflow_mode(workflow_mode) == WORKFLOW_MODE_ANALYSIS:
+        body += """
+
+Analysis-mode: COMPLETED vs BLOCKED (dataset workflows)
+- Use **COMPLETED** when the step is logically finished, **including** when there is nothing left to retrieve because
+  a prior search returned zero hits, returned no shortlist you can act on, or a dependency step produced no candidate IDs.
+  Say that plainly, list the gap under limitations/open gaps, and reference the prior step — do **not** call this BLOCKED.
+- Use **BLOCKED** only when you have **concrete** dataset targets or a viable query path, but archives/APIs failed after
+  reasonable retries or alternates **and** you cannot partially satisfy the completion condition another way.
+  Brief upstream outages on one archive (for example 5xx, disk-full, or non-JSON error pages) are BLOCKED **for the step
+  that hit the outage**, not for later steps that only restate “there were no candidates to detail.”
+- If a detail step finds no IDs to fetch, still call at least one relevant tool (for example repeat a minimal search to
+  confirm the empty state) so the observation is verified, then conclude **COMPLETED** with “skipped — no inputs.”"""
+    return body
 
 
 def _build_benchmark_loop_instruction(tool_hints: list[str]) -> str:
@@ -10616,6 +11871,10 @@ def _build_planner_instruction(
             "- Do NOT append a terminal PubMed/OpenAlex/Europe PMC corroboration step just to obtain citations.\n"
             "- Add a literature step only if the user explicitly asks for papers/manuscripts, or if a key comparison dimension cannot be resolved from archive metadata and source-native dataset tools alone.\n"
             "- For archive comparison tasks, prioritize source-native dataset detail steps over literature-only follow-up.\n"
+            "- Prefer **one archive-focused step chain at a time**: for each repository, plan search **then** dataset-level detail retrieval for that repository's shortlist before moving to the next repository. Avoid a uniform pattern of “search every archive” followed by “detail every archive” — that creates brittle no-op detail steps when an early search is empty or an archive is down.\n"
+            "- When a detail step depends on candidates from a prior step, phrase the completion_condition so it is satisfied by either (a) retrieved detail records for the shortlist or (b) an explicit verified empty shortlist / upstream outage with gaps recorded — not only by successful detail fetches.\n"
+            "- Do NOT create standalone executor steps whose only purpose is to synthesize, rank, tabulate, chart, or visualize already-collected dataset evidence. Final comparison and visualization happen in the notebook synthesizer after evidence-gathering steps complete.\n"
+            "- If you need a final archive-backed verification step, anchor it to the same archive/source-native tools that produced the dataset records. Do not use BigQuery as a placeholder source for notebook synthesis.\n"
             "- When the objective is to find, shortlist, compare, QC, or prepare public datasets for reuse, a plan with only archive/source-native steps is acceptable."
         )
     else:
@@ -10662,10 +11921,12 @@ def _build_planner_instruction(
     )
 
 
-def _router_before_model_callback(
+def _router_before_model_callback_core(
     *,
     callback_context: CallbackContext,
     llm_request: LlmRequest,
+    workflow_agent_name: str,
+    allow_report_assistant: bool,
 ) -> LlmResponse | None:
     """Route by session state when in-workflow (no LLM call); otherwise inject
     context for the router LLM to classify. This avoids an extra API call when
@@ -10675,6 +11936,11 @@ def _router_before_model_callback(
     user_turn = _extract_user_turn_text(callback_context)
 
     task_state = _get_task_state(callback_context)
+    analysis_workspace = (
+        _get_analysis_workspace(callback_context)
+        if workflow_agent_name == "analysis_workflow"
+        else None
+    )
     plan_pending = bool(
         callback_context.state.get(STATE_PLAN_PENDING_APPROVAL, False)
     )
@@ -10697,51 +11963,31 @@ def _router_before_model_callback(
             has_report = True
             report_objective = objective
 
-    # In-workflow: bypass router LLM entirely — transfer straight to research_workflow
+    # In-workflow: bypass router LLM entirely — transfer straight to the active workflow.
     if plan_pending or plan_status in ("ready", "blocked", "in_progress") or has_pending_steps:
-        transfer_part = types.Part(
-            function_call=types.FunctionCall(
-                name="transfer_to_agent",
-                args={"agent_name": "research_workflow"},
-            )
-        )
-        return LlmResponse(
-            content=types.Content(role="model", parts=[transfer_part]),
-            partial=False,
-            turn_complete=False,
-        )
+        return _make_transfer_response(workflow_agent_name)
+
+    if workflow_agent_name == "analysis_workflow" and _is_underspecified_analysis_request(
+        user_turn,
+        workspace=analysis_workspace,
+    ):
+        return _make_transfer_response("clarifier")
 
     if not has_report and _is_obvious_research_workflow_query(user_turn):
-        transfer_part = types.Part(
-            function_call=types.FunctionCall(
-                name="transfer_to_agent",
-                args={"agent_name": "research_workflow"},
-            )
-        )
-        return LlmResponse(
-            content=types.Content(role="model", parts=[transfer_part]),
-            partial=False,
-            turn_complete=False,
-        )
+        return _make_transfer_response(workflow_agent_name)
 
     if not has_report and _is_obvious_general_qa_query(user_turn):
-        transfer_part = types.Part(
-            function_call=types.FunctionCall(
-                name="transfer_to_agent",
-                args={"agent_name": "general_qa"},
-            )
-        )
-        return LlmResponse(
-            content=types.Content(role="model", parts=[transfer_part]),
-            partial=False,
-            turn_complete=False,
-        )
+        return _make_transfer_response("general_qa")
+
+    if _is_obvious_analysis_followup_query(user_turn, workspace=analysis_workspace):
+        return _make_transfer_response(workflow_agent_name)
 
     # Idle / fresh query: inject state context for LLM to classify
     state_context = (
         "Session context for routing:\n"
         f"- report_exists: {has_report}\n"
         f"- report_objective: {report_objective or 'N/A'}\n"
+        f"- report_assistant_available: {allow_report_assistant}\n"
         f"- plan_pending_approval: {plan_pending}\n"
         f"- plan_status: {plan_status}\n"
         f"- has_pending_steps: {has_pending_steps}\n"
@@ -10749,6 +11995,35 @@ def _router_before_model_callback(
     )
     llm_request.append_instructions([state_context])
     return None
+
+
+def _router_before_model_callback(
+    *,
+    callback_context: CallbackContext,
+    llm_request: LlmRequest,
+) -> LlmResponse | None:
+    return _router_before_model_callback_core(
+        callback_context=callback_context,
+        llm_request=llm_request,
+        workflow_agent_name="research_workflow",
+        allow_report_assistant=True,
+    )
+
+
+def _make_router_before_model_callback(
+    *,
+    workflow_agent_name: str,
+    allow_report_assistant: bool,
+):
+    def _callback(*, callback_context: CallbackContext, llm_request: LlmRequest) -> LlmResponse | None:
+        return _router_before_model_callback_core(
+            callback_context=callback_context,
+            llm_request=llm_request,
+            workflow_agent_name=workflow_agent_name,
+            allow_report_assistant=allow_report_assistant,
+        )
+
+    return _callback
 
 
 def _report_assistant_before_model_callback(
@@ -10851,6 +12126,30 @@ def _normalize_workflow_mode(mode: str | None) -> str:
     return WORKFLOW_MODE_REPORT
 
 
+def _tool_workspace_context(tool_context: ToolContext | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any]]:
+    if tool_context is None:
+        return None, None, {}
+    task_state = _get_task_state_from_state_map(tool_context.state)
+    workspace = _get_analysis_workspace_from_state_map(tool_context.state)
+    active_task_context = _get_active_task_context_from_state_map(tool_context.state)
+    if active_task_context:
+        conversation_id = str(active_task_context.get("conversation_id") or "").strip()
+    else:
+        conversation_id = ""
+    if workspace is None and conversation_id:
+        workspace = ensure_analysis_workspace(
+            None,
+            conversation_id=conversation_id,
+        )
+        tool_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
+        _refresh_analysis_notebook_state_from_workspace(
+            tool_context.state,
+            workspace=workspace,
+            task_state=task_state,
+        )
+    return task_state, workspace, active_task_context
+
+
 def store_dataset_visualizations(
     dimensions_json: str,
     datasets_json: str,
@@ -10916,6 +12215,11 @@ def store_dataset_visualizations(
 
     task_state["latest_dataset_visualizations"] = bundle
     tool_context.state[STATE_WORKFLOW_TASK] = task_state
+    _refresh_analysis_notebook_state_from_workspace(
+        tool_context.state,
+        workspace=_get_analysis_workspace_from_state_map(tool_context.state),
+        task_state=task_state,
+    )
 
     summary_cards = dict(bundle.get("summary_cards", {}) or {})
     top_dataset = str(summary_cards.get("top_dataset", "") or "").strip()
@@ -10935,6 +12239,178 @@ def store_dataset_visualizations(
         "message": message,
         "summary_cards": summary_cards,
         "warnings": list(bundle.get("warnings", []) or []),
+    }
+
+
+def store_dataset_catalog(
+    dimensions_json: str,
+    datasets_json: str,
+    objective: str = "",
+    summary: str = "",
+    notes_json: str = "",
+    tool_context: ToolContext | None = None,
+) -> dict[str, Any]:
+    """Append a dataset-comparison artifact and cell to the analysis notebook."""
+    task_state, workspace, active_task_context = _tool_workspace_context(tool_context)
+    if tool_context is None or task_state is None or workspace is None:
+        return {
+            "ok": False,
+            "message": "Analysis notebook storage is unavailable because task or workspace state is missing.",
+        }
+
+    try:
+        dimensions = parse_visualization_json_array(
+            dimensions_json,
+            field_name="dimensions_json",
+        )
+        datasets = parse_visualization_json_array(
+            datasets_json,
+            field_name="datasets_json",
+        )
+        notes_raw = parse_visualization_json_array(
+            notes_json,
+            field_name="notes_json",
+        )
+        notes = [str(note).strip() for note in notes_raw if str(note).strip()]
+        result = append_dataset_catalog_artifact(
+            workspace,
+            task_id=str(active_task_context.get("task_id") or "").strip(),
+            user_prompt=str(active_task_context.get("user_prompt") or task_state.get("objective") or "").strip(),
+            objective=objective or str(task_state.get("objective", "") or ""),
+            summary=summary,
+            dimensions=dimensions,
+            datasets=datasets,
+            notes=notes,
+        )
+        payload = dict(result.get("payload") or {})
+        bundle = dict(payload.get("visualizations", {}) or {})
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "message": str(exc),
+        }
+
+    task_state["latest_dataset_visualizations"] = bundle
+    tool_context.state[STATE_WORKFLOW_TASK] = task_state
+    tool_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
+    _refresh_analysis_notebook_state_from_workspace(
+        tool_context.state,
+        workspace=workspace,
+        task_state=task_state,
+    )
+    return {
+        "ok": True,
+        "message": (
+            f"Appended dataset comparison cell with {int((payload.get('summary_cards', {}) or {}).get('dataset_count', 0) or 0)} datasets."
+        ),
+        "operation_id": result.get("operation_id", ""),
+        "cell_id": result.get("cell_id", ""),
+        "artifact_id": result.get("artifact_id", ""),
+        "summary_cards": dict(payload.get("summary_cards", {}) or {}),
+        "warnings": list(payload.get("warnings", []) or []),
+    }
+
+
+def store_dataset_metadata_profile(
+    metadata_json: str,
+    title: str = "",
+    summary: str = "",
+    tool_context: ToolContext | None = None,
+) -> dict[str, Any]:
+    """Append a normalized single-dataset metadata profile to the analysis notebook."""
+    task_state, workspace, active_task_context = _tool_workspace_context(tool_context)
+    if tool_context is None or task_state is None or workspace is None:
+        return {
+            "ok": False,
+            "message": "Analysis notebook storage is unavailable because task or workspace state is missing.",
+        }
+
+    try:
+        metadata = parse_json_object_text(
+            metadata_json,
+            field_name="metadata_json",
+        )
+        result = append_dataset_metadata_artifact(
+            workspace,
+            task_id=str(active_task_context.get("task_id") or "").strip(),
+            user_prompt=str(active_task_context.get("user_prompt") or task_state.get("objective") or "").strip(),
+            metadata=metadata,
+            title=title,
+            summary=summary,
+        )
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "message": str(exc),
+        }
+
+    tool_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
+    _refresh_analysis_notebook_state_from_workspace(
+        tool_context.state,
+        workspace=workspace,
+        task_state=task_state,
+    )
+    return {
+        "ok": True,
+        "message": (
+            f"Appended metadata profile for {str((result.get('payload') or {}).get('dataset_label') or 'the dataset').strip()}."
+        ),
+        "operation_id": result.get("operation_id", ""),
+        "cell_id": result.get("cell_id", ""),
+        "artifact_id": result.get("artifact_id", ""),
+        "dataset_id": result.get("dataset_id", ""),
+    }
+
+
+def append_analysis_note(
+    markdown: str,
+    title: str = "",
+    related_dataset_ids_json: str = "",
+    tool_context: ToolContext | None = None,
+) -> dict[str, Any]:
+    """Append a markdown analysis note to the notebook."""
+    task_state, workspace, active_task_context = _tool_workspace_context(tool_context)
+    if tool_context is None or task_state is None or workspace is None:
+        return {
+            "ok": False,
+            "message": "Analysis notebook storage is unavailable because task or workspace state is missing.",
+        }
+
+    try:
+        related_dataset_ids = [
+            str(value).strip()
+            for value in parse_json_array_text(
+                related_dataset_ids_json,
+                field_name="related_dataset_ids_json",
+            )
+            if str(value).strip()
+        ]
+        result = append_analysis_note_artifact(
+            workspace,
+            task_id=str(active_task_context.get("task_id") or "").strip(),
+            user_prompt=str(active_task_context.get("user_prompt") or task_state.get("objective") or "").strip(),
+            markdown=markdown,
+            title=title,
+            related_dataset_ids=related_dataset_ids,
+        )
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "message": str(exc),
+        }
+
+    tool_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
+    _refresh_analysis_notebook_state_from_workspace(
+        tool_context.state,
+        workspace=workspace,
+        task_state=task_state,
+    )
+    return {
+        "ok": True,
+        "message": "Appended notebook note.",
+        "operation_id": result.get("operation_id", ""),
+        "cell_id": result.get("cell_id", ""),
+        "artifact_id": result.get("artifact_id", ""),
     }
 
 
@@ -10959,6 +12435,579 @@ def create_mcp_toolset(tool_filter: list[str] | ToolPredicate | None = None) -> 
     )
 
 
+def _resolve_workflow_models(model: str | None = None) -> WorkflowModels:
+    return WorkflowModels(
+        runtime_model=str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
+        planner_model=PLANNER_MODEL,
+        synthesizer_model=SYNTHESIZER_MODEL,
+        router_model=ROUTER_MODEL,
+    )
+
+
+def _resolve_base_tool_hints(
+    tool_filter: list[str] | None,
+    *,
+    workflow_mode: str,
+) -> list[str]:
+    normalized_mode = _normalize_workflow_mode(workflow_mode)
+    default_hints = ANALYSIS_DEFAULT_TOOL_HINTS if normalized_mode == WORKFLOW_MODE_ANALYSIS else KNOWN_MCP_TOOLS
+    return _dedupe_str_list(default_hints if tool_filter is None else tool_filter, limit=120)
+
+
+def _prioritize_executor_tool_hints(
+    base_tool_hints: list[str],
+    *,
+    prefer_bigquery: bool,
+) -> list[str]:
+    if not prefer_bigquery:
+        return list(base_tool_hints)
+    base_hint_set = set(base_tool_hints)
+    prioritized_hints = [name for name in BQ_PRIORITY_TOOLS if name in base_hint_set]
+    prioritized_set = set(prioritized_hints)
+    prioritized_hints.extend([name for name in base_tool_hints if name not in prioritized_set])
+    return prioritized_hints
+
+
+def _wrap_managed_toolsets(toolsets: tuple[McpToolset, ...]) -> ManagedMcpToolsets | None:
+    return ManagedMcpToolsets(toolsets) if toolsets else None
+
+
+def build_report_tool_profile(
+    *,
+    base_tool_hints: list[str],
+    prefer_bigquery: bool,
+    planner_skills_enabled: bool,
+    execution_skills_enabled: bool,
+    report_assistant_skills_enabled: bool,
+) -> WorkflowToolProfile:
+    executor_tool_filter: list[str] | ToolPredicate | None
+    if base_tool_hints:
+        executor_tool_filter = _ActiveStepToolPredicate(base_tool_hints)
+    else:
+        executor_tool_filter = []
+    executor_mcp_toolset = create_mcp_toolset(tool_filter=executor_tool_filter)
+    report_assistant_mcp_toolset = create_mcp_toolset(tool_filter=base_tool_hints)
+    executor_tools: list[McpToolset] = [executor_mcp_toolset] if executor_mcp_toolset is not None else []
+    report_assistant_mcp_tools: list[McpToolset] = (
+        [report_assistant_mcp_toolset] if report_assistant_mcp_toolset is not None else []
+    )
+    planner_tools: list[Any] = []
+    workflow_lookup_tools: list[Any] = []
+    report_assistant_tools: list[Any] = []
+    if planner_skills_enabled:
+        _, planner_skill_toolset = create_planner_skill_toolset()
+        planner_tools = [planner_skill_toolset]
+    if execution_skills_enabled:
+        _, execution_skill_toolset = create_execution_skill_toolset()
+        workflow_lookup_tools.append(execution_skill_toolset)
+    if report_assistant_skills_enabled:
+        _, report_assistant_skill_toolset = create_report_assistant_skill_toolset()
+        report_assistant_tools.append(report_assistant_skill_toolset)
+    workflow_lookup_tools.extend(executor_tools)
+    report_assistant_tools.extend(report_assistant_mcp_tools)
+    managed_toolsets = tuple(
+        toolset for toolset in (executor_mcp_toolset, report_assistant_mcp_toolset) if toolset is not None
+    )
+    return WorkflowToolProfile(
+        base_tool_hints=list(base_tool_hints),
+        executor_tool_hints=_prioritize_executor_tool_hints(
+            base_tool_hints,
+            prefer_bigquery=prefer_bigquery,
+        ),
+        planner_tools=planner_tools,
+        workflow_lookup_tools=workflow_lookup_tools,
+        report_assistant_tools=report_assistant_tools,
+        synthesizer_tools=[],
+        managed_mcp_toolsets=managed_toolsets,
+    )
+
+
+def build_analysis_tool_profile(
+    *,
+    base_tool_hints: list[str],
+    prefer_bigquery: bool,
+    planner_skills_enabled: bool,
+    execution_skills_enabled: bool,
+) -> WorkflowToolProfile:
+    executor_tool_filter: list[str] | ToolPredicate | None
+    if base_tool_hints:
+        executor_tool_filter = _ActiveStepToolPredicate(base_tool_hints)
+    else:
+        executor_tool_filter = []
+    executor_mcp_toolset = create_mcp_toolset(tool_filter=executor_tool_filter)
+    workflow_lookup_tools: list[Any] = [executor_mcp_toolset] if executor_mcp_toolset is not None else []
+    planner_tools: list[Any] = []
+    if planner_skills_enabled:
+        _, planner_skill_toolset = create_planner_skill_toolset()
+        planner_tools = [planner_skill_toolset]
+    if execution_skills_enabled:
+        _, execution_skill_toolset = create_execution_skill_toolset()
+        workflow_lookup_tools.insert(0, execution_skill_toolset)
+    synthesizer_tools = [
+        FunctionTool(store_dataset_catalog),
+        FunctionTool(store_dataset_metadata_profile),
+        FunctionTool(append_analysis_note),
+    ]
+    managed_toolsets = tuple(toolset for toolset in (executor_mcp_toolset,) if toolset is not None)
+    return WorkflowToolProfile(
+        base_tool_hints=list(base_tool_hints),
+        executor_tool_hints=_prioritize_executor_tool_hints(
+            base_tool_hints,
+            prefer_bigquery=prefer_bigquery,
+        ),
+        planner_tools=planner_tools,
+        workflow_lookup_tools=workflow_lookup_tools,
+        report_assistant_tools=[],
+        synthesizer_tools=synthesizer_tools,
+        managed_mcp_toolsets=managed_toolsets,
+    )
+
+
+def _create_benchmark_workflow_agent(
+    *,
+    runtime_model: str,
+    base_tool_hints: list[str],
+    execution_skills_enabled: bool,
+) -> tuple[LoopAgent, ManagedMcpToolsets | None]:
+    benchmark_mcp_toolset = create_mcp_toolset(tool_filter=base_tool_hints)
+    benchmark_tools: list[Any] = []
+    if execution_skills_enabled:
+        _, execution_skill_toolset = create_execution_skill_toolset()
+        benchmark_tools.append(execution_skill_toolset)
+    if benchmark_mcp_toolset is not None:
+        benchmark_tools.append(benchmark_mcp_toolset)
+
+    benchmark_executor = LlmAgent(
+        name="benchmark_executor",
+        description=(
+            "Loop-based benchmark execution profile for direct biomedical "
+            "database question answering with retry/recovery behavior."
+        ),
+        model=runtime_model,
+        instruction=_build_benchmark_loop_instruction(base_tool_hints),
+        tools=benchmark_tools,
+        include_contents="none",
+        disallow_transfer_to_parent=True,
+        before_agent_callback=_benchmark_before_agent_callback,
+        before_model_callback=_benchmark_before_model_callback,
+        after_model_callback=_benchmark_after_model_callback,
+        on_model_error_callback=_on_model_error,
+        on_tool_error_callback=_on_tool_error,
+    )
+    benchmark_loop = LoopAgent(
+        name="benchmark_loop",
+        sub_agents=[benchmark_executor],
+        max_iterations=BENCHMARK_LOOP_MAX_ITERATIONS,
+    )
+    managed_toolsets = tuple(
+        toolset for toolset in (benchmark_mcp_toolset,) if toolset is not None
+    )
+    return benchmark_loop, _wrap_managed_toolsets(managed_toolsets)
+
+
+def _build_shared_specialist_agents(runtime_model: str) -> tuple[LlmAgent, LlmAgent]:
+    general_qa = LlmAgent(
+        name="general_qa",
+        description=(
+            "Answers factual biomedical questions directly from knowledge. "
+            "No database lookups or tool calls needed."
+        ),
+        model=runtime_model,
+        instruction=GENERAL_QA_INSTRUCTION,
+        tools=[],
+        disallow_transfer_to_parent=True,
+        on_model_error_callback=_on_model_error,
+    )
+    clarifier = LlmAgent(
+        name="clarifier",
+        description=(
+            "Asks the user to clarify vague, ambiguous, incomplete, or "
+            "nonsensical queries before proceeding."
+        ),
+        model=runtime_model,
+        instruction=CLARIFIER_INSTRUCTION,
+        tools=[],
+        disallow_transfer_to_parent=True,
+        on_model_error_callback=_on_model_error,
+    )
+    return general_qa, clarifier
+
+
+def build_report_planner(
+    *,
+    planner_model: str,
+    executor_tool_hints: list[str],
+    prefer_bigquery: bool,
+    planner_skills_enabled: bool,
+    require_plan_approval: bool,
+    planner_tools: list[Any],
+) -> LlmAgent:
+    return LlmAgent(
+        name="planner",
+        model=planner_model,
+        instruction=_build_planner_instruction(
+            executor_tool_hints,
+            prefer_bigquery=prefer_bigquery,
+            planner_skills_enabled=planner_skills_enabled,
+            workflow_mode=WORKFLOW_MODE_REPORT,
+        ),
+        tools=planner_tools,
+        disallow_transfer_to_parent=True,
+        before_model_callback=_make_planner_before_model_callback(
+            require_approval=require_plan_approval,
+            model_name=planner_model,
+            workflow_mode=WORKFLOW_MODE_REPORT,
+        ),
+        after_model_callback=_make_planner_after_model_callback(
+            require_approval=require_plan_approval,
+            workflow_mode=WORKFLOW_MODE_REPORT,
+        ),
+        on_model_error_callback=_on_model_error,
+    )
+
+
+def build_analysis_planner(
+    *,
+    planner_model: str,
+    executor_tool_hints: list[str],
+    prefer_bigquery: bool,
+    planner_skills_enabled: bool,
+    require_plan_approval: bool,
+    planner_tools: list[Any],
+) -> LlmAgent:
+    return LlmAgent(
+        name="analysis_planner",
+        model=planner_model,
+        instruction=_build_planner_instruction(
+            executor_tool_hints,
+            prefer_bigquery=prefer_bigquery,
+            planner_skills_enabled=planner_skills_enabled,
+            workflow_mode=WORKFLOW_MODE_ANALYSIS,
+        ),
+        tools=planner_tools,
+        disallow_transfer_to_parent=True,
+        before_model_callback=_make_planner_before_model_callback(
+            require_approval=require_plan_approval,
+            model_name=planner_model,
+            workflow_mode=WORKFLOW_MODE_ANALYSIS,
+        ),
+        after_model_callback=_make_planner_after_model_callback(
+            require_approval=require_plan_approval,
+            workflow_mode=WORKFLOW_MODE_ANALYSIS,
+        ),
+        on_model_error_callback=_on_model_error,
+    )
+
+
+def build_report_executor_loop(
+    *,
+    runtime_model: str,
+    executor_tool_hints: list[str],
+    prefer_bigquery: bool,
+    workflow_lookup_tools: list[Any],
+    require_plan_approval: bool,
+) -> LoopAgent:
+    hitl_agent_gate = _hitl_skip_agent if require_plan_approval else None
+    step_executor = LlmAgent(
+        name="step_executor",
+        model=runtime_model,
+        instruction=_build_step_executor_instruction_for_mode(
+            executor_tool_hints,
+            prefer_bigquery=prefer_bigquery,
+            workflow_mode=WORKFLOW_MODE_REPORT,
+        ),
+        tools=workflow_lookup_tools,
+        include_contents="none",
+        before_agent_callback=_react_skip_if_done,
+        before_model_callback=_react_before_model_callback,
+        after_model_callback=_react_after_model_callback,
+        on_model_error_callback=_on_model_error,
+        on_tool_error_callback=_on_tool_error,
+    )
+    return LoopAgent(
+        name="react_loop",
+        sub_agents=[step_executor],
+        max_iterations=25,
+        before_agent_callback=hitl_agent_gate,
+    )
+
+
+def build_analysis_execution_loop(
+    *,
+    runtime_model: str,
+    executor_tool_hints: list[str],
+    prefer_bigquery: bool,
+    workflow_lookup_tools: list[Any],
+    require_plan_approval: bool,
+) -> LoopAgent:
+    hitl_agent_gate = _hitl_skip_agent if require_plan_approval else None
+    step_executor = LlmAgent(
+        name="analysis_step_executor",
+        model=runtime_model,
+        instruction=_build_step_executor_instruction_for_mode(
+            executor_tool_hints,
+            prefer_bigquery=prefer_bigquery,
+            workflow_mode=WORKFLOW_MODE_ANALYSIS,
+        ),
+        tools=workflow_lookup_tools,
+        include_contents="none",
+        before_agent_callback=_react_skip_if_done,
+        before_model_callback=_react_before_model_callback,
+        after_model_callback=_react_after_model_callback,
+        on_model_error_callback=_on_model_error,
+        on_tool_error_callback=_on_tool_error,
+    )
+    return LoopAgent(
+        name="analysis_executor_loop",
+        sub_agents=[step_executor],
+        max_iterations=25,
+        before_agent_callback=hitl_agent_gate,
+    )
+
+
+def build_report_synthesizer(
+    *,
+    synthesizer_model: str,
+    require_plan_approval: bool,
+) -> LlmAgent:
+    hitl_agent_gate = _hitl_skip_agent if require_plan_approval else None
+    return LlmAgent(
+        name="report_synthesizer",
+        model=synthesizer_model,
+        instruction=SYNTHESIZER_INSTRUCTION,
+        tools=[],
+        include_contents="none",
+        before_agent_callback=hitl_agent_gate,
+        before_model_callback=_synth_before_model_callback,
+        after_model_callback=_synth_after_model_callback,
+        on_model_error_callback=_on_model_error,
+    )
+
+
+def build_analysis_synthesizer(
+    *,
+    synthesizer_model: str,
+    require_plan_approval: bool,
+    synthesizer_tools: list[Any],
+) -> LlmAgent:
+    hitl_agent_gate = _hitl_skip_agent if require_plan_approval else None
+    return LlmAgent(
+        name="analysis_notebook_synthesizer",
+        model=synthesizer_model,
+        instruction=ANALYSIS_NOTEBOOK_SYNTHESIZER_INSTRUCTION,
+        tools=synthesizer_tools,
+        include_contents="none",
+        before_agent_callback=hitl_agent_gate,
+        before_model_callback=_analysis_synth_before_model_callback,
+        after_model_callback=_analysis_synth_after_model_callback,
+        on_model_error_callback=_on_model_error,
+    )
+
+
+def build_report_assistant(
+    *,
+    runtime_model: str,
+    report_assistant_tools: list[Any],
+) -> LlmAgent:
+    return LlmAgent(
+        name="report_assistant",
+        description=(
+            "Helps with an existing research report: answers questions about "
+            "findings, restructures sections, and performs light follow-up "
+            "lookups using biomedical tools. Only available after a report "
+            "has been produced."
+        ),
+        model=runtime_model,
+        instruction=REPORT_ASSISTANT_INSTRUCTION,
+        tools=report_assistant_tools,
+        disallow_transfer_to_parent=True,
+        before_model_callback=_report_assistant_before_model_callback,
+        after_model_callback=_report_assistant_after_model_callback,
+        on_model_error_callback=_on_model_error,
+        on_tool_error_callback=_on_tool_error,
+    )
+
+
+def build_report_router(
+    *,
+    router_model: str,
+    general_qa: LlmAgent,
+    clarifier: LlmAgent,
+    report_assistant: LlmAgent,
+    research_workflow: SequentialAgent,
+) -> LlmAgent:
+    return LlmAgent(
+        name="co_scientist_router",
+        description="AI Co-Scientist: biomedical research assistant with intent routing.",
+        model=router_model,
+        instruction=ROUTER_INSTRUCTION,
+        sub_agents=[general_qa, clarifier, report_assistant, research_workflow],
+        before_model_callback=_make_router_before_model_callback(
+            workflow_agent_name="research_workflow",
+            allow_report_assistant=True,
+        ),
+        on_model_error_callback=_on_model_error,
+    )
+
+
+def build_analysis_router(
+    *,
+    router_model: str,
+    general_qa: LlmAgent,
+    clarifier: LlmAgent,
+    analysis_workflow: SequentialAgent,
+) -> LlmAgent:
+    return LlmAgent(
+        name="co_scientist_router",
+        description="AI Co-Scientist: biomedical research assistant with intent routing.",
+        model=router_model,
+        instruction=ANALYSIS_ROUTER_INSTRUCTION,
+        sub_agents=[general_qa, clarifier, analysis_workflow],
+        before_model_callback=_make_router_before_model_callback(
+            workflow_agent_name="analysis_workflow",
+            allow_report_assistant=False,
+        ),
+        on_model_error_callback=_on_model_error,
+    )
+
+
+def create_report_workflow_agent(
+    *,
+    tool_filter: list[str] | None = None,
+    model: str | None = None,
+    prefer_bigquery: bool | None = None,
+    planner_skills_enabled: bool | None = None,
+    execution_skills_enabled: bool | None = None,
+    report_assistant_skills_enabled: bool | None = None,
+    require_plan_approval: bool = False,
+) -> tuple[LlmAgent, ManagedMcpToolsets | None]:
+    models = _resolve_workflow_models(model)
+    use_bigquery_priority = DEFAULT_PREFER_BIGQUERY if prefer_bigquery is None else bool(prefer_bigquery)
+    use_planner_skills = (
+        DEFAULT_PLANNER_SKILLS_ENABLED if planner_skills_enabled is None else bool(planner_skills_enabled)
+    )
+    use_execution_skills = (
+        DEFAULT_EXECUTION_SKILLS_ENABLED if execution_skills_enabled is None else bool(execution_skills_enabled)
+    )
+    use_report_assistant_skills = (
+        DEFAULT_REPORT_ASSISTANT_SKILLS_ENABLED
+        if report_assistant_skills_enabled is None
+        else bool(report_assistant_skills_enabled)
+    )
+    tool_profile = build_report_tool_profile(
+        base_tool_hints=_resolve_base_tool_hints(tool_filter, workflow_mode=WORKFLOW_MODE_REPORT),
+        prefer_bigquery=use_bigquery_priority,
+        planner_skills_enabled=use_planner_skills,
+        execution_skills_enabled=use_execution_skills,
+        report_assistant_skills_enabled=use_report_assistant_skills,
+    )
+    planner = build_report_planner(
+        planner_model=models.planner_model,
+        executor_tool_hints=tool_profile.executor_tool_hints,
+        prefer_bigquery=use_bigquery_priority,
+        planner_skills_enabled=use_planner_skills,
+        require_plan_approval=require_plan_approval,
+        planner_tools=tool_profile.planner_tools,
+    )
+    react_loop = build_report_executor_loop(
+        runtime_model=models.runtime_model,
+        executor_tool_hints=tool_profile.executor_tool_hints,
+        prefer_bigquery=use_bigquery_priority,
+        workflow_lookup_tools=tool_profile.workflow_lookup_tools,
+        require_plan_approval=require_plan_approval,
+    )
+    report_synthesizer = build_report_synthesizer(
+        synthesizer_model=models.synthesizer_model,
+        require_plan_approval=require_plan_approval,
+    )
+    research_workflow = SequentialAgent(
+        name="research_workflow",
+        description=(
+            "Full research pipeline: plans an investigation, gathers evidence "
+            "from biomedical databases and APIs, and produces a formal report "
+            "with citations. Also handles workflow commands (approve, continue, "
+            "finalize, revise, history, rollback, switch)."
+        ),
+        sub_agents=[planner, react_loop, report_synthesizer],
+    )
+    general_qa, clarifier = _build_shared_specialist_agents(models.runtime_model)
+    report_assistant = build_report_assistant(
+        runtime_model=models.runtime_model,
+        report_assistant_tools=tool_profile.report_assistant_tools,
+    )
+    router = build_report_router(
+        router_model=models.router_model,
+        general_qa=general_qa,
+        clarifier=clarifier,
+        report_assistant=report_assistant,
+        research_workflow=research_workflow,
+    )
+    return router, _wrap_managed_toolsets(tool_profile.managed_mcp_toolsets)
+
+
+def create_analysis_workflow_agent(
+    *,
+    tool_filter: list[str] | None = None,
+    model: str | None = None,
+    prefer_bigquery: bool | None = None,
+    planner_skills_enabled: bool | None = None,
+    execution_skills_enabled: bool | None = None,
+    require_plan_approval: bool = False,
+) -> tuple[LlmAgent, ManagedMcpToolsets | None]:
+    models = _resolve_workflow_models(model)
+    use_bigquery_priority = DEFAULT_PREFER_BIGQUERY if prefer_bigquery is None else bool(prefer_bigquery)
+    use_planner_skills = (
+        DEFAULT_PLANNER_SKILLS_ENABLED if planner_skills_enabled is None else bool(planner_skills_enabled)
+    )
+    use_execution_skills = (
+        DEFAULT_EXECUTION_SKILLS_ENABLED if execution_skills_enabled is None else bool(execution_skills_enabled)
+    )
+    tool_profile = build_analysis_tool_profile(
+        base_tool_hints=_resolve_base_tool_hints(tool_filter, workflow_mode=WORKFLOW_MODE_ANALYSIS),
+        prefer_bigquery=use_bigquery_priority,
+        planner_skills_enabled=use_planner_skills,
+        execution_skills_enabled=use_execution_skills,
+    )
+    planner = build_analysis_planner(
+        planner_model=models.planner_model,
+        executor_tool_hints=tool_profile.executor_tool_hints,
+        prefer_bigquery=use_bigquery_priority,
+        planner_skills_enabled=use_planner_skills,
+        require_plan_approval=require_plan_approval,
+        planner_tools=tool_profile.planner_tools,
+    )
+    react_loop = build_analysis_execution_loop(
+        runtime_model=models.runtime_model,
+        executor_tool_hints=tool_profile.executor_tool_hints,
+        prefer_bigquery=use_bigquery_priority,
+        workflow_lookup_tools=tool_profile.workflow_lookup_tools,
+        require_plan_approval=require_plan_approval,
+    )
+    analysis_synthesizer = build_analysis_synthesizer(
+        synthesizer_model=models.synthesizer_model,
+        require_plan_approval=require_plan_approval,
+        synthesizer_tools=tool_profile.synthesizer_tools,
+    )
+    analysis_workflow = SequentialAgent(
+        name="analysis_workflow",
+        description=(
+            "Open-data analysis pipeline: plans a notebook-oriented dataset analysis, "
+            "runs source-native discovery or metadata steps, and appends notebook "
+            "artifacts after each completed task. Also handles workflow commands "
+            "(approve, continue, finalize, revise, history, rollback, switch)."
+        ),
+        sub_agents=[planner, react_loop, analysis_synthesizer],
+    )
+    general_qa, clarifier = _build_shared_specialist_agents(models.runtime_model)
+    router = build_analysis_router(
+        router_model=models.router_model,
+        general_qa=general_qa,
+        clarifier=clarifier,
+        analysis_workflow=analysis_workflow,
+    )
+    return router, _wrap_managed_toolsets(tool_profile.managed_mcp_toolsets)
+
+
 def create_workflow_agent(
     *,
     tool_filter: list[str] | None = None,
@@ -10970,7 +13019,7 @@ def create_workflow_agent(
     require_plan_approval: bool = False,
     benchmark_mode: bool = False,
     workflow_mode: str = WORKFLOW_MODE_REPORT,
-) -> tuple[LlmAgent | SequentialAgent, McpToolset | None]:
+) -> tuple[LlmAgent | LoopAgent | SequentialAgent, ManagedMcpToolsets | None]:
     """Create the routed ADK agent graph and return (root_agent, managed_mcp_toolsets).
 
     The root agent is an intent-classifying router that transfers to:
@@ -10990,237 +13039,43 @@ def create_workflow_agent(
             return a single tool-using agent optimized for benchmark-style
             direct question answering.
     """
-    runtime_model = str(model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    planner_model = PLANNER_MODEL
-    synthesizer_model = SYNTHESIZER_MODEL
-    router_model = ROUTER_MODEL
     normalized_mode = _normalize_workflow_mode(workflow_mode)
-    analysis_mode = normalized_mode == WORKFLOW_MODE_ANALYSIS
-    use_bigquery_priority = DEFAULT_PREFER_BIGQUERY if prefer_bigquery is None else bool(prefer_bigquery)
-    use_planner_skills = (
-        DEFAULT_PLANNER_SKILLS_ENABLED if planner_skills_enabled is None else bool(planner_skills_enabled)
-    )
-    use_execution_skills = (
-        DEFAULT_EXECUTION_SKILLS_ENABLED if execution_skills_enabled is None else bool(execution_skills_enabled)
-    )
-    use_report_assistant_skills = (
-        DEFAULT_REPORT_ASSISTANT_SKILLS_ENABLED
-        if report_assistant_skills_enabled is None
-        else bool(report_assistant_skills_enabled)
-    )
-
-    base_tool_hints = _dedupe_str_list(KNOWN_MCP_TOOLS if tool_filter is None else tool_filter, limit=120)
+    models = _resolve_workflow_models(model)
+    base_tool_hints = _resolve_base_tool_hints(tool_filter, workflow_mode=normalized_mode)
     if benchmark_mode:
-        benchmark_mcp_toolset = create_mcp_toolset(tool_filter=base_tool_hints)
-        benchmark_tools: list[Any] = []
-        if use_execution_skills:
-            _, execution_skill_toolset = create_execution_skill_toolset()
-            benchmark_tools.append(execution_skill_toolset)
-        if benchmark_mcp_toolset is not None:
-            benchmark_tools.append(benchmark_mcp_toolset)
-
-        benchmark_executor = LlmAgent(
-            name="benchmark_executor",
-            description=(
-                "Loop-based benchmark execution profile for direct biomedical "
-                "database question answering with retry/recovery behavior."
-            ),
-            model=runtime_model,
-            instruction=_build_benchmark_loop_instruction(base_tool_hints),
-            tools=benchmark_tools,
-            include_contents="none",
-            disallow_transfer_to_parent=True,
-            before_agent_callback=_benchmark_before_agent_callback,
-            before_model_callback=_benchmark_before_model_callback,
-            after_model_callback=_benchmark_after_model_callback,
-            on_model_error_callback=_on_model_error,
-            on_tool_error_callback=_on_tool_error,
+        use_execution_skills = (
+            DEFAULT_EXECUTION_SKILLS_ENABLED if execution_skills_enabled is None else bool(execution_skills_enabled)
         )
-        benchmark_loop = LoopAgent(
-            name="benchmark_loop",
-            sub_agents=[benchmark_executor],
-            max_iterations=BENCHMARK_LOOP_MAX_ITERATIONS,
+        return _create_benchmark_workflow_agent(
+            runtime_model=models.runtime_model,
+            base_tool_hints=base_tool_hints,
+            execution_skills_enabled=use_execution_skills,
         )
-        managed_toolsets = tuple(
-            toolset for toolset in (benchmark_mcp_toolset,) if toolset is not None
+    if normalized_mode == WORKFLOW_MODE_ANALYSIS:
+        return create_analysis_workflow_agent(
+            tool_filter=tool_filter,
+            model=model,
+            prefer_bigquery=prefer_bigquery,
+            planner_skills_enabled=planner_skills_enabled,
+            execution_skills_enabled=execution_skills_enabled,
+            require_plan_approval=require_plan_approval,
         )
-        return benchmark_loop, (ManagedMcpToolsets(managed_toolsets) if managed_toolsets else None)
-
-    executor_tool_filter: list[str] | ToolPredicate | None
-    if base_tool_hints:
-        executor_tool_filter = _ActiveStepToolPredicate(base_tool_hints)
-    else:
-        executor_tool_filter = []
-    executor_mcp_toolset = create_mcp_toolset(tool_filter=executor_tool_filter)
-    report_assistant_mcp_toolset = create_mcp_toolset(tool_filter=base_tool_hints)
-    executor_tools: list[McpToolset] = [executor_mcp_toolset] if executor_mcp_toolset is not None else []
-    report_assistant_mcp_tools: list[McpToolset] = (
-        [report_assistant_mcp_toolset] if report_assistant_mcp_toolset is not None else []
+    return create_report_workflow_agent(
+        tool_filter=tool_filter,
+        model=model,
+        prefer_bigquery=prefer_bigquery,
+        planner_skills_enabled=planner_skills_enabled,
+        execution_skills_enabled=execution_skills_enabled,
+        report_assistant_skills_enabled=report_assistant_skills_enabled,
+        require_plan_approval=require_plan_approval,
     )
-    planner_tools: list[Any] = []
-    workflow_lookup_tools: list[Any] = []
-    report_assistant_tools: list[Any] = []
-    if use_planner_skills:
-        _, planner_skill_toolset = create_planner_skill_toolset()
-        planner_tools = [planner_skill_toolset]
-    if use_execution_skills:
-        _, execution_skill_toolset = create_execution_skill_toolset()
-        workflow_lookup_tools.append(execution_skill_toolset)
-    if use_report_assistant_skills:
-        _, report_assistant_skill_toolset = create_report_assistant_skill_toolset()
-        report_assistant_tools.append(report_assistant_skill_toolset)
-    workflow_lookup_tools.extend(executor_tools)
-    report_assistant_tools.extend(report_assistant_mcp_tools)
-    if use_bigquery_priority:
-        base_hint_set = set(base_tool_hints)
-        prioritized_hints = [name for name in BQ_PRIORITY_TOOLS if name in base_hint_set]
-        prioritized_set = set(prioritized_hints)
-        prioritized_hints.extend([name for name in base_tool_hints if name not in prioritized_set])
-        executor_tool_hints = prioritized_hints
-    else:
-        executor_tool_hints = base_tool_hints
-
-    hitl_agent_gate = _hitl_skip_agent if require_plan_approval else None
-    synthesizer_instruction = SYNTHESIZER_INSTRUCTION
-    synthesizer_tools: list[Any] = []
-    if analysis_mode:
-        synthesizer_instruction = f"{SYNTHESIZER_INSTRUCTION.rstrip()}\n\n{ANALYSIS_VISUALIZATION_POLICY.strip()}"
-        synthesizer_tools = [FunctionTool(store_dataset_visualizations)]
-
-    # ── Research workflow agents (plan → execute → synthesize) ────────────
-
-    planner = LlmAgent(
-        name="planner",
-        model=planner_model,
-        instruction=_build_planner_instruction(
-            executor_tool_hints,
-            prefer_bigquery=use_bigquery_priority,
-            planner_skills_enabled=use_planner_skills,
-            workflow_mode=normalized_mode,
-        ),
-        tools=planner_tools,
-        disallow_transfer_to_parent=True,
-        before_model_callback=_make_planner_before_model_callback(
-            require_approval=require_plan_approval,
-            model_name=planner_model,
-        ),
-        after_model_callback=_make_planner_after_model_callback(
-            require_approval=require_plan_approval,
-        ),
-        on_model_error_callback=_on_model_error,
-    )
-    step_executor = LlmAgent(
-        name="step_executor",
-        model=runtime_model,
-        instruction=_build_step_executor_instruction_for_mode(
-            executor_tool_hints,
-            prefer_bigquery=use_bigquery_priority,
-            workflow_mode=normalized_mode,
-        ),
-        tools=workflow_lookup_tools,
-        include_contents="none",
-        before_agent_callback=_react_skip_if_done,
-        before_model_callback=_react_before_model_callback,
-        after_model_callback=_react_after_model_callback,
-        on_model_error_callback=_on_model_error,
-        on_tool_error_callback=_on_tool_error,
-    )
-    react_loop = LoopAgent(
-        name="react_loop",
-        sub_agents=[step_executor],
-        max_iterations=25,
-        before_agent_callback=hitl_agent_gate,
-    )
-    report_synthesizer = LlmAgent(
-        name="report_synthesizer",
-        model=synthesizer_model,
-        instruction=synthesizer_instruction,
-        tools=synthesizer_tools,
-        include_contents="none",
-        before_agent_callback=hitl_agent_gate,
-        before_model_callback=_synth_before_model_callback,
-        after_model_callback=_synth_after_model_callback,
-        on_model_error_callback=_on_model_error,
-    )
-
-    research_workflow = SequentialAgent(
-        name="research_workflow",
-        description=(
-            "Full research pipeline: plans an investigation, gathers evidence "
-            "from biomedical databases and APIs, and produces a formal report "
-            "with citations. Also handles workflow commands (approve, continue, "
-            "finalize, revise, history, rollback, switch)."
-        ),
-        sub_agents=[planner, react_loop, report_synthesizer],
-    )
-
-    # ── Lightweight specialist agents ─────────────────────────────────────
-
-    general_qa = LlmAgent(
-        name="general_qa",
-        description=(
-            "Answers factual biomedical questions directly from knowledge. "
-            "No database lookups or tool calls needed."
-        ),
-        model=runtime_model,
-        instruction=GENERAL_QA_INSTRUCTION,
-        tools=[],
-        disallow_transfer_to_parent=True,
-        on_model_error_callback=_on_model_error,
-    )
-
-    clarifier = LlmAgent(
-        name="clarifier",
-        description=(
-            "Asks the user to clarify vague, ambiguous, incomplete, or "
-            "nonsensical queries before proceeding."
-        ),
-        model=runtime_model,
-        instruction=CLARIFIER_INSTRUCTION,
-        tools=[],
-        disallow_transfer_to_parent=True,
-        on_model_error_callback=_on_model_error,
-    )
-
-    report_assistant = LlmAgent(
-        name="report_assistant",
-        description=(
-            "Helps with an existing research report: answers questions about "
-            "findings, restructures sections, and performs light follow-up "
-            "lookups using biomedical tools. Only available after a report "
-            "has been produced."
-        ),
-        model=runtime_model,
-        instruction=REPORT_ASSISTANT_INSTRUCTION,
-        tools=report_assistant_tools,
-        disallow_transfer_to_parent=True,
-        before_model_callback=_report_assistant_before_model_callback,
-        after_model_callback=_report_assistant_after_model_callback,
-        on_model_error_callback=_on_model_error,
-        on_tool_error_callback=_on_tool_error,
-    )
-
-    # ── Intent router (root agent) ────────────────────────────────────────
-
-    router = LlmAgent(
-        name="co_scientist_router",
-        description="AI Co-Scientist: biomedical research assistant with intent routing.",
-        model=router_model,
-        instruction=ROUTER_INSTRUCTION,
-        sub_agents=[general_qa, clarifier, report_assistant, research_workflow],
-        before_model_callback=_router_before_model_callback,
-        on_model_error_callback=_on_model_error,
-    )
-
-    managed_toolsets = tuple(
-        toolset
-        for toolset in (executor_mcp_toolset, report_assistant_mcp_toolset)
-        if toolset is not None
-    )
-    return router, (ManagedMcpToolsets(managed_toolsets) if managed_toolsets else None)
 
 
 __all__ = [
+    "build_analysis_tool_profile",
+    "build_report_tool_profile",
+    "create_analysis_workflow_agent",
     "create_mcp_toolset",
+    "create_report_workflow_agent",
     "create_workflow_agent",
 ]

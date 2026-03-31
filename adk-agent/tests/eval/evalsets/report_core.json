@@ -1,0 +1,91 @@
+{
+  "eval_set_id": "co_scientist_report_core",
+  "name": "AI Co-Scientist Report Core",
+  "description": "Minimal report-mode behavior checks for direct answers, clarification, and plan generation.",
+  "eval_cases": [
+    {
+      "eval_id": "report_general_qa_crispr",
+      "conversation": [
+        {
+          "invocation_id": "inv_1",
+          "user_content": {
+            "parts": [
+              {
+                "text": "What is CRISPR?"
+              }
+            ]
+          },
+          "final_response": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "CRISPR is a genome editing system derived from bacterial adaptive immunity that uses guide RNAs and nuclease proteins such as Cas enzymes to target DNA."
+              }
+            ]
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "eval_user",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "report_clarifier_underspecified_request",
+      "conversation": [
+        {
+          "invocation_id": "inv_1",
+          "user_content": {
+            "parts": [
+              {
+                "text": "Can you evaluate it for me?"
+              }
+            ]
+          },
+          "final_response": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "The request is underspecified, so the assistant should ask a clarifying question about the target, disease, modality, or comparison the user wants evaluated."
+              }
+            ]
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "eval_user",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "report_plan_lrrk2_parkinsons",
+      "conversation": [
+        {
+          "invocation_id": "inv_1",
+          "user_content": {
+            "parts": [
+              {
+                "text": "Evaluate LRRK2 as a therapeutic target for Parkinson disease."
+              }
+            ]
+          },
+          "final_response": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "The assistant should present a markdown research plan for evaluating LRRK2 in Parkinson disease and end by asking the user to approve or revise the plan before execution."
+              }
+            ]
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist",
+        "user_id": "eval_user",
+        "state": {}
+      }
+    }
+  ]
+}

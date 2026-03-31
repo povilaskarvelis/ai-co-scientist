@@ -1513,7 +1513,23 @@ async function fetchWithRetry(url, options = {}) {
 
 async function fetchJsonWithRetry(url, options = {}) {
   const response = await fetchWithRetry(url, options);
-  return response.json();
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    const normalized = normalizeWhitespace(text);
+    if (
+      normalized.startsWith("fwrite(): Write of")
+      && normalized.includes("No space left on device")
+    ) {
+      throw new Error(
+        `Upstream service returned a server warning instead of JSON: ${normalized.slice(0, 220)}`
+      );
+    }
+    throw new Error(
+      `Invalid JSON payload received${normalized ? `: ${normalized.slice(0, 220)}` : ""}`
+    );
+  }
 }
 
 async function fetchBufferWithRetry(url, options = {}) {

@@ -11,6 +11,8 @@ for _env_name in ("AI_CO_SCIENTIST_POSTGRES_DSN", "POSTGRES_DSN", "DATABASE_URL"
 import co_scientist.workflow as workflow
 import ui_server
 from co_scientist.workflow import (
+    STATE_ANALYSIS_NOTEBOOK,
+    STATE_ANALYSIS_WORKSPACE,
     STATE_EXECUTOR_ACTIVE_STEP_ID,
     STATE_EXECUTOR_LAST_ERROR,
     STATE_PLAN_PENDING_APPROVAL,
@@ -96,6 +98,8 @@ def _sample_graph_task_state() -> dict:
 def test_extract_persistable_session_state_filters_transient_keys():
     payload = {
         STATE_WORKFLOW_TASK: {"objective": "Test"},
+        STATE_ANALYSIS_NOTEBOOK: {"schema": "analysis_notebook.v1", "workspace_revision": 1},
+        STATE_ANALYSIS_WORKSPACE: {"schema": "analysis_workspace.v1", "conversation_id": "conv_test"},
         STATE_PRIOR_RESEARCH: [{"objective": "Earlier"}],
         STATE_PLAN_PENDING_APPROVAL: True,
         "temp:executor_buffer": "ignore me",
@@ -105,6 +109,8 @@ def test_extract_persistable_session_state_filters_transient_keys():
 
     assert extracted == {
         STATE_WORKFLOW_TASK: {"objective": "Test"},
+        STATE_ANALYSIS_NOTEBOOK: {"schema": "analysis_notebook.v1", "workspace_revision": 1},
+        STATE_ANALYSIS_WORKSPACE: {"schema": "analysis_workspace.v1", "conversation_id": "conv_test"},
         STATE_PRIOR_RESEARCH: [{"objective": "Earlier"}],
         STATE_PLAN_PENDING_APPROVAL: True,
     }
@@ -185,6 +191,44 @@ def test_extract_tool_error_metrics_from_function_response():
     }
 
 
+def test_notebook_synthesizer_tool_outcome_surfaces_notebook_events():
+    response = SimpleNamespace(
+        name="store_dataset_catalog",
+        response={
+            "ok": True,
+            "message": "Appended dataset comparison cell with 2 datasets.",
+            "summary_cards": {"dataset_count": 2, "dimension_count": 3},
+        },
+    )
+
+    event = ui_server._notebook_synthesizer_tool_outcome(
+        response,
+        author="analysis_notebook_synthesizer",
+    )
+
+    assert event is not None
+    assert event["event_type"] == "notebook.tool.completed"
+    assert event["status"] == "done"
+    assert "2 datasets" in event["human_line"]
+
+
+def test_notebook_synthesizer_tool_outcome_surfaces_notebook_failures():
+    response = SimpleNamespace(
+        name="store_dataset_catalog",
+        response={"ok": False, "message": "Need at least two comparison dimensions."},
+    )
+
+    event = ui_server._notebook_synthesizer_tool_outcome(
+        response,
+        author="analysis_notebook_synthesizer",
+    )
+
+    assert event is not None
+    assert event["event_type"] == "tool.failed"
+    assert event["status"] == "error"
+    assert "Need at least two comparison dimensions" in event["human_line"]
+
+
 def test_derive_run_error_message_strips_markdown_noise():
     message = ui_server._derive_run_error_message(
         "## Execution Error\n\nVertex AI quota or rate limit exhausted.\n\n`429 RESOURCE_EXHAUSTED`",
@@ -255,6 +299,7 @@ async def test_get_or_create_session_rehydrates_persisted_state(runtime):
         task_id="task_rehydrate",
         state={
             STATE_WORKFLOW_TASK: {"objective": "Restore me", "steps": []},
+            STATE_ANALYSIS_WORKSPACE: {"schema": "analysis_workspace.v1", "conversation_id": "conv_rehydrate"},
             STATE_PRIOR_RESEARCH: [{"objective": "Previous iteration"}],
             STATE_PLAN_PENDING_APPROVAL: True,
             "temp:co_scientist_executor_buffer": "discard",
@@ -270,9 +315,317 @@ async def test_get_or_create_session_rehydrates_persisted_state(runtime):
 
     assert session is not None
     assert session.state[STATE_WORKFLOW_TASK]["objective"] == "Restore me"
+    assert session.state[STATE_ANALYSIS_WORKSPACE]["conversation_id"] == "conv_rehydrate"
     assert session.state[STATE_PRIOR_RESEARCH] == [{"objective": "Previous iteration"}]
     assert session.state[STATE_PLAN_PENDING_APPROVAL] is True
     assert "temp:co_scientist_executor_buffer" not in session.state
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_session_initializes_analysis_workspace(runtime):
+    cs = await runtime._get_or_create_session("conv_analysis_workspace", mode="analysis")
+    session = await runtime.session_service.get_session(
+        app_name=cs.app_name,
+        user_id=runtime.user_id,
+        session_id=cs.session_id,
+    )
+
+    assert session is not None
+    assert session.state[STATE_ANALYSIS_WORKSPACE]["schema"] == "analysis_workspace.v1"
+    assert session.state[STATE_ANALYSIS_WORKSPACE]["conversation_id"] == "conv_analysis_workspace"
+
+
+@pytest.mark.asyncio
+async def test_get_conversation_analysis_workspace_returns_workspace(runtime):
+    task = ui_server._make_task(
+        "task_analysis_workspace",
+        "Compare public datasets",
+        "conv_analysis_workspace_read",
+        mode="analysis",
+    )
+    task["analysis_cell_ids"] = ["cell_123"]
+    runtime.store.save_task(task)
+    runtime.store.save_workflow_session(
+        "conv_analysis_workspace_read",
+        task_id="task_analysis_workspace",
+        state={
+            STATE_ANALYSIS_WORKSPACE: {
+                "schema": "analysis_workspace.v1",
+                "conversation_id": "conv_analysis_workspace_read",
+                "mode": "analysis",
+                "title": "Open Data Analysis",
+                "revision": 4,
+                "selected_dataset_id": "nemar:nm000104",
+                "datasets": {
+                    "nemar:nm000104": {
+                        "dataset_id": "nemar:nm000104",
+                        "source": "NEMAR",
+                        "accession": "nm000104",
+                        "label": "NEMAR nm000104",
+                        "tags": ["EEG"],
+                        "latest_artifact_ids": {},
+                    }
+                },
+                "artifacts": {},
+                "cells": [],
+                "operations": [],
+            }
+        },
+    )
+
+    payload = await runtime.get_conversation_analysis_workspace("conv_analysis_workspace_read")
+
+    assert payload is not None
+    assert payload["mode"] == "analysis"
+    assert payload["workspace"]["selected_dataset_id"] == "nemar:nm000104"
+
+
+@pytest.mark.asyncio
+async def test_get_conversation_analysis_notebook_returns_notebook(runtime):
+    task = ui_server._make_task(
+        "task_analysis_notebook",
+        "Compare public datasets",
+        "conv_analysis_notebook_read",
+        mode="analysis",
+    )
+    runtime.store.save_task(task)
+    runtime.store.save_workflow_session(
+        "conv_analysis_notebook_read",
+        task_id="task_analysis_notebook",
+        state={
+            STATE_ANALYSIS_WORKSPACE: {
+                "schema": "analysis_workspace.v1",
+                "conversation_id": "conv_analysis_notebook_read",
+                "mode": "analysis",
+                "title": "Open Data Analysis",
+                "revision": 3,
+                "selected_dataset_id": "openneuro:ds001461",
+                "datasets": {
+                    "openneuro:ds001461": {
+                        "dataset_id": "openneuro:ds001461",
+                        "source": "OpenNeuro",
+                        "accession": "ds001461",
+                        "label": "OpenNeuro ds001461",
+                        "tags": ["MRI", "rsfMRI"],
+                        "latest_artifact_ids": {},
+                    }
+                },
+                "artifacts": {
+                    "artifact_1": {
+                        "artifact_id": "artifact_1",
+                        "type": "dataset_catalog",
+                        "schema": "dataset_catalog.v1",
+                        "title": "Reusable schizophrenia datasets",
+                        "summary": "Shortlist reusable schizophrenia datasets.",
+                        "payload": {
+                            "summary": "Shortlist reusable schizophrenia datasets.",
+                            "dimensions": [
+                                {"key": "sample_scale", "label": "Sample scale"},
+                                {"key": "metadata_richness", "label": "Metadata richness"},
+                            ],
+                            "datasets": [
+                                {
+                                    "dataset_id": "openneuro:ds001461",
+                                    "dataset_label": "OpenNeuro ds001461",
+                                    "source": "OpenNeuro",
+                                    "accession": "ds001461",
+                                    "overall_score": 4.7,
+                                    "metrics": {"subject_count": 81},
+                                    "tags": ["MRI", "rsfMRI"],
+                                    "notes": "Resting-state schizophrenia cohort.",
+                                },
+                                {
+                                    "dataset_id": "openneuro:ds004302",
+                                    "dataset_label": "OpenNeuro ds004302",
+                                    "source": "OpenNeuro",
+                                    "accession": "ds004302",
+                                    "overall_score": 4.3,
+                                    "metrics": {"subject_count": 71},
+                                    "tags": ["MRI"],
+                                    "notes": "Speech-perception schizophrenia cohort.",
+                                },
+                            ],
+                            "visualizations": {
+                                "rows": [
+                                    {
+                                        "dataset_label": "OpenNeuro ds001461",
+                                        "short_label": "ds001461",
+                                        "source": "OpenNeuro",
+                                        "accession": "ds001461",
+                                        "overall_score": 4.7,
+                                        "metrics": {"subject_count": 81},
+                                        "tags": ["MRI", "rsfMRI"],
+                                        "notes": "Resting-state schizophrenia cohort.",
+                                    },
+                                    {
+                                        "dataset_label": "OpenNeuro ds004302",
+                                        "short_label": "ds004302",
+                                        "source": "OpenNeuro",
+                                        "accession": "ds004302",
+                                        "overall_score": 4.3,
+                                        "metrics": {"subject_count": 71},
+                                        "tags": ["MRI"],
+                                        "notes": "Speech-perception schizophrenia cohort.",
+                                    },
+                                ]
+                            },
+                            "notes": ["Auto-generated comparison."],
+                            "warnings": [],
+                        },
+                    }
+                },
+                "cells": [
+                    {
+                        "cell_id": "cell_1",
+                        "type": "dataset_comparison",
+                        "task_id": "task_analysis_notebook",
+                        "created_at": "2026-03-29T00:00:00Z",
+                        "title": "Reusable schizophrenia datasets",
+                        "artifact_id": "artifact_1",
+                    }
+                ],
+                "operations": [],
+            }
+        },
+    )
+
+    payload = await runtime.get_conversation_analysis_notebook("conv_analysis_notebook_read")
+
+    assert payload is not None
+    assert payload["schema"] == "analysis_notebook.v1"
+    assert payload["download_path"].endswith("/analysis-notebook.ipynb")
+    assert any(cell["cell_type"] == "code" for cell in payload["notebook"]["cells"])
+    ipynb_text = ui_server.serialize_notebook_ipynb({"notebook": payload["notebook"]})
+    assert '"nbformat": 4' in ipynb_text
+
+
+@pytest.mark.asyncio
+async def test_get_conversation_analysis_workspace_recovers_cells_from_saved_tasks(runtime):
+    task = ui_server._make_task(
+        "task_analysis_recover",
+        "Compare reusable schizophrenia datasets",
+        "conv_analysis_workspace_recover",
+        mode="analysis",
+    )
+    task["report_markdown"] = "## Summary\n\nRecovered notebook note."
+    task["dataset_visualizations"] = {
+        "schema": "dataset_visualizations.v1",
+        "objective": "Compare reusable schizophrenia datasets",
+        "summary": "Shortlist reusable public datasets.",
+        "rows": [
+            {
+                "dataset_label": "OpenNeuro ds001461",
+                "source": "OpenNeuro",
+                "accession": "ds001461",
+                "overall_score": 4.6,
+                "scores": {"disease_match": 4.8, "metadata_richness": 4.3},
+                "metrics": {"subject_count": 81},
+                "tags": ["MRI", "rsfMRI"],
+            },
+            {
+                "dataset_label": "OpenNeuro ds004302",
+                "source": "OpenNeuro",
+                "accession": "ds004302",
+                "overall_score": 4.2,
+                "scores": {"disease_match": 4.5, "metadata_richness": 4.1},
+                "metrics": {"subject_count": 71},
+                "tags": ["MRI"],
+            },
+        ],
+        "dimensions": [
+            {"key": "disease_match", "label": "Disease match"},
+            {"key": "metadata_richness", "label": "Metadata richness"},
+        ],
+        "summary_cards": {
+            "dataset_count": 2,
+            "dimension_count": 2,
+            "source_count": 1,
+            "top_dataset": "OpenNeuro ds001461",
+            "top_score": 4.6,
+        },
+        "charts": {"bar": {"score_key": "overall_score"}},
+        "notes": ["Recovered from saved task output."],
+    }
+    runtime.store.save_task(task)
+    runtime.store.save_workflow_session(
+        "conv_analysis_workspace_recover",
+        task_id="task_analysis_recover",
+        state={
+            STATE_ANALYSIS_WORKSPACE: {
+                "schema": "analysis_workspace.v1",
+                "conversation_id": "conv_analysis_workspace_recover",
+                "mode": "analysis",
+                "title": "Open Data Analysis",
+                "revision": 0,
+                "selected_dataset_id": None,
+                "datasets": {},
+                "artifacts": {},
+                "cells": [],
+                "operations": [],
+            }
+        },
+    )
+
+    payload = await runtime.get_conversation_analysis_workspace("conv_analysis_workspace_recover")
+
+    assert payload is not None
+    cell_types = [cell["type"] for cell in payload["workspace"]["cells"]]
+    assert "dataset_comparison" in cell_types
+    assert "analysis_note" in cell_types
+
+    stored_task = runtime.store.get_task("task_analysis_recover")
+    assert stored_task is not None
+    assert stored_task["analysis_cell_ids"]
+
+
+@pytest.mark.asyncio
+async def test_set_conversation_selected_dataset_updates_workspace_and_task_snapshot(runtime):
+    await runtime._get_or_create_session("conv_analysis_select", mode="analysis")
+    task = ui_server._make_task(
+        "task_analysis_select",
+        "Compare public datasets",
+        "conv_analysis_select",
+        mode="analysis",
+    )
+    runtime.store.save_task(task)
+    runtime.store.save_workflow_session(
+        "conv_analysis_select",
+        task_id="task_analysis_select",
+        state={
+            STATE_ANALYSIS_WORKSPACE: {
+                "schema": "analysis_workspace.v1",
+                "conversation_id": "conv_analysis_select",
+                "mode": "analysis",
+                "title": "Open Data Analysis",
+                "revision": 2,
+                "selected_dataset_id": None,
+                "datasets": {
+                    "nemar:nm000104": {
+                        "dataset_id": "nemar:nm000104",
+                        "source": "NEMAR",
+                        "accession": "nm000104",
+                        "label": "NEMAR nm000104",
+                        "tags": ["EEG"],
+                        "latest_artifact_ids": {},
+                    }
+                },
+                "artifacts": {},
+                "cells": [],
+                "operations": [],
+            }
+        },
+    )
+
+    payload = await runtime.set_conversation_selected_dataset("conv_analysis_select", "nemar:nm000104")
+
+    stored_task = runtime.store.get_task("task_analysis_select")
+    assert payload is not None
+    assert payload["selected_dataset_id"] == "nemar:nm000104"
+    assert stored_task is not None
+    assert stored_task["selected_dataset_id_snapshot"] == "nemar:nm000104"
+    notebook_payload = await runtime.get_conversation_analysis_notebook("conv_analysis_select")
+    assert notebook_payload is not None
+    assert isinstance(notebook_payload["notebook"], dict)
 
 
 @pytest.mark.asyncio

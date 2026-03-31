@@ -1,0 +1,63 @@
+{
+  "eval_set_id": "co_scientist_analysis_core",
+  "name": "AI Co-Scientist Analysis Core",
+  "description": "Minimal analysis-mode behavior checks for dataset-oriented planning and clarification.",
+  "eval_cases": [
+    {
+      "eval_id": "analysis_clarifier_missing_dataset_context",
+      "conversation": [
+        {
+          "invocation_id": "inv_1",
+          "user_content": {
+            "parts": [
+              {
+                "text": "Run an analysis on this dataset."
+              }
+            ]
+          },
+          "final_response": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "The assistant should ask for the dataset identity, modality, or repository details before proposing an analysis workflow."
+              }
+            ]
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist_analysis",
+        "user_id": "eval_user",
+        "state": {}
+      }
+    },
+    {
+      "eval_id": "analysis_plan_public_fmri_dataset",
+      "conversation": [
+        {
+          "invocation_id": "inv_1",
+          "user_content": {
+            "parts": [
+              {
+                "text": "Help me find a public fMRI dataset for depression and outline how you would quality-check and preprocess it."
+              }
+            ]
+          },
+          "final_response": {
+            "role": "model",
+            "parts": [
+              {
+                "text": "The assistant should propose an analysis-oriented plan that includes dataset discovery, modality-aware QC and preprocessing steps, reproducible execution expectations, and an approval or next-step prompt rather than pretending the work is already done."
+              }
+            ]
+          }
+        }
+      ],
+      "session_input": {
+        "app_name": "co_scientist_analysis",
+        "user_id": "eval_user",
+        "state": {}
+      }
+    }
+  ]
+}

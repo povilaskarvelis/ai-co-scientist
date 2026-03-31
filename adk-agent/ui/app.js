@@ -26,6 +26,7 @@ const state = {
   debugByTaskId: {},
   graphByTaskId: {},
   visualsByTaskId: {},
+  analysisWorkspaceByConversationId: {},
   graphSearchByTaskId: {},
   graphSelectionByTaskId: {},
   graphCy: null,
@@ -34,6 +35,7 @@ const state = {
   activityExpandedByTask: {},
   handlingTerminalRunIds: new Set(),
   startingTaskIds: new Set(),
+  pendingAnalysisScrollTaskId: "",
 };
 
 const el = {
@@ -452,7 +454,9 @@ function renderModePicker() {
     el.modePicker.classList.toggle("hidden", !showModePicker);
     el.modePicker.querySelectorAll("[data-mode]").forEach((card) => {
       const mode = normalizeTaskMode(card.dataset.mode || "");
-      card.classList.toggle("active", mode === currentConversationMode());
+      const isActive = mode === currentConversationMode();
+      card.classList.toggle("active", isActive);
+      card.setAttribute("aria-pressed", isActive ? "true" : "false");
     });
   }
   if (el.exampleQueriesLabel) {
@@ -583,7 +587,27 @@ function reportCardHtml(iteration) {
   const task = iteration?.task || {};
   const report = iteration?.report || {};
   const taskId = String(task.task_id || "");
-  if (!taskId || !report.has_report) return "";
+  const mode = normalizeTaskMode(task.mode || report.mode || "");
+  const hasAnalysisCells = Boolean(iteration?.analysis?.has_cells || task?.has_analysis_cells);
+  if (!taskId) return "";
+  if (mode === "analysis") {
+    if (!hasAnalysisCells) return "";
+    const isActive = String(state.selectedReportTaskId || "") === taskId;
+    const branchLabel = String(iteration?.branch_label || "").trim();
+    const cellCount = Number((iteration?.analysis?.cell_ids || []).length || 0);
+    return `
+      <article class="message assistant report-card ${isActive ? "active" : ""}" data-action="open-report" data-task-id="${escapeHtml(taskId)}" role="button" tabindex="0">
+        <div class="report-card-head">
+          <strong>Analysis ${Number(iteration?.iteration_index || 0) || 1}</strong>
+          <span>${escapeHtml(formatDate(task.updated_at))}</span>
+        </div>
+        <div class="report-card-title">${escapeHtml(String(task.title || task.user_query || "Analysis step"))}</div>
+        <div class="report-card-meta">${escapeHtml(`${cellCount} notebook cell${cellCount === 1 ? "" : "s"}`)}</div>
+        ${branchLabel ? `<div class="branch-badge">${escapeHtml(branchLabel)}</div>` : ""}
+      </article>
+    `;
+  }
+  if (!report.has_report) return "";
   const isActive = String(state.selectedReportTaskId || "") === taskId;
   const branchLabel = String(iteration?.branch_label || "").trim();
   return `
@@ -601,6 +625,7 @@ function reportCardHtml(iteration) {
 function followUpSuggestionsHtml(iteration) {
   if (iteration?.is_direct_response) return "";
   const task = iteration?.task || {};
+  if (normalizeTaskMode(task.mode || iteration?.report?.mode || "") === "analysis") return "";
   if (String(task.status || "") !== "completed") return "";
   const report = iteration?.report || {};
   if (!report.has_report) return "";
@@ -690,6 +715,19 @@ function collectActivitySources(step) {
   return sources;
 }
 
+function renderActivityToolsInvokedHtml(toolsCalled) {
+  const items = (Array.isArray(toolsCalled) ? toolsCalled : [])
+    .map((t) => String(t || "").trim())
+    .filter(Boolean);
+  if (!items.length) return "";
+  return `
+    <div class="activity-log-step-section is-tools-invoked">
+      <div class="activity-log-step-label">Tools invoked</div>
+      <pre class="activity-log-tools-pre">${escapeHtml(items.join("\n"))}</pre>
+    </div>
+  `;
+}
+
 function renderActivitySectionHtml(label, items = [], extraClass = "") {
   const lines = (Array.isArray(items) ? items : []).filter(Boolean);
   if (!lines.length) return "";
@@ -759,6 +797,7 @@ function buildActivityDetailsHtml(stepDetails = []) {
             </div>
             <div class="activity-log-step-body">
               ${renderActivitySectionHtml("Summary", summaryLines, "is-summary")}
+              ${renderActivityToolsInvokedHtml(step?.tools_called)}
               ${renderActivitySectionHtml("Activity", toolLines)}
               ${renderActivitySectionHtml("Evidence", evidenceIds)}
               ${renderActivitySectionHtml("Open questions", openGaps)}
@@ -1283,6 +1322,26 @@ function currentGraphTaskId() {
 
 function currentVisualsTaskId() {
   return currentDebugTaskId();
+}
+
+function currentAnalysisWorkspaceEntry() {
+  const conversationId = String(state.selectedConversationId || "").trim();
+  if (!conversationId) return null;
+  return state.analysisWorkspaceByConversationId[conversationId] || null;
+}
+
+function currentAnalysisWorkspace() {
+  return currentAnalysisWorkspaceEntry()?.data?.workspace || null;
+}
+
+function analysisCellById(workspace, cellId) {
+  const cells = Array.isArray(workspace?.cells) ? workspace.cells : [];
+  return cells.find((cell) => String(cell?.cell_id || "") === String(cellId || "")) || null;
+}
+
+function analysisFirstCellForTask(workspace, taskId) {
+  const cells = Array.isArray(workspace?.cells) ? workspace.cells : [];
+  return cells.find((cell) => String(cell?.task_id || "") === String(taskId || "")) || null;
 }
 
 function destroyGraphInstance() {
@@ -2641,6 +2700,536 @@ function datasetVisualizationsHtml(payload) {
   `;
 }
 
+function analysisWorkspaceStateHtml(title, message, kind = "empty") {
+  return `
+    <div class="analysis-empty analysis-empty-${escapeHtml(kind)}">
+      <h4>${escapeHtml(title)}</h4>
+      <p>${escapeHtml(message)}</p>
+    </div>
+  `;
+}
+
+function analysisNotebookValueHtml(value) {
+  if (Array.isArray(value)) {
+    const items = value.map((item) => escapeHtml(String(item || ""))).filter(Boolean);
+    if (!items.length) return '<span class="analysis-value-muted">Not provided</span>';
+    return items.map((item) => `<span class="analysis-chip">${item}</span>`).join("");
+  }
+  const text = String(value ?? "").trim();
+  return text ? escapeHtml(text) : '<span class="analysis-value-muted">Not provided</span>';
+}
+
+function analysisMetadataSectionHtml(title, payload, { allowChips = false } = {}) {
+  const entries = Object.entries(payload && typeof payload === "object" ? payload : {})
+    .filter(([, value]) => {
+      if (Array.isArray(value)) return value.length > 0;
+      return String(value ?? "").trim().length > 0;
+    });
+  if (!entries.length) return "";
+  return `
+    <section class="analysis-metadata-section">
+      <div class="analysis-metadata-title">${escapeHtml(title)}</div>
+      <div class="analysis-metadata-table">
+        ${entries.map(([key, value]) => `
+          <div class="analysis-metadata-row">
+            <div class="analysis-metadata-key">${escapeHtml(key.replace(/_/g, " "))}</div>
+            <div class="analysis-metadata-value ${allowChips && Array.isArray(value) ? "analysis-metadata-value-chips" : ""}">${analysisNotebookValueHtml(value)}</div>
+          </div>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function analysisComparisonDatasetListHtml(datasets = []) {
+  const rows = Array.isArray(datasets) ? datasets : [];
+  if (!rows.length) return "";
+  return `
+    <section class="analysis-comparison-list">
+      <div class="analysis-cell-subtitle">Shortlist</div>
+      <div class="analysis-table-shell">
+        <table class="analysis-table">
+          <thead>
+            <tr>
+              <th>Dataset</th>
+              <th>Accession</th>
+              <th>Subjects</th>
+              <th>Score</th>
+              <th>Notes</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.slice(0, 12).map((dataset) => {
+              const datasetId = String(dataset?.dataset_id || "").trim();
+              const notes = String(dataset?.notes || "").trim();
+              const tags = Array.isArray(dataset?.tags) ? dataset.tags : [];
+              const subjectCount = dataset?.metrics?.subject_count;
+              return `
+                <tr>
+                  <td>
+                    <div class="analysis-table-title">${escapeHtml(dataset?.dataset_label || "")}</div>
+                    ${tags.length ? `<div class="analysis-table-tags">${tags.map((tag) => `<span class="analysis-chip">${escapeHtml(String(tag || ""))}</span>`).join("")}</div>` : ""}
+                  </td>
+                  <td>${escapeHtml([dataset?.source, dataset?.accession].filter(Boolean).join(" • "))}</td>
+                  <td>${subjectCount != null && subjectCount !== "" ? escapeHtml(String(subjectCount)) : '<span class="analysis-value-muted">n/a</span>'}</td>
+                  <td>${dataset?.overall_score != null ? `<span class="visual-score-pill">${escapeHtml(Number(dataset.overall_score || 0).toFixed(2))}/5</span>` : '<span class="analysis-value-muted">n/a</span>'}</td>
+                  <td>${notes ? escapeHtml(notes) : '<span class="analysis-value-muted">No note</span>'}</td>
+                  <td>${datasetId ? `<button class="ghost-btn" type="button" data-action="select-analysis-dataset" data-dataset-id="${escapeHtml(datasetId)}">Select</button>` : ""}</td>
+                </tr>
+              `;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function analysisIterationForTask(taskId) {
+  const detail = state.selectedConversationDetail;
+  if (!detail) return null;
+  return findIteration(detail, taskId);
+}
+
+function analysisNotebookPromptHtml(taskId) {
+  const iteration = analysisIterationForTask(taskId);
+  const task = iteration?.task || {};
+  const prompt = String(task?.user_query || task?.objective || "").trim();
+  if (!prompt) return "";
+  return `
+    <section class="analysis-notebook-block is-input">
+      <div class="analysis-notebook-block-label">In</div>
+      <pre class="analysis-notebook-input">${escapeHtml(prompt)}</pre>
+    </section>
+  `;
+}
+
+function analysisNotebookExecutionHtml(taskId) {
+  const iteration = analysisIterationForTask(taskId);
+  const steps = Array.isArray(iteration?.task?.steps) ? iteration.task.steps : [];
+  const visibleSteps = steps.filter((step) => String(step?.status || "pending").trim() !== "pending");
+  if (!visibleSteps.length) return "";
+  return `
+    <section class="analysis-notebook-block is-trace">
+      <div class="analysis-notebook-block-label">Trace</div>
+      <p class="analysis-notebook-hint">Agent execution trace for this cell.</p>
+      ${buildActivityDetailsHtml(visibleSteps)}
+    </section>
+  `;
+}
+
+function analysisMetadataMetricNumber(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const match = text.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const parsed = Number(match[0]);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function analysisMetadataVisualHtml(payload) {
+  const metricSpecs = [
+    {
+      label: "Subjects",
+      raw: payload?.subjects_sessions?.subject_count,
+    },
+    {
+      label: "Sessions",
+      raw: payload?.subjects_sessions?.session_count,
+    },
+    {
+      label: "Assets",
+      raw: payload?.access_download?.asset_count,
+    },
+  ];
+  const metrics = metricSpecs
+    .map((item) => {
+      const value = analysisMetadataMetricNumber(item.raw);
+      if (value == null) return null;
+      return {
+        label: item.label,
+        value,
+        display: Number.isInteger(value) ? String(value) : value.toFixed(1),
+      };
+    })
+    .filter(Boolean);
+
+  const chips = [];
+  const publicDownload = String(payload?.access_download?.public_download || "").trim();
+  const license = String(payload?.access_download?.license || "").trim();
+  const source = String(payload?.source || "").trim();
+  if (source) chips.push(source);
+  if (publicDownload) chips.push(`Public download: ${publicDownload}`);
+  if (license) chips.push(`License: ${license}`);
+
+  if (!metrics.length && !chips.length) return "";
+  const maxValue = Math.max(...metrics.map((metric) => Number(metric.value || 0)), 1);
+
+  return `
+    <section class="analysis-notebook-block is-output">
+      <div class="analysis-notebook-block-label">Visual summary</div>
+      ${chips.length ? `<div class="analysis-tag-row analysis-metadata-hero-tags">${chips.map((chip) => `<span class="analysis-chip">${escapeHtml(chip)}</span>`).join("")}</div>` : ""}
+      ${metrics.length ? `
+        <div class="analysis-metric-grid">
+          ${metrics.map((metric) => `
+            <div class="analysis-metric-card">
+              <div class="analysis-metric-head">
+                <span>${escapeHtml(metric.label)}</span>
+                <strong>${escapeHtml(metric.display)}</strong>
+              </div>
+              <div class="analysis-metric-bar">
+                <span style="width:${Math.max(16, Math.round((Number(metric.value || 0) / maxValue) * 100))}%"></span>
+              </div>
+            </div>
+          `).join("")}
+        </div>
+      ` : ""}
+    </section>
+  `;
+}
+
+function analysisNotebookDatasetComparisonCodeHtml(payload) {
+  const datasets = Array.isArray(payload?.datasets) ? payload.datasets : [];
+  const dims = Array.isArray(payload?.dimensions) ? payload.dimensions : [];
+  if (!datasets.length) return "";
+  const firstAccession = String(datasets[0]?.accession || "dsXXXXXX").trim();
+  const dimKeys = dims
+    .map((d) => String(d?.key || d?.label || "").trim())
+    .filter(Boolean);
+  const lines = [
+    "query = \"schizophrenia\"",
+    "datasets = search_openneuro_datasets(query=query)",
+    "records = [get_openneuro_dataset(ds_id) for ds_id in datasets]",
+    "",
+    "# normalized comparison axes",
+    `dimensions = ${JSON.stringify(dimKeys.length ? dimKeys : ["sample_scale", "metadata_richness", "access_readiness"])}`,
+    "",
+    "# preview",
+    `records[:${Math.min(datasets.length, 6)}]  # includes ${firstAccession}`,
+    "",
+    "# output below is rendered from stored notebook artifacts",
+  ];
+  return `
+    <section class="analysis-notebook-block is-input">
+      <div class="analysis-notebook-block-label">In</div>
+      <pre class="analysis-notebook-input">${escapeHtml(lines.join("\n"))}</pre>
+    </section>
+  `;
+}
+
+function analysisNotebookComparisonOutputHtml(payload) {
+  const bundle = payload?.visualizations || {};
+  const rows = Array.isArray(bundle?.rows) ? bundle.rows : [];
+  const notes = Array.isArray(bundle?.notes) ? bundle.notes : [];
+  const warnings = Array.isArray(bundle?.warnings) ? bundle.warnings : [];
+  if (!rows.length) {
+    return `
+      <section class="analysis-notebook-block is-output">
+        <div class="analysis-notebook-block-label">Out</div>
+        ${analysisComparisonDatasetListHtml(payload?.datasets || [])}
+      </section>
+    `;
+  }
+  return `
+    <section class="analysis-notebook-block is-output">
+      <div class="analysis-notebook-block-label">Out</div>
+      <div class="analysis-notebook-output-stack">
+        ${analysisComparisonDatasetListHtml(payload?.datasets || [])}
+        <section class="analysis-notebook-figure">
+          <div class="analysis-cell-subtitle">Overall ranking</div>
+          ${visualsBarChartSvg(rows, Number(bundle?.charts?.bar?.max_score || 5))}
+        </section>
+        <div class="analysis-notebook-chart-grid">
+          <section class="analysis-notebook-figure">
+            <div class="analysis-cell-subtitle">Heatmap</div>
+            ${visualsHeatmapHtml({ available: true, visualizations: bundle })}
+          </section>
+          <section class="analysis-notebook-figure">
+            <div class="analysis-cell-subtitle">Scatter</div>
+            ${visualsScatterPlotSvg({ available: true, visualizations: bundle })}
+          </section>
+        </div>
+        ${notes.length ? `<section class="analysis-notebook-figure"><div class="analysis-cell-subtitle">Notes</div><ul class="analysis-inline-list">${notes.map((note) => `<li>${escapeHtml(String(note || ""))}</li>`).join("")}</ul></section>` : ""}
+        ${warnings.length ? `<section class="analysis-notebook-figure is-warning"><div class="analysis-cell-subtitle">Warnings</div><ul class="analysis-inline-list">${warnings.map((warning) => `<li>${escapeHtml(String(warning || ""))}</li>`).join("")}</ul></section>` : ""}
+      </div>
+    </section>
+  `;
+}
+
+function analysisNotebookCellHtml(cell, artifact, workspace) {
+  const type = String(cell?.type || "").trim();
+  const taskId = String(cell?.task_id || "").trim();
+  const isFocused = taskId && taskId === String(state.selectedReportTaskId || "").trim();
+  const title = String(cell?.title || artifact?.title || "Notebook cell");
+  if (type === "dataset_comparison") {
+    const payload = artifact?.payload || {};
+    return `
+      <article class="analysis-cell ${isFocused ? "is-focused" : ""}" data-cell-id="${escapeHtml(cell?.cell_id || "")}" data-task-id="${escapeHtml(taskId)}">
+        <header class="analysis-cell-head">
+          <div>
+            <div class="analysis-cell-kicker">Dataset comparison</div>
+            <h4>${escapeHtml(title)}</h4>
+          </div>
+          <span class="analysis-cell-date">${escapeHtml(formatDate(cell?.created_at))}</span>
+        </header>
+        ${analysisNotebookPromptHtml(taskId)}
+        ${analysisNotebookExecutionHtml(taskId)}
+        ${analysisNotebookDatasetComparisonCodeHtml(payload)}
+        ${analysisNotebookComparisonOutputHtml(payload)}
+      </article>
+    `;
+  }
+  if (type === "dataset_metadata") {
+    const payload = artifact?.payload || {};
+    return `
+      <article class="analysis-cell ${isFocused ? "is-focused" : ""}" data-cell-id="${escapeHtml(cell?.cell_id || "")}" data-task-id="${escapeHtml(taskId)}">
+        <header class="analysis-cell-head">
+          <div>
+            <div class="analysis-cell-kicker">Dataset metadata</div>
+            <h4>${escapeHtml(title)}</h4>
+            <p class="analysis-cell-caption">${escapeHtml(String(payload?.summary || payload?.dataset_label || ""))}</p>
+          </div>
+          <span class="analysis-cell-date">${escapeHtml(formatDate(cell?.created_at))}</span>
+        </header>
+        ${analysisNotebookPromptHtml(taskId)}
+        ${analysisNotebookExecutionHtml(taskId)}
+        ${analysisMetadataVisualHtml(payload)}
+        <section class="analysis-notebook-block is-output">
+          <div class="analysis-notebook-block-label">Out</div>
+          <div class="analysis-metadata-grid">
+            ${analysisMetadataSectionHtml("Identity", payload?.identity || {})}
+            ${analysisMetadataSectionHtml("Access / Download", payload?.access_download || {})}
+            ${analysisMetadataSectionHtml("Subjects / Sessions", payload?.subjects_sessions || {})}
+            ${analysisMetadataSectionHtml("Modalities / Tasks", payload?.modalities_tasks || {}, { allowChips: true })}
+            ${analysisMetadataSectionHtml("Standards / File Formats", payload?.standards_file_formats || {}, { allowChips: true })}
+            ${analysisMetadataSectionHtml("Links / Publications", payload?.links_publications || {}, { allowChips: true })}
+          </div>
+          ${Array.isArray(payload?.source_raw_highlights) && payload.source_raw_highlights.length ? `
+            <section class="analysis-metadata-section">
+              <div class="analysis-metadata-title">Source-native raw highlights</div>
+              <div class="analysis-tag-row">
+                ${payload.source_raw_highlights.map((item) => `<span class="analysis-chip">${escapeHtml(String(item || ""))}</span>`).join("")}
+              </div>
+            </section>
+          ` : ""}
+        </section>
+      </article>
+    `;
+  }
+  if (type === "analysis_note") {
+    const markdown = String(artifact?.payload?.markdown || "").trim();
+    return `
+      <article class="analysis-cell ${isFocused ? "is-focused" : ""}" data-cell-id="${escapeHtml(cell?.cell_id || "")}" data-task-id="${escapeHtml(taskId)}">
+        <header class="analysis-cell-head">
+          <div>
+            <div class="analysis-cell-kicker">Analysis note</div>
+            <h4>${escapeHtml(title)}</h4>
+          </div>
+          <span class="analysis-cell-date">${escapeHtml(formatDate(cell?.created_at))}</span>
+        </header>
+        ${analysisNotebookPromptHtml(taskId)}
+        ${analysisNotebookExecutionHtml(taskId)}
+        <section class="analysis-notebook-block is-output">
+          <div class="analysis-notebook-block-label">Out</div>
+          <div class="analysis-note markdown-body">${markdownToHtml(markdown)}</div>
+        </section>
+      </article>
+    `;
+  }
+  return `
+    <article class="analysis-cell" data-cell-id="${escapeHtml(cell?.cell_id || "")}" data-task-id="${escapeHtml(taskId)}">
+      <header class="analysis-cell-head">
+        <h4>${escapeHtml(title)}</h4>
+      </header>
+      <div class="analysis-note markdown-body">${markdownToHtml(String(artifact?.summary || "").trim())}</div>
+    </article>
+  `;
+}
+
+function analysisNotebookMimeData(data, key) {
+  if (!data || typeof data !== "object") return "";
+  const value = data[key];
+  if (Array.isArray(value)) return value.join("");
+  return typeof value === "string" ? value : "";
+}
+
+function analysisNotebookOutputHtml(output) {
+  const outputType = String(output?.output_type || "").trim();
+  if (outputType === "display_data" || outputType === "execute_result") {
+    const data = output?.data && typeof output.data === "object" ? output.data : {};
+    const html = analysisNotebookMimeData(data, "text/html");
+    const svg = analysisNotebookMimeData(data, "image/svg+xml");
+    const plain = analysisNotebookMimeData(data, "text/plain");
+    const jsonValue = data["application/json"];
+    return `
+      <div class="nb-output-item">
+        ${html ? `<div class="nb-output-rich">${html}</div>` : ""}
+        ${svg ? `<div class="nb-output-svg">${svg}</div>` : ""}
+        ${plain && !html && !svg ? `<pre class="nb-output-plain">${escapeHtml(plain)}</pre>` : ""}
+        ${jsonValue && !html ? `<pre class="nb-output-json">${escapeHtml(JSON.stringify(jsonValue, null, 2))}</pre>` : ""}
+      </div>
+    `;
+  }
+  if (outputType === "stream") {
+    const text = Array.isArray(output?.text) ? output.text.join("") : String(output?.text || "");
+    return `<div class="nb-output-item"><pre class="nb-output-plain">${escapeHtml(text)}</pre></div>`;
+  }
+  if (outputType === "error") {
+    const traceback = Array.isArray(output?.traceback) ? output.traceback.join("\n") : String(output?.evalue || "Notebook error");
+    return `<div class="nb-output-item is-error"><pre class="nb-output-plain">${escapeHtml(traceback)}</pre></div>`;
+  }
+  return "";
+}
+
+function analysisNotebookCellDatasetActionsHtml(cell) {
+  const meta = cell?.metadata?.co_scientist || {};
+  const rows = Array.isArray(meta?.dataset_rows) ? meta.dataset_rows : [];
+  const buttons = rows
+    .map((row) => {
+      const datasetId = String(row?.dataset_id || "").trim();
+      const label = String(row?.dataset_label || row?.accession || datasetId).trim();
+      if (!datasetId || !label) return "";
+      return `<button class="ghost-btn" type="button" data-action="select-analysis-dataset" data-dataset-id="${escapeHtml(datasetId)}">${escapeHtml(label)}</button>`;
+    })
+    .filter(Boolean);
+  if (!buttons.length) return "";
+  return `
+    <div class="nb-cell-actions">
+      <span class="nb-cell-actions-label">Select dataset</span>
+      <div class="nb-cell-actions-row">${buttons.join("")}</div>
+    </div>
+  `;
+}
+
+function analysisNotebookRenderedCellHtml(cell, index) {
+  const cellType = String(cell?.cell_type || "").trim();
+  const meta = cell?.metadata?.co_scientist || {};
+  const taskId = String(meta?.task_id || "").trim();
+  const title = String(meta?.title || "").trim();
+  const createdAt = String(meta?.created_at || "").trim();
+  if (cellType === "markdown") {
+    const source = Array.isArray(cell?.source) ? cell.source.join("") : String(cell?.source || "");
+    return `
+      <article class="nb-cell nb-cell-markdown" data-task-id="${escapeHtml(taskId)}" data-cell-index="${index}">
+        ${title ? `<div class="nb-cell-title">${escapeHtml(title)}</div>` : ""}
+        <div class="nb-markdown markdown-body">${markdownToHtml(source)}</div>
+      </article>
+    `;
+  }
+  const source = Array.isArray(cell?.source) ? cell.source.join("") : String(cell?.source || "");
+  const outputs = Array.isArray(cell?.outputs) ? cell.outputs : [];
+  return `
+    <article class="nb-cell nb-cell-code" data-task-id="${escapeHtml(taskId)}" data-cell-index="${index}">
+      <div class="nb-cell-head">
+        <div>
+          ${title ? `<div class="nb-cell-title">${escapeHtml(title)}</div>` : ""}
+          ${meta?.kind ? `<div class="nb-cell-kind">${escapeHtml(String(meta.kind).replace(/_/g, " "))}</div>` : ""}
+        </div>
+        ${createdAt ? `<span class="nb-cell-date">${escapeHtml(formatDate(createdAt))}</span>` : ""}
+      </div>
+      <div class="nb-input-row">
+        <div class="nb-prompt">In&nbsp;[ ]:</div>
+        <pre class="nb-code">${escapeHtml(source)}</pre>
+      </div>
+      ${outputs.length ? `
+        <div class="nb-output-row">
+          <div class="nb-prompt">Out[ ]:</div>
+          <div class="nb-output-stack">
+            ${outputs.map((output) => analysisNotebookOutputHtml(output)).join("")}
+          </div>
+        </div>
+      ` : ""}
+      ${analysisNotebookCellDatasetActionsHtml(cell)}
+    </article>
+  `;
+}
+
+function analysisNotebookDocumentHtml(payload) {
+  const notebook = payload?.notebook && typeof payload.notebook === "object" ? payload.notebook : {};
+  const cells = Array.isArray(notebook?.cells) ? notebook.cells : [];
+  const downloadPath = String(payload?.download_path || "").trim();
+  if (!cells.length) {
+    return analysisWorkspaceStateHtml("Notebook is empty", "Run an analysis step to start building the notebook.", "empty");
+  }
+  return `
+    <div class="nb-doc">
+      <div class="nb-toolbar">
+        <div class="nb-toolbar-copy">
+          <strong>Notebook</strong>
+          <span>${escapeHtml(`${cells.length} cell${cells.length === 1 ? "" : "s"} · workspace rev ${payload?.workspace_revision || 0}`)}</span>
+        </div>
+        ${downloadPath ? `<a class="ghost-btn" href="${escapeHtml(downloadPath)}" download>Download .ipynb</a>` : ""}
+      </div>
+      <div class="nb-doc-stack">
+        ${cells.map((cell, index) => analysisNotebookRenderedCellHtml(cell, index)).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function analysisWorkspaceHtml(entry) {
+  if (!entry || (entry.loading && !entry.data)) {
+    return analysisWorkspaceStateHtml("Loading notebook", "Rebuilding the analysis notebook for this conversation.", "loading");
+  }
+  if (entry.error && !entry.data) {
+    return analysisWorkspaceStateHtml("Notebook unavailable", entry.error, "error");
+  }
+  return analysisNotebookDocumentHtml(entry?.data || {});
+}
+
+function scrollAnalysisNotebookToTask(taskId) {
+  const normalizedTaskId = String(taskId || "").trim();
+  if (!normalizedTaskId || !el.reportContent) return;
+  const target = Array.from(el.reportContent.querySelectorAll(".nb-cell"))
+    .find((node) => String(node.dataset.taskId || "") === normalizedTaskId);
+  if (!target) return;
+  target.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function refreshCurrentAnalysisWorkspace({ force = false } = {}) {
+  const conversationId = String(state.selectedConversationId || "").trim();
+  if (!conversationId || currentConversationMode() !== "analysis") return;
+  const existing = state.analysisWorkspaceByConversationId[conversationId];
+  if (existing?.loading) return;
+  if (!force && existing && existing.data) return;
+
+  const hasExistingData = Boolean(existing?.data);
+  state.analysisWorkspaceByConversationId[conversationId] = hasExistingData
+    ? { loading: true, error: "", data: existing.data }
+    : { loading: true, error: "", data: null };
+  if (!hasExistingData) renderReportPanel();
+
+  try {
+    const payload = await api(`/api/conversations/${encodeURIComponent(conversationId)}/analysis-notebook`);
+    state.analysisWorkspaceByConversationId[conversationId] = { loading: false, error: "", data: payload };
+  } catch (err) {
+    state.analysisWorkspaceByConversationId[conversationId] = hasExistingData
+      ? { loading: false, error: "", data: existing.data }
+      : {
+          loading: false,
+          error: String(err?.message || "Failed to load analysis notebook."),
+          data: null,
+        };
+  }
+
+  renderReportPanel();
+}
+
+async function selectAnalysisDataset(datasetId) {
+  const conversationId = String(state.selectedConversationId || "").trim();
+  const normalizedDatasetId = String(datasetId || "").trim();
+  if (!conversationId || !normalizedDatasetId) return;
+  await api(`/api/conversations/${encodeURIComponent(conversationId)}/analysis-selection`, {
+    method: "POST",
+    body: JSON.stringify({ dataset_id: normalizedDatasetId }),
+  });
+  await refreshCurrentAnalysisWorkspace({ force: true });
+  await refreshConversations({ keepSelection: true, skipRender: true });
+  renderAll();
+}
+
 async function refreshCurrentDatasetVisuals({ force = false } = {}) {
   const taskId = currentVisualsTaskId();
   if (!taskId || state.reportPanelMode !== "visuals") return;
@@ -2672,7 +3261,12 @@ async function refreshCurrentDatasetVisuals({ force = false } = {}) {
 
 function renderReportPanel() {
   const iteration = currentReportIteration();
-  const showPanel = Boolean(state.selectedConversationId && iteration && iteration?.report?.has_report);
+  const conversationMode = currentConversationMode();
+  const isAnalysisMode = conversationMode === "analysis";
+  const showPanel = Boolean(
+    state.selectedConversationId
+    && (isAnalysisMode || (iteration && iteration?.report?.has_report))
+  );
   const debugTaskId = currentDebugTaskId();
   const debugEntry = debugTaskId ? state.debugByTaskId[debugTaskId] : null;
   const showDebugToggle = Boolean(showPanel && debugTaskId);
@@ -2709,6 +3303,38 @@ function renderReportPanel() {
     setInnerHtmlIfChanged(el.visualsPanel, "");
     setDebugSummaryHtml("", "");
     setDebugJsonText("", "");
+    return;
+  }
+
+  if (isAnalysisMode) {
+    const detail = state.selectedConversationDetail;
+    const conversationId = String(state.selectedConversationId || "").trim();
+    const workspaceEntry = currentAnalysisWorkspaceEntry();
+    const title = conversationTitle(detail?.conversation) || "Analysis Notebook";
+    const panelKey = String(state.selectedReportTaskId || conversationId);
+    setRenderedReportTitle(panelKey, title);
+    el.exportPdfBtn.classList.add("hidden");
+    el.datasetVisualsBtn.classList.add("hidden");
+    el.evidenceGraphBtn.classList.add("hidden");
+    el.debugToggleBtn.classList.add("hidden");
+    el.reportStatus.classList.add("hidden");
+    el.reportStatus.classList.remove("error");
+    el.debugPanel.classList.add("hidden");
+    el.graphPanel.classList.add("hidden");
+    el.visualsPanel.classList.add("hidden");
+    setInnerHtmlIfChanged(el.visualsPanel, "");
+    setDebugSummaryHtml("", "");
+    setDebugJsonText("", "");
+    el.reportContent.classList.remove("hidden");
+    setInnerHtmlIfChanged(el.reportContent, analysisWorkspaceHtml(workspaceEntry));
+    if (!workspaceEntry || (workspaceEntry.loading && !workspaceEntry.data)) {
+      refreshCurrentAnalysisWorkspace().catch((err) => setNotice(`Failed to load notebook: ${err.message}`, true));
+    }
+    const pendingTaskId = String(state.pendingAnalysisScrollTaskId || state.selectedReportTaskId || "").trim();
+    if (pendingTaskId) {
+      requestAnimationFrame(() => scrollAnalysisNotebookToTask(pendingTaskId));
+      state.pendingAnalysisScrollTaskId = "";
+    }
     return;
   }
 
@@ -2898,6 +3524,9 @@ async function selectConversation(conversationId, { silent = false, skipRender =
     state.pendingUserMessage = "";
     state.clarificationMessage = "";
     if (!skipRender) renderAll();
+    if (normalizeTaskMode(detail?.conversation?.mode || "") === "analysis") {
+      refreshCurrentAnalysisWorkspace().catch((err) => setNotice(`Failed to load notebook: ${err.message}`, true));
+    }
     refreshCurrentDebugState().catch((err) => setNotice(`Failed to load debug state: ${err.message}`, true));
   } catch (err) {
     if (!silent) setNotice(`Failed to load conversation: ${err.message}`, true);
@@ -3069,7 +3698,11 @@ async function handleTerminalRunState(run) {
         if (status === "completed" && shouldAutoFocus) {
           state.selectedReportTaskId = run.task_id;
           const isAnalysisMode = normalizeTaskMode(taskDetail?.task?.mode || "") === "analysis";
-          state.reportPanelMode = isAnalysisMode && taskDetail?.task?.has_dataset_visualizations ? "visuals" : "report";
+          state.reportPanelMode = isAnalysisMode ? "report" : (taskDetail?.task?.has_dataset_visualizations ? "visuals" : "report");
+          if (isAnalysisMode) {
+            state.pendingAnalysisScrollTaskId = run.task_id;
+            await refreshCurrentAnalysisWorkspace({ force: true });
+          }
         }
       } catch (err) {
         setNotice(`Could not refresh conversations: ${err.message}`, true);
@@ -3181,8 +3814,10 @@ function clearDraft() {
   state.debugByTaskId = {};
   state.graphByTaskId = {};
   state.visualsByTaskId = {};
+  state.analysisWorkspaceByConversationId = {};
   state.graphSearchByTaskId = {};
   state.graphSelectionByTaskId = {};
+  state.pendingAnalysisScrollTaskId = "";
   stopRunPolling();
   state.runsByRunId = {};
   state.runsByTaskId = {};
@@ -3239,12 +3874,13 @@ function bindEvents() {
       const scrollTop = el.messages.scrollTop;
       state.selectedReportTaskId = taskId;
       const iteration = findIteration(state.selectedConversationDetail, taskId);
-      state.reportPanelMode = (
-        normalizeTaskMode(iteration?.task?.mode || iteration?.report?.mode || "") === "analysis"
-        && iteration?.report?.has_dataset_visualizations
-      )
-        ? "visuals"
-        : "report";
+      const isAnalysisMode = normalizeTaskMode(iteration?.task?.mode || iteration?.report?.mode || "") === "analysis";
+      state.reportPanelMode = isAnalysisMode
+        ? "report"
+        : (iteration?.report?.has_dataset_visualizations ? "visuals" : "report");
+      if (isAnalysisMode) {
+        state.pendingAnalysisScrollTaskId = taskId;
+      }
       renderAll();
       refreshCurrentDebugState().catch((err) => setNotice(`Failed to load debug state: ${err.message}`, true));
       el.messages.scrollTop = scrollTop;
@@ -3275,15 +3911,24 @@ function bindEvents() {
     const scrollTop = el.messages.scrollTop;
     state.selectedReportTaskId = taskId;
     const iteration = findIteration(state.selectedConversationDetail, taskId);
-    state.reportPanelMode = (
-      normalizeTaskMode(iteration?.task?.mode || iteration?.report?.mode || "") === "analysis"
-      && iteration?.report?.has_dataset_visualizations
-    )
-      ? "visuals"
-      : "report";
+    const isAnalysisMode = normalizeTaskMode(iteration?.task?.mode || iteration?.report?.mode || "") === "analysis";
+    state.reportPanelMode = isAnalysisMode
+      ? "report"
+      : (iteration?.report?.has_dataset_visualizations ? "visuals" : "report");
+    if (isAnalysisMode) {
+      state.pendingAnalysisScrollTaskId = taskId;
+    }
     renderAll();
     refreshCurrentDebugState().catch((err) => setNotice(`Failed to load debug state: ${err.message}`, true));
     el.messages.scrollTop = scrollTop;
+  });
+
+  el.reportContent.addEventListener("click", (event) => {
+    const selectBtn = event.target.closest('[data-action="select-analysis-dataset"]');
+    if (!selectBtn) return;
+    const datasetId = String(selectBtn.dataset.datasetId || "").trim();
+    if (!datasetId) return;
+    selectAnalysisDataset(datasetId).catch((err) => setNotice(`Failed to select dataset: ${err.message}`, true));
   });
 
   el.composerForm.addEventListener("submit", (event) => {

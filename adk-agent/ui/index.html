@@ -105,15 +105,13 @@
             </section>
             <div id="messages" class="messages"></div>
             <section id="modePicker" class="mode-picker">
-              <button type="button" class="mode-card active" data-mode="report">
-                <span class="mode-card-eyebrow">Current Workflow</span>
+              <button type="button" class="mode-card active" data-mode="report" aria-pressed="true">
                 <span class="mode-card-title">Biomedical Report</span>
                 <span class="mode-card-copy">Query biomedical databases and synthesize a cited research report.</span>
               </button>
-              <button type="button" class="mode-card" data-mode="analysis">
-                <span class="mode-card-eyebrow">Open Data Workflow</span>
+              <button type="button" class="mode-card" data-mode="analysis" aria-pressed="false">
                 <span class="mode-card-title">Open Data Analysis</span>
-                <span class="mode-card-copy">Find reusable public datasets and compare them visually before QC and reanalysis.</span>
+                <span class="mode-card-copy">Find reusable public datasets and explore them or reanalyze them.</span>
               </button>
             </section>
             <form id="composerForm" class="composer">
