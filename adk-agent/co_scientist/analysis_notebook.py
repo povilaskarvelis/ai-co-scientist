@@ -21,6 +21,9 @@ except ImportError:  # pragma: no cover - exercised in user runtime when nbforma
 
 ANALYSIS_NOTEBOOK_SCHEMA = "analysis_notebook.v1"
 
+# Rows included in dataset_comparison code cells and SVG previews (executor fallback can exceed 12).
+NOTEBOOK_COMPARISON_MAX_DATASETS = 60
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -248,7 +251,7 @@ def _catalog_record(dataset: Mapping[str, Any]) -> dict[str, Any]:
 
 def _dataset_comparison_source(payload: Mapping[str, Any], artifact: Mapping[str, Any]) -> str:
     del artifact
-    records = [_catalog_record(dataset) for dataset in list(payload.get("datasets", []) or [])[:12]]
+    records = [_catalog_record(dataset) for dataset in list(payload.get("datasets", []) or [])[:NOTEBOOK_COMPARISON_MAX_DATASETS]]
     return (
         "import pandas as pd\n"
         "import matplotlib.pyplot as plt\n\n"
@@ -342,7 +345,7 @@ def _dataset_comparison_source(payload: Mapping[str, Any], artifact: Mapping[str
 
 def _numeric_chart_svg(rows: list[dict[str, Any]], *, key: str, title: str, color: str) -> str:
     clean_rows: list[dict[str, Any]] = []
-    for row in rows[:12]:
+    for row in rows[:NOTEBOOK_COMPARISON_MAX_DATASETS]:
         value = row.get(key)
         if value in (None, "", [], {}):
             continue
@@ -482,10 +485,10 @@ def _category_chart_svg(rows: list[dict[str, Any]], *, key: str, title: str, col
 
 
 def _field_presence_svg(rows: list[dict[str, Any]], *, fields: list[tuple[str, str]], title: str) -> str:
-    row_labels = [_text(row.get("accession") or row.get("dataset_label") or "Dataset") for row in rows[:12]]
+    row_labels = [_text(row.get("accession") or row.get("dataset_label") or "Dataset") for row in rows[:NOTEBOOK_COMPARISON_MAX_DATASETS]]
     column_labels = [label for _, label in fields]
     values: list[list[int]] = []
-    for row in rows[:12]:
+    for row in rows[:NOTEBOOK_COMPARISON_MAX_DATASETS]:
         row_values: list[int] = []
         for key, _label in fields:
             value = row.get(key)
@@ -502,16 +505,16 @@ def _field_presence_svg(rows: list[dict[str, Any]], *, fields: list[tuple[str, s
 
 def _multi_value_matrix_svg(rows: list[dict[str, Any]], *, key: str, title: str, color: str) -> str:
     labels: list[str] = []
-    for row in rows[:12]:
+    for row in rows[:NOTEBOOK_COMPARISON_MAX_DATASETS]:
         for item in _list_text(row.get(key)):
             if item not in labels:
                 labels.append(item)
     labels = labels[:10]
     if not labels:
         return ""
-    row_labels = [_text(row.get("accession") or row.get("dataset_label") or "Dataset") for row in rows[:12]]
+    row_labels = [_text(row.get("accession") or row.get("dataset_label") or "Dataset") for row in rows[:NOTEBOOK_COMPARISON_MAX_DATASETS]]
     values: list[list[int]] = []
-    for row in rows[:12]:
+    for row in rows[:NOTEBOOK_COMPARISON_MAX_DATASETS]:
         items = set(_list_text(row.get(key)))
         values.append([1 if label in items else 0 for label in labels])
     return _binary_matrix_svg(
@@ -537,7 +540,7 @@ def _status_matrix_svg(rows: list[dict[str, Any]]) -> str:
 
 def _scatter_svg(rows: list[dict[str, Any]], *, x_key: str, y_key: str, title: str) -> str:
     points: list[dict[str, Any]] = []
-    for row in rows[:12]:
+    for row in rows[:NOTEBOOK_COMPARISON_MAX_DATASETS]:
         x_val = row.get(x_key)
         y_val = row.get(y_key)
         try:
@@ -597,7 +600,7 @@ def _dataset_comparison_preview_text(records: list[dict[str, Any]]) -> str:
         "bids",
     ]
     lines = ["\t".join(headers)]
-    for record in records[:12]:
+    for record in records[:NOTEBOOK_COMPARISON_MAX_DATASETS]:
         lines.append(
             "\t".join(
                 [
@@ -619,7 +622,7 @@ def _dataset_comparison_preview_text(records: list[dict[str, Any]]) -> str:
 
 
 def _dataset_comparison_outputs(payload: Mapping[str, Any]) -> list[Any]:
-    records = [_catalog_record(dataset) for dataset in list(payload.get("datasets", []) or [])[:12]]
+    records = [_catalog_record(dataset) for dataset in list(payload.get("datasets", []) or [])[:NOTEBOOK_COMPARISON_MAX_DATASETS]]
     if not records:
         return []
     outputs = [

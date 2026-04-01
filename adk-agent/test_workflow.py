@@ -227,6 +227,11 @@ def test_report_and_analysis_tool_profiles_use_different_default_hint_sets():
     assert "search_clinical_trials" in report_profile.base_tool_hints
     assert "search_clinical_trials" not in analysis_profile.base_tool_hints
     assert "search_openneuro_datasets" in analysis_profile.base_tool_hints
+    assert "list_openneuro_snapshots" in analysis_profile.base_tool_hints
+    assert "list_openneuro_files" in analysis_profile.base_tool_hints
+    assert "list_nemar_files" in analysis_profile.base_tool_hints
+    assert "list_dandi_versions" in analysis_profile.base_tool_hints
+    assert "list_dandi_assets" in analysis_profile.base_tool_hints
     assert analysis_profile.report_assistant_tools == []
 
 
@@ -492,6 +497,68 @@ def test_store_dataset_catalog_appends_analysis_workspace_cell_and_visual_bundle
     assert len(list(comparison_cell.get("outputs", []) or [])) >= 5
 
 
+
+def test_store_dataset_catalog_defaults_dimensions_for_plain_metadata_compare():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Compare public EEG datasets",
+        "success_criteria": ["Return a shortlist"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Compare public EEG datasets",
+                "tool_hint": "search_nemar_datasets",
+                "domains": ["neuroscience"],
+                "completion_condition": "Return a shortlist",
+            }
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Compare public EEG datasets",
+    )
+    ctx = SimpleNamespace(
+        state={
+            workflow.STATE_WORKFLOW_TASK: task_state,
+            workflow.STATE_ACTIVE_TASK_CONTEXT: {
+                "conversation_id": "conv_analysis_workspace_default_dims",
+                "task_id": "task_analysis_workspace_default_dims",
+                "user_prompt": "Compare public EEG datasets",
+                "mode": "analysis",
+            },
+        }
+    )
+
+    response = workflow.store_dataset_catalog(
+        datasets_json=json.dumps(
+            [
+                {
+                    "dataset_label": "NEMAR nm000104",
+                    "source": "NEMAR",
+                    "accession": "nm000104",
+                    "participant_count": 32,
+                    "modalities": ["EEG"],
+                },
+                {
+                    "dataset_label": "OpenNeuro ds005522",
+                    "source": "OpenNeuro",
+                    "accession": "ds005522",
+                    "participant_count": 24,
+                    "modalities": ["EEG"],
+                },
+            ]
+        ),
+        objective="Compare public EEG datasets",
+        summary="Plain metadata comparison without ranking dimensions.",
+        tool_context=ctx,
+    )
+
+    assert response["ok"] is True
+    payload = ctx.state[workflow.STATE_ANALYSIS_WORKSPACE]["artifacts"][response["artifact_id"]]["payload"]
+    assert payload["dimensions"] == []
+    assert payload["summary_cards"]["dataset_count"] == 2
+
+
 def test_openneuro_fallback_catalog_uses_raw_metadata_fields():
     plan = {
         "schema": workflow.PLAN_SCHEMA,
@@ -546,6 +613,52 @@ def test_openneuro_fallback_catalog_uses_raw_metadata_fields():
     assert "modalities" in first
     assert "doi" in first
     assert "scores" not in first
+
+
+def test_openneuro_fallback_catalog_includes_more_than_twelve_executor_ids():
+    """Executor-summary fallback must not cap at dataset_visualization.MAX_DATASETS (12)."""
+    summary_lines = [
+        f"OpenNeuro study (ds{300000 + i}). 10 participants. modality: MRI.\n" for i in range(1, 21)
+    ]
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "List OpenNeuro datasets",
+        "success_criteria": ["Return matches"],
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Search OpenNeuro",
+                "tool_hint": "search_openneuro_datasets",
+                "domains": ["neuroscience"],
+                "completion_condition": "Done",
+            }
+        ],
+    }
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="List OpenNeuro datasets",
+    )
+    workflow._apply_step_execution_result_to_task_state(
+        task_state,
+        {
+            "schema": workflow.STEP_RESULT_SCHEMA,
+            "step_id": "S1",
+            "status": "completed",
+            "step_progress_note": "Collected matches.",
+            "result_summary": "".join(summary_lines),
+            "evidence_ids": [],
+            "open_gaps": [],
+            "suggested_next_searches": [],
+            "tools_called": ["search_openneuro_datasets"],
+            "structured_observations": [],
+        },
+    )
+    payload = workflow._build_openneuro_fallback_catalog_payloads(
+        task_state,
+        user_prompt="Compare and plot metadata",
+    )
+    assert payload is not None
+    assert len(payload["datasets"]) == 20
 
 
 def test_analysis_fallback_replaces_legacy_generic_dataset_comparison_cell():
@@ -1144,6 +1257,7 @@ def test_analysis_synth_context_requires_dataset_catalog_for_compare_task_withou
     joined = "\n".join(instructions)
 
     assert "You MUST call `store_dataset_catalog` before returning Markdown." in joined
+    assert "dimensions_json=\"[]\"" in joined
     assert "`append_analysis_note` alone is not sufficient." in joined
     assert "Reuse the completed-step evidence from this task instead of reopening planning or discovery." in joined
 
@@ -2596,15 +2710,40 @@ def test_prioritize_tools_for_step_prefers_hint_then_fallbacks():
 def test_format_source_precedence_rules_mentions_neuroscience_dataset_discovery():
     text = workflow._format_source_precedence_rules([
         "search_openneuro_datasets",
+        "list_openneuro_snapshots",
+        "list_openneuro_files",
         "search_nemar_datasets",
+        "get_nemar_dataset_details",
+        "list_nemar_files",
         "search_dandi_datasets",
+        "list_dandi_versions",
+        "list_dandi_assets",
         "search_braincode_datasets",
     ])
     assert "Neuroscience dataset discovery" in text
     assert "`search_nemar_datasets`" in text
+    assert "`get_nemar_dataset_details`" in text
+    assert "`list_nemar_files`" in text
+    assert "structured Data Explorer metadata" in text
     assert "`search_openneuro_datasets`" in text
+    assert "`list_openneuro_files`" in text
     assert "`search_dandi_datasets`" in text
+    assert "`list_dandi_assets`" in text
     assert "A OR B" not in text
+
+
+def test_neuroscience_mirror_tool_descriptions_and_precedence_call_out_catalog_limits():
+    assert "catalog view" in workflow.tool_registry.TOOL_DESCRIPTIONS["search_conp_datasets"]
+    assert "GitHub catalog" in workflow.tool_registry.TOOL_DESCRIPTIONS["search_braincode_datasets"]
+    assert "GitHub catalog" in workflow.tool_registry.TOOL_DESCRIPTIONS["search_enigma_datasets"]
+
+    text = workflow._format_source_precedence_rules([
+        "search_openneuro_datasets",
+        "search_dandi_datasets",
+        "search_braincode_datasets",
+        "search_conp_datasets",
+    ])
+    assert "GitHub-backed mirror/catalog views" in text
 
 
 def test_react_step_context_instructions_include_routing_guidance():

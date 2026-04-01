@@ -58,7 +58,6 @@ from .analysis_workspace import (
 from .analysis_notebook import build_analysis_notebook
 from . import tool_registry
 from .dataset_visualization import (
-    MAX_DATASETS,
     build_dataset_visualization_bundle,
     parse_visualization_json_array,
 )
@@ -304,10 +303,15 @@ KNOWN_MCP_TOOLS = [
     "query_neurobagel_cohorts",
     "search_openneuro_datasets",
     "get_openneuro_dataset",
+    "list_openneuro_snapshots",
+    "list_openneuro_files",
     "search_dandi_datasets",
     "get_dandi_dataset",
+    "list_dandi_versions",
+    "list_dandi_assets",
     "search_nemar_datasets",
     "get_nemar_dataset_details",
+    "list_nemar_files",
     "search_braincode_datasets",
     "get_braincode_dataset_details",
     "search_enigma_datasets",
@@ -331,10 +335,15 @@ ANALYSIS_DEFAULT_TOOL_HINTS = (
     "query_neurobagel_cohorts",
     "search_openneuro_datasets",
     "get_openneuro_dataset",
+    "list_openneuro_snapshots",
+    "list_openneuro_files",
     "search_dandi_datasets",
     "get_dandi_dataset",
+    "list_dandi_versions",
+    "list_dandi_assets",
     "search_nemar_datasets",
     "get_nemar_dataset_details",
+    "list_nemar_files",
     "search_braincode_datasets",
     "get_braincode_dataset_details",
     "search_enigma_datasets",
@@ -704,6 +713,7 @@ store a normalized dataset catalog before you finalize the markdown.
 
 Use the tool only when you have enough evidence to compare concrete dataset candidates. When you call it:
 - Pass `datasets_json` as a compact JSON array encoded as strings.
+- For plain metadata comparison or plotting tasks, it is valid to omit ranking dimensions entirely by using `dimensions_json="[]"`.
 - Preserve raw metadata fields when available: `participant_count`, `session_count`, `modalities`,
   `tasks`, `diagnoses`, `public_download`, `license`, `doi`, `bids`, and short evidence-grounded notes.
 - Only include heuristic comparison dimensions or scores when the user explicitly asks for ranking.
@@ -731,6 +741,7 @@ Notebook rules:
 - After storing the main artifact, call `append_analysis_note` with a concise interpretation and next-step framing.
 - Use compact JSON strings only for tool payloads.
 - Do not pass raw source payloads directly into notebook tools. Normalize NEMAR, OpenNeuro, and DANDI records into common fields first.
+- For plain dataset discovery, comparison, or plotting tasks, call `store_dataset_catalog` with `dimensions_json="[]"`; do not invent ranking dimensions just to satisfy the tool call.
 - For default dataset discovery and plotting, prefer raw metadata fields over heuristic scores. Use scores only when the user explicitly asks for ranking.
 - Do not auto-select a dataset from a multi-dataset comparison result.
 - When the task explicitly inspects one dataset, ensure the metadata profile clearly identifies that dataset.
@@ -6807,6 +6818,10 @@ def _openneuro_doi_index(corpus: str) -> dict[str, str]:
     return mapping
 
 
+# Executor-summary OpenNeuro fallback is not limited by dataset_visualization.MAX_DATASETS (store tool cap).
+OPENNEURO_EXECUTOR_FALLBACK_MAX_DATASETS = 80
+
+
 def _build_openneuro_fallback_catalog_payloads(
     task_state: dict[str, Any],
     *,
@@ -6829,7 +6844,7 @@ def _build_openneuro_fallback_catalog_payloads(
 
     doi_by_ds = _openneuro_doi_index(corpus)
     datasets: list[dict[str, Any]] = []
-    for acc in ordered_ids[:MAX_DATASETS]:
+    for acc in ordered_ids[:OPENNEURO_EXECUTOR_FALLBACK_MAX_DATASETS]:
         chunk = _openneuro_chunk_for_accession(corpus, acc)
         title = _openneuro_named_title_for_accession(corpus, acc) or _openneuro_title_from_chunk(chunk)
         modalities = _openneuro_modalities_from_chunk(chunk)
@@ -7011,48 +7026,14 @@ def _record_notebook_synthesis_diagnostic(
         del bucket[:-24]
 
 
-def _materialize_analysis_notebook_fallback(
+def _analysis_try_append_dataset_comparison_from_sources(
     *,
-    callback_context: CallbackContext,
     task_state: dict[str, Any],
-    final_markdown: str,
-) -> dict[str, Any] | None:
-    active_task_context = _get_active_task_context(callback_context)
-    conversation_id = str(active_task_context.get("conversation_id") or "").strip()
-    task_id = str(active_task_context.get("task_id") or "").strip()
-    user_prompt = str(
-        active_task_context.get("user_prompt")
-        or task_state.get("objective")
-        or ""
-    ).strip()
-
-    workspace = _get_analysis_workspace(callback_context)
-    if workspace is None and conversation_id:
-        workspace = ensure_analysis_workspace(
-            None,
-            conversation_id=conversation_id,
-        )
-        callback_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
-    if workspace is None:
-        return None
-
-    removed_legacy = _remove_task_dataset_comparison_cells(
-        workspace,
-        task_id=task_id,
-        only_if_underspecified=True,
-    )
-    if removed_legacy:
-        _record_notebook_synthesis_diagnostic(
-            task_state,
-            human_line=(
-                f"Notebook: removed {removed_legacy} underspecified legacy dataset comparison cell(s) "
-                "before rebuilding notebook output."
-            ),
-            status="done",
-            kind="legacy_catalog_removed",
-            removed_count=removed_legacy,
-        )
-
+    workspace: dict[str, Any],
+    task_id: str,
+    user_prompt: str,
+) -> None:
+    """Append dataset_comparison from visualization bundle or OpenNeuro executor text if missing."""
     current_cell_types = set(_analysis_task_cell_types(workspace, task_id=task_id))
     bundle = task_state.get("latest_dataset_visualizations")
 
@@ -7173,7 +7154,57 @@ def _materialize_analysis_notebook_fallback(
                 status="progress",
                 kind="openneuro_fallback_skipped",
             )
-        current_cell_types = set(_analysis_task_cell_types(workspace, task_id=task_id))
+
+
+def _materialize_analysis_notebook_fallback(
+    *,
+    callback_context: CallbackContext,
+    task_state: dict[str, Any],
+    final_markdown: str,
+) -> dict[str, Any] | None:
+    active_task_context = _get_active_task_context(callback_context)
+    conversation_id = str(active_task_context.get("conversation_id") or "").strip()
+    task_id = str(active_task_context.get("task_id") or "").strip()
+    user_prompt = str(
+        active_task_context.get("user_prompt")
+        or task_state.get("objective")
+        or ""
+    ).strip()
+
+    workspace = _get_analysis_workspace(callback_context)
+    if workspace is None and conversation_id:
+        workspace = ensure_analysis_workspace(
+            None,
+            conversation_id=conversation_id,
+        )
+        callback_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
+    if workspace is None:
+        return None
+
+    removed_legacy = _remove_task_dataset_comparison_cells(
+        workspace,
+        task_id=task_id,
+        only_if_underspecified=True,
+    )
+    if removed_legacy:
+        _record_notebook_synthesis_diagnostic(
+            task_state,
+            human_line=(
+                f"Notebook: removed {removed_legacy} underspecified legacy dataset comparison cell(s) "
+                "before rebuilding notebook output."
+            ),
+            status="done",
+            kind="legacy_catalog_removed",
+            removed_count=removed_legacy,
+        )
+
+    _analysis_try_append_dataset_comparison_from_sources(
+        task_state=task_state,
+        workspace=workspace,
+        task_id=task_id,
+        user_prompt=user_prompt,
+    )
+    current_cell_types = set(_analysis_task_cell_types(workspace, task_id=task_id))
 
     if final_markdown and "analysis_note" not in current_cell_types:
         related_dataset_ids: list[str] = []
@@ -9621,6 +9652,7 @@ def _analysis_synth_context_instructions(
                 "Notebook requirement for this turn:\n"
                 "- This task is acting as a dataset-search/compare operation and it does not yet have a `dataset_comparison` cell.\n"
                 "- You MUST call `store_dataset_catalog` before returning Markdown.\n"
+                "- For plain metadata comparison or plotting, use `dimensions_json=\"[]\"` rather than inventing ranking dimensions.\n"
                 "- `append_analysis_note` alone is not sufficient.\n"
                 "- Reuse the completed-step evidence from this task instead of reopening planning or discovery."
             )
@@ -11398,6 +11430,43 @@ def _analysis_synth_before_model_callback(
     llm_request.append_instructions(
         _analysis_synth_context_instructions(task_state, callback_context)
     )
+
+    active_task_context = _get_active_task_context(callback_context)
+    conversation_id = str(active_task_context.get("conversation_id") or "").strip()
+    task_id = str(active_task_context.get("task_id") or "").strip()
+    user_prompt = str(
+        active_task_context.get("user_prompt")
+        or task_state.get("objective")
+        or ""
+    ).strip()
+    if task_id:
+        workspace = _get_analysis_workspace(callback_context)
+        if workspace is None and conversation_id:
+            workspace = ensure_analysis_workspace(
+                None,
+                conversation_id=conversation_id,
+            )
+            callback_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
+        if workspace is not None:
+            _remove_task_dataset_comparison_cells(
+                workspace,
+                task_id=task_id,
+                only_if_underspecified=True,
+            )
+            _analysis_try_append_dataset_comparison_from_sources(
+                callback_context=callback_context,
+                task_state=task_state,
+                workspace=workspace,
+                task_id=task_id,
+                user_prompt=user_prompt,
+            )
+            callback_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
+            _refresh_analysis_notebook_state_from_workspace(
+                callback_context.state,
+                workspace=workspace,
+                task_state=task_state,
+            )
+    callback_context.state[STATE_WORKFLOW_TASK] = task_state
     return None
 
 
@@ -12243,14 +12312,19 @@ def store_dataset_visualizations(
 
 
 def store_dataset_catalog(
-    dimensions_json: str,
     datasets_json: str,
     objective: str = "",
     summary: str = "",
-    notes_json: str = "",
+    dimensions_json: str = "[]",
+    notes_json: str = "[]",
     tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
-    """Append a dataset-comparison artifact and cell to the analysis notebook."""
+    """Append a dataset-comparison artifact and cell to the analysis notebook.
+
+    Use `dimensions_json="[]"` for plain metadata comparison or plotting tasks that
+    do not require heuristic ranking dimensions. `datasets_json` should contain
+    normalized rows rather than raw archive payloads.
+    """
     task_state, workspace, active_task_context = _tool_workspace_context(tool_context)
     if tool_context is None or task_state is None or workspace is None:
         return {
