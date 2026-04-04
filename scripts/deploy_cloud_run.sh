@@ -5,7 +5,7 @@ set -euo pipefail
 # PROJECT_ID  – GCP project (pass via env or edit default below)
 # GOOGLE_API_KEY – Google AI Studio key (required only when USE_VERTEX_AI=false; stored in Secret Manager)
 # ── Optional overrides ───────────────────────────────────────────────────────
-# REGION, SERVICE_NAME, REPO_NAME, IMAGE_NAME, USE_VERTEX_AI, GA4_MEASUREMENT_ID, CONCURRENCY
+# REGION, SERVICE_NAME, REPO_NAME, IMAGE_NAME, USE_VERTEX_AI, GA4_MEASUREMENT_ID, CONCURRENCY, CPU
 # ─────────────────────────────────────────────────────────────────────────────
 
 PROJECT_ID="gen-lang-client-0943167408"
@@ -19,6 +19,7 @@ BIOGRID_ACCESS_KEY="${BIOGRID_ACCESS_KEY:-}"
 BIOGRID_ORCS_ACCESS_KEY="${BIOGRID_ORCS_ACCESS_KEY:-}"
 GA4_MEASUREMENT_ID="${GA4_MEASUREMENT_ID:-G-NTCXHW3B2G}"
 CONCURRENCY="${CONCURRENCY:-16}"
+CPU="${CPU:-2}"
 
 ENV_FILE="adk-agent/.env"
 
@@ -81,6 +82,7 @@ fi
 echo "Using project=${PROJECT_ID} region=${REGION} service=${SERVICE_NAME}"
 echo "LLM backend: $([ "${USE_VERTEX_AI}" = "true" ] && echo "Vertex AI" || echo "AI Studio API key")"
 echo "Cloud Run concurrency: ${CONCURRENCY}"
+echo "Cloud Run CPU: ${CPU}"
 
 # ── Artifact Registry ────────────────────────────────────────────────────────
 
@@ -165,7 +167,7 @@ DEPLOY_FLAGS=(
   --platform managed
   --allow-unauthenticated
   --port 8080
-  --cpu 4
+  --cpu "${CPU}"
   --memory 4Gi
   --min-instances 1
   --max-instances 3
