@@ -715,19 +715,6 @@ function collectActivitySources(step) {
   return sources;
 }
 
-function renderActivityToolsInvokedHtml(toolsCalled) {
-  const items = (Array.isArray(toolsCalled) ? toolsCalled : [])
-    .map((t) => String(t || "").trim())
-    .filter(Boolean);
-  if (!items.length) return "";
-  return `
-    <div class="activity-log-step-section is-tools-invoked">
-      <div class="activity-log-step-label">Tools invoked</div>
-      <pre class="activity-log-tools-pre">${escapeHtml(items.join("\n"))}</pre>
-    </div>
-  `;
-}
-
 function renderActivitySectionHtml(label, items = [], extraClass = "") {
   const lines = (Array.isArray(items) ? items : []).filter(Boolean);
   if (!lines.length) return "";
@@ -742,11 +729,67 @@ function renderActivitySectionHtml(label, items = [], extraClass = "") {
   `;
 }
 
-function buildActivityDetailsHtml(stepDetails = []) {
+function activityEventTimeLabel(iso) {
+  if (!iso) return "";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function isNotebookActivityEvent(event) {
+  const type = String(event?.type || event?.event_type || "").trim();
+  const phase = String(event?.phase || "").trim();
+  const tool = String(event?.metrics?.tool || "").trim();
+  const author = String(event?.metrics?.author || "").trim();
+  if (type === "notebook.tool.completed" || type === "notebook.diagnostic") return true;
+  if (type === "synthesis.completed" && phase === "synthesize") return true;
+  if (type === "tool.called" && author === "analysis_notebook_synthesizer") return true;
+  if (type === "tool.failed" && (author === "analysis_notebook_synthesizer" || tool.startsWith("store_") || tool === "append_analysis_note")) return true;
+  return false;
+}
+
+function notebookActivityEventLines(events = []) {
+  const relevant = (Array.isArray(events) ? events : []).filter((event) => isNotebookActivityEvent(event));
+  return relevant.slice(-12).map((event) => {
+    const type = String(event?.type || event?.event_type || "").trim();
+    const human = normalizeActivityText(event?.human_line || event?.type || "");
+    let prefix = "Notebook";
+    if (type === "tool.called") prefix = "Tool call";
+    else if (type === "tool.failed") prefix = "Tool error";
+    else if (type === "notebook.tool.completed") prefix = "Tool ok";
+    else if (type === "notebook.diagnostic") prefix = "Decision";
+    else if (type === "synthesis.completed") prefix = "Synthesis";
+    return `${prefix}: ${human}`;
+  });
+}
+
+function notebookActivitySummaryText(events = []) {
+  const relevant = (Array.isArray(events) ? events : []).filter((event) => isNotebookActivityEvent(event));
+  const latest = relevant.length ? relevant[relevant.length - 1] : null;
+  return normalizeActivityText(latest?.human_line || latest?.type || "");
+}
+
+function notebookActivityIssueLines(events = []) {
+  const relevant = (Array.isArray(events) ? events : []).filter((event) => isNotebookActivityEvent(event));
+  return relevant
+    .filter((event) => {
+      const type = String(event?.type || event?.event_type || "").trim();
+      const status = String(event?.status || "").trim();
+      return status === "error" || type === "tool.failed";
+    })
+    .slice(-6)
+    .map((event) => normalizeActivityText(event?.human_line || event?.type || ""))
+    .filter(Boolean);
+}
+
+function buildActivityDetailsHtml(stepDetails = [], events = []) {
   const visibleSteps = (Array.isArray(stepDetails) ? stepDetails : [])
     .filter((step) => String(step?.status || "pending").trim() !== "pending");
+  const notebookLines = notebookActivityEventLines(events);
+  const notebookSummary = notebookActivitySummaryText(events);
+  const notebookIssues = notebookActivityIssueLines(events);
 
-  if (!visibleSteps.length) {
+  if (!visibleSteps.length && !notebookLines.length) {
     return '<div class="activity-log-empty">Activity details will appear here as steps begin.</div>';
   }
 
@@ -797,7 +840,6 @@ function buildActivityDetailsHtml(stepDetails = []) {
             </div>
             <div class="activity-log-step-body">
               ${renderActivitySectionHtml("Summary", summaryLines, "is-summary")}
-              ${renderActivityToolsInvokedHtml(step?.tools_called)}
               ${renderActivitySectionHtml("Activity", toolLines)}
               ${renderActivitySectionHtml("Evidence", evidenceIds)}
               ${renderActivitySectionHtml("Open questions", openGaps)}
@@ -805,6 +847,25 @@ function buildActivityDetailsHtml(stepDetails = []) {
           </div>
         `;
       }).join("")}
+      ${notebookLines.length ? `
+        <div class="activity-log-step is-notebook">
+          <div class="activity-log-step-head">
+            <span class="activity-log-step-dot" aria-hidden="true"></span>
+            <div class="activity-log-step-copy">
+              <div class="activity-log-step-title">
+                <span class="activity-log-step-id">Notebook</span>
+                <span class="activity-log-step-goal">Code cell generation</span>
+              </div>
+              <div class="activity-log-step-meta">Notebook tool calls, plotting diagnostics, and rendering status</div>
+            </div>
+          </div>
+          <div class="activity-log-step-body">
+            ${renderActivitySectionHtml("Summary", notebookSummary ? [notebookSummary] : [], "is-summary")}
+            ${renderActivitySectionHtml("Activity", notebookLines)}
+            ${renderActivitySectionHtml("Issues", notebookIssues)}
+          </div>
+        </div>
+      ` : ""}
     </div>
   `;
 }
@@ -861,10 +922,12 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
   const toolFailedEvents = safeEvents.filter((e) => e?.type === "tool.failed");
   const stepRetryEvents = safeEvents.filter((e) => e?.type === "step.retry");
   const stepStartedEvents = safeEvents.filter((e) => e?.type === "step.started" && e?.metrics?.step_id);
+  const notebookEvents = safeEvents.filter((event) => isNotebookActivityEvent(event));
   const latestToolCalled = toolCalledEvents.length ? toolCalledEvents[toolCalledEvents.length - 1] : null;
   const latestToolFailed = toolFailedEvents.length ? toolFailedEvents[toolFailedEvents.length - 1] : null;
   const latestStepRetry = stepRetryEvents.length ? stepRetryEvents[stepRetryEvents.length - 1] : null;
   const latestStepStarted = stepStartedEvents.length ? stepStartedEvents[stepStartedEvents.length - 1] : null;
+  const latestNotebookEvent = notebookEvents.length ? notebookEvents[notebookEvents.length - 1] : null;
   const stepsCompleted = Number(latestSummary?.steps_completed || stepEvents.length || 0);
   const stepsTotal = Number(latestSummary?.steps_total || 0);
   const stepDetails = Array.isArray(latestSummary?.step_details) ? latestSummary.step_details : [];
@@ -885,10 +948,12 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
   const title = "Research log";
 
   let summary = "";
-  if (normalizedStatus === "completed" && (stepsTotal > 0 || latestSummary?.summary)) {
-    summary = String(latestSummary?.summary || "").trim() || `${stepsCompleted}/${stepsTotal} plan steps executed`;
-  } else if (latestToolFailed) {
+  if (latestToolFailed) {
     summary = String(latestToolFailed?.human_line || "").trim() || "A tool call failed.";
+  } else if (latestNotebookEvent && normalizedStatus === "completed") {
+    summary = String(latestNotebookEvent?.human_line || "").trim() || "Notebook synthesis completed.";
+  } else if (normalizedStatus === "completed" && (stepsTotal > 0 || latestSummary?.summary)) {
+    summary = String(latestSummary?.summary || "").trim() || `${stepsCompleted}/${stepsTotal} plan steps executed`;
   } else if (latestStepRetry) {
     summary = String(latestStepRetry?.human_line || "").trim() || "Retrying the current step.";
   } else if (latestToolCalled) {
@@ -922,6 +987,9 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
   }
   if (stepPips.length) {
     preview = stepPips.join("  ·  ");
+    if (latestNotebookEvent && normalizedStatus === "completed") {
+      preview = String(latestNotebookEvent?.human_line || "").trim() || preview;
+    }
   } else if (latestLine) {
     preview = latestLine;
   } else if (normalizedStatus === "completed") {
@@ -936,7 +1004,7 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
     title,
     summary,
     preview,
-    detailsHtml: buildActivityDetailsHtml(stepDetails),
+    detailsHtml: buildActivityDetailsHtml(stepDetails, safeEvents),
     planApproved: !!planApproved,
   };
 }
@@ -2756,12 +2824,10 @@ function analysisComparisonDatasetListHtml(datasets = []) {
               <th>Subjects</th>
               <th>Score</th>
               <th>Notes</th>
-              <th></th>
             </tr>
           </thead>
           <tbody>
             ${rows.slice(0, 12).map((dataset) => {
-              const datasetId = String(dataset?.dataset_id || "").trim();
               const notes = String(dataset?.notes || "").trim();
               const tags = Array.isArray(dataset?.tags) ? dataset.tags : [];
               const subjectCount = dataset?.metrics?.subject_count;
@@ -2775,7 +2841,6 @@ function analysisComparisonDatasetListHtml(datasets = []) {
                   <td>${subjectCount != null && subjectCount !== "" ? escapeHtml(String(subjectCount)) : '<span class="analysis-value-muted">n/a</span>'}</td>
                   <td>${dataset?.overall_score != null ? `<span class="visual-score-pill">${escapeHtml(Number(dataset.overall_score || 0).toFixed(2))}/5</span>` : '<span class="analysis-value-muted">n/a</span>'}</td>
                   <td>${notes ? escapeHtml(notes) : '<span class="analysis-value-muted">No note</span>'}</td>
-                  <td>${datasetId ? `<button class="ghost-btn" type="button" data-action="select-analysis-dataset" data-dataset-id="${escapeHtml(datasetId)}">Select</button>` : ""}</td>
                 </tr>
               `;
             }).join("")}
@@ -2808,13 +2873,15 @@ function analysisNotebookPromptHtml(taskId) {
 function analysisNotebookExecutionHtml(taskId) {
   const iteration = analysisIterationForTask(taskId);
   const steps = Array.isArray(iteration?.task?.steps) ? iteration.task.steps : [];
+  const events = Array.isArray(iteration?.research_log?.events) ? iteration.research_log.events : [];
   const visibleSteps = steps.filter((step) => String(step?.status || "pending").trim() !== "pending");
-  if (!visibleSteps.length) return "";
+  const hasNotebookActivity = notebookActivityEventLines(events).length > 0;
+  if (!visibleSteps.length && !hasNotebookActivity) return "";
   return `
     <section class="analysis-notebook-block is-trace">
       <div class="analysis-notebook-block-label">Trace</div>
       <p class="analysis-notebook-hint">Agent execution trace for this cell.</p>
-      ${buildActivityDetailsHtml(visibleSteps)}
+      ${buildActivityDetailsHtml(visibleSteps, events)}
     </section>
   `;
 }
@@ -3061,13 +3128,15 @@ function analysisNotebookOutputHtml(output) {
     const data = output?.data && typeof output.data === "object" ? output.data : {};
     const html = analysisNotebookMimeData(data, "text/html");
     const svg = analysisNotebookMimeData(data, "image/svg+xml");
+    const png = analysisNotebookMimeData(data, "image/png");
     const plain = analysisNotebookMimeData(data, "text/plain");
     const jsonValue = data["application/json"];
     return `
       <div class="nb-output-item">
         ${html ? `<div class="nb-output-rich">${html}</div>` : ""}
         ${svg ? `<div class="nb-output-svg">${svg}</div>` : ""}
-        ${plain && !html && !svg ? `<pre class="nb-output-plain">${escapeHtml(plain)}</pre>` : ""}
+        ${png ? `<div class="nb-output-image"><img src="data:image/png;base64,${png}" alt="${escapeHtml(plain || "Notebook figure")}" /></div>` : ""}
+        ${plain && !html && !svg && !png ? `<pre class="nb-output-plain">${escapeHtml(plain)}</pre>` : ""}
         ${jsonValue && !html ? `<pre class="nb-output-json">${escapeHtml(JSON.stringify(jsonValue, null, 2))}</pre>` : ""}
       </div>
     `;
@@ -3083,32 +3152,13 @@ function analysisNotebookOutputHtml(output) {
   return "";
 }
 
-function analysisNotebookCellDatasetActionsHtml(cell) {
-  const meta = cell?.metadata?.co_scientist || {};
-  const rows = Array.isArray(meta?.dataset_rows) ? meta.dataset_rows : [];
-  const buttons = rows
-    .map((row) => {
-      const datasetId = String(row?.dataset_id || "").trim();
-      const label = String(row?.dataset_label || row?.accession || datasetId).trim();
-      if (!datasetId || !label) return "";
-      return `<button class="ghost-btn" type="button" data-action="select-analysis-dataset" data-dataset-id="${escapeHtml(datasetId)}">${escapeHtml(label)}</button>`;
-    })
-    .filter(Boolean);
-  if (!buttons.length) return "";
-  return `
-    <div class="nb-cell-actions">
-      <span class="nb-cell-actions-label">Select dataset</span>
-      <div class="nb-cell-actions-row">${buttons.join("")}</div>
-    </div>
-  `;
-}
-
 function analysisNotebookRenderedCellHtml(cell, index) {
   const cellType = String(cell?.cell_type || "").trim();
   const meta = cell?.metadata?.co_scientist || {};
   const taskId = String(meta?.task_id || "").trim();
   const title = String(meta?.title || "").trim();
   const createdAt = String(meta?.created_at || "").trim();
+  const kind = String(meta?.kind || "").trim();
   if (cellType === "markdown") {
     const source = Array.isArray(cell?.source) ? cell.source.join("") : String(cell?.source || "");
     return `
@@ -3125,7 +3175,7 @@ function analysisNotebookRenderedCellHtml(cell, index) {
       <div class="nb-cell-head">
         <div>
           ${title ? `<div class="nb-cell-title">${escapeHtml(title)}</div>` : ""}
-          ${meta?.kind ? `<div class="nb-cell-kind">${escapeHtml(String(meta.kind).replace(/_/g, " "))}</div>` : ""}
+          ${kind ? `<div class="nb-cell-kind">${escapeHtml(kind.replace(/_/g, " "))}</div>` : ""}
         </div>
         ${createdAt ? `<span class="nb-cell-date">${escapeHtml(formatDate(createdAt))}</span>` : ""}
       </div>
@@ -3141,7 +3191,6 @@ function analysisNotebookRenderedCellHtml(cell, index) {
           </div>
         </div>
       ` : ""}
-      ${analysisNotebookCellDatasetActionsHtml(cell)}
     </article>
   `;
 }

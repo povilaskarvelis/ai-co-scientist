@@ -15,8 +15,11 @@ from .dataset_visualization import build_dataset_visualization_bundle
 ANALYSIS_WORKSPACE_SCHEMA = "analysis_workspace.v1"
 ANALYSIS_CONTEXT_SCHEMA = "analysis_context.v1"
 DATASET_CATALOG_SCHEMA = "dataset_catalog.v1"
+METADATA_SNAPSHOT_SCHEMA = "metadata_snapshot.v1"
 DATASET_METADATA_PROFILE_SCHEMA = "dataset_metadata_profile.v1"
 ANALYSIS_NOTE_SCHEMA = "analysis_note.v1"
+ANALYSIS_CODE_CELL_SCHEMA = "analysis_code_cell.v1"
+_OPENNEURO_ACCESSION_RE = re.compile(r"\b(ds\d{6,})\b", re.IGNORECASE)
 
 
 def _utc_now() -> str:
@@ -166,6 +169,75 @@ def _normalize_accession(source_key: str, accession: Any) -> str:
         if prefix.strip().lower() == "dandi":
             text = suffix.strip()
     return text
+
+
+def _is_generic_accession(source_key: str, source: Any, accession: Any) -> bool:
+    normalized = str(accession or "").strip().lower()
+    if not normalized:
+        return True
+    source_text = str(source or "").strip().lower()
+    source_tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", source_text)
+        if token
+    }
+    source_tokens.update({source_key, source_text, "dataset"})
+    return normalized in source_tokens
+
+
+def _infer_openneuro_accession(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        match = _OPENNEURO_ACCESSION_RE.search(text)
+        if match:
+            return str(match.group(1) or "").strip()
+    return ""
+
+
+def _infer_modalities_from_text(*values: Any) -> list[str]:
+    corpus = " ".join(str(value or "") for value in values if str(value or "").strip())
+    normalized = corpus.lower()
+    found: list[str] = []
+    checks = [
+        ("rsfMRI", ("rsfmri", "resting-state fmri", "resting state fmri")),
+        ("fMRI", (" fmri", "functional mri", "functional magnetic resonance imaging")),
+        ("EEG", ("eeg", "electroencephalography")),
+        ("MEG", ("meg", "magnetoencephalography")),
+        ("PET", (" pet", "positron emission tomography")),
+        ("iEEG", ("ieeg", "intracranial eeg")),
+        ("MRI", (" mri", "structural mri", "magnetic resonance imaging")),
+    ]
+    for label, tokens in checks:
+        if any(token in normalized for token in tokens):
+            found.append(label)
+    return _dedupe_strings(found, limit=6, max_chars=24)
+
+
+def _canonical_modality_label(value: Any) -> str:
+    text = _compact_text(value, max_chars=32)
+    normalized = text.strip().lower()
+    mapping = {
+        "eeg": "EEG",
+        "meg": "MEG",
+        "pet": "PET",
+        "ieeg": "iEEG",
+        "mri": "MRI",
+        "fmri": "fMRI",
+        "rsfmri": "rsfMRI",
+    }
+    return mapping.get(normalized, text)
+
+
+def _is_generic_dataset_label(label: str, source: str) -> bool:
+    normalized_label = str(label or "").strip().lower()
+    normalized_source = str(source or "").strip().lower()
+    if not normalized_label:
+        return True
+    if normalized_label in {normalized_source, canonical_source_key(source), "dataset"}:
+        return True
+    return False
 
 
 def canonical_dataset_id(source: Any, accession: Any = "", label: Any = "") -> str:
@@ -373,12 +445,62 @@ def _normalize_dataset_catalog_entry(row: Mapping[str, Any]) -> dict[str, Any]:
         return None
 
     source = _compact_text(row.get("source"), max_chars=48)
-    accession = _compact_text(row.get("accession"), max_chars=48)
-    label = _compact_text(row.get("dataset_label"), max_chars=120) or accession or source or "Dataset"
-    dataset_id = canonical_dataset_id(source, accession, label)
+    source_key = canonical_source_key(source)
+    raw_accession = _compact_text(
+        row.get("accession") or row.get("dataset_accession") or row.get("id"),
+        max_chars=48,
+    )
     metrics = _as_mapping(row.get("metrics"))
     evidence_ids = _dedupe_strings(_as_list(row.get("evidence_ids")), limit=10, max_chars=64)
     tags = _dedupe_strings(_as_list(row.get("tags")), limit=10, max_chars=40)
+
+    title = _compact_text(
+        row.get("title") or row.get("dataset_title") or row.get("name"),
+        max_chars=200,
+    )
+    description = _compact_text(
+        row.get("description") or row.get("summary") or row.get("notes"),
+        max_chars=320,
+    )
+    doi = _compact_text(row.get("doi"), max_chars=120)
+    if not doi:
+        doi = next(
+            (
+                str(item).split("DOI:", 1)[1].strip()
+                for item in evidence_ids
+                if str(item).upper().startswith("DOI:")
+            ),
+            "",
+        )
+    accession = _normalize_accession(source_key, raw_accession)
+    if _is_generic_accession(source_key, source, accession):
+        accession = ""
+    if source_key == "openneuro":
+        inferred_accession = _normalize_accession(
+            source_key,
+            _infer_openneuro_accession(
+                accession,
+                doi,
+                title,
+                row.get("dataset_label"),
+                description,
+                row.get("short_label"),
+                row.get("id"),
+            ),
+        )
+        if inferred_accession:
+            accession = inferred_accession
+        elif accession and not _OPENNEURO_ACCESSION_RE.fullmatch(accession):
+            accession = ""
+
+    label = _compact_text(row.get("dataset_label"), max_chars=120)
+    if _is_generic_dataset_label(label, source):
+        if title and not _is_generic_dataset_label(title, source):
+            label = _compact_text(title, max_chars=120)
+        elif accession:
+            label = f"{source or source_key.title()} {accession}"
+    label = label or accession or source or "Dataset"
+    dataset_id = canonical_dataset_id(source, accession, label)
 
     participant_count = _first_nonempty(
         row,
@@ -393,11 +515,7 @@ def _normalize_dataset_catalog_entry(row: Mapping[str, Any]) -> dict[str, Any]:
     if session_count in (None, "", [], {}):
         session_count = _metric_lookup(metrics, "session_count")
 
-    title = _compact_text(row.get("title") or row.get("dataset_title") or label, max_chars=200) or label
-    description = _compact_text(
-        row.get("description") or row.get("summary") or row.get("notes"),
-        max_chars=320,
-    )
+    title = title or label
 
     inferred_modalities = [
         tag
@@ -405,7 +523,16 @@ def _normalize_dataset_catalog_entry(row: Mapping[str, Any]) -> dict[str, Any]:
         if tag.upper() in {"MRI", "FMRI", "RSFMRI", "EEG", "MEG", "PET", "IEEG"}
         or tag.lower().startswith("modality:")
     ]
-    modalities = _list_field("modalities", "modality", fallback=inferred_modalities)
+    inferred_modalities.extend(
+        item
+        for item in _infer_modalities_from_text(label, title, description)
+        if item not in inferred_modalities
+    )
+    modalities = _dedupe_strings(
+        [_canonical_modality_label(item) for item in _list_field("modalities", "modality", fallback=inferred_modalities)],
+        limit=8,
+        max_chars=24,
+    )
     diagnoses = _list_field("diagnoses", "conditions", "condition")
     tasks = _list_field("tasks", "task")
     public_download = _bool_field("public_download", "is_public", "downloadable")
@@ -420,16 +547,6 @@ def _normalize_dataset_catalog_entry(row: Mapping[str, Any]) -> dict[str, Any]:
             bids = metric_bids
         elif any(str(tag).strip().lower() == "bids" for tag in tags):
             bids = True
-    doi = _compact_text(row.get("doi"), max_chars=120)
-    if not doi:
-        doi = next(
-            (
-                str(item).split("DOI:", 1)[1].strip()
-                for item in evidence_ids
-                if str(item).upper().startswith("DOI:")
-            ),
-            "",
-        )
     license_text = _compact_text(
         row.get("license") or _metric_lookup(metrics, "license"),
         max_chars=80,
@@ -893,6 +1010,71 @@ def append_dataset_catalog_artifact(
     }
 
 
+def append_metadata_snapshot_artifact(
+    workspace: dict[str, Any],
+    *,
+    task_id: str,
+    user_prompt: str,
+    objective: str,
+    summary: str,
+    dimensions: list[Any],
+    datasets: list[Any],
+    notes: list[str] | None = None,
+) -> dict[str, Any]:
+    payload = build_dataset_catalog_payload(
+        objective=objective,
+        summary=summary,
+        dimensions=dimensions,
+        datasets=datasets,
+        notes=notes,
+    )
+    payload["schema"] = METADATA_SNAPSHOT_SCHEMA
+    dataset_ids = [
+        str(item.get("dataset_id") or "").strip()
+        for item in payload.get("datasets", [])
+        if str(item.get("dataset_id") or "").strip()
+    ]
+    operation = _ensure_operation(
+        workspace,
+        task_id=task_id,
+        user_prompt=user_prompt,
+        intent="dataset_search_compare",
+        target_dataset_ids=dataset_ids,
+    )
+    title = _compact_text(summary or objective or "Metadata snapshot", max_chars=160) or "Metadata snapshot"
+    artifact, cell = _append_artifact_cell(
+        workspace,
+        task_id=task_id,
+        operation=operation,
+        artifact_type="metadata_snapshot",
+        artifact_schema=METADATA_SNAPSHOT_SCHEMA,
+        title=title,
+        summary=summary or objective,
+        payload=payload,
+        cell_type="metadata_snapshot",
+    )
+    for dataset in payload.get("datasets", []):
+        dataset_id = str(dataset.get("dataset_id") or "").strip()
+        if not dataset_id:
+            continue
+        _upsert_workspace_dataset(
+            workspace,
+            dataset_id=dataset_id,
+            source=str(dataset.get("source") or "").strip(),
+            accession=str(dataset.get("accession") or "").strip(),
+            label=str(dataset.get("dataset_label") or "").strip(),
+            tags=list(dataset.get("tags") or []),
+            artifact_type="metadata_snapshot",
+            artifact_id=str(artifact.get("artifact_id") or "").strip(),
+        )
+    return {
+        "operation_id": operation["operation_id"],
+        "artifact_id": artifact["artifact_id"],
+        "cell_id": cell["cell_id"],
+        "payload": payload,
+    }
+
+
 def append_dataset_metadata_artifact(
     workspace: dict[str, Any],
     *,
@@ -997,6 +1179,64 @@ def append_analysis_note_artifact(
     }
 
 
+def append_notebook_code_cell_artifact(
+    workspace: dict[str, Any],
+    *,
+    task_id: str,
+    user_prompt: str,
+    source_code: str,
+    outputs: list[Mapping[str, Any]],
+    title: str = "",
+    summary: str = "",
+    cell_kind: str = "analysis_code",
+    output_summary: list[str] | None = None,
+    context_artifact_ids: list[str] | None = None,
+    selected_dataset_id: str | None = None,
+) -> dict[str, Any]:
+    clean_source = str(source_code or "").strip()
+    if not clean_source:
+        raise ValueError("source_code must not be empty.")
+
+    resolved_kind = _slugify(cell_kind or "analysis_code", fallback="analysis_code", max_chars=32).replace("-", "_")
+    operation = _ensure_operation(
+        workspace,
+        task_id=task_id,
+        user_prompt=user_prompt,
+        intent="dataset_metadata" if selected_dataset_id else "dataset_search_compare",
+        target_dataset_ids=[selected_dataset_id] if selected_dataset_id else [],
+    )
+    payload = {
+        "schema": ANALYSIS_CODE_CELL_SCHEMA,
+        "created_at": _utc_now(),
+        "language": "python",
+        "kind": resolved_kind,
+        "source_code": clean_source,
+        "outputs": [dict(item) for item in list(outputs or [])],
+        "output_summary": _dedupe_strings(output_summary or [], limit=8, max_chars=80),
+        "context_artifact_ids": _dedupe_strings(context_artifact_ids or [], limit=8, max_chars=64),
+    }
+    resolved_title = _compact_text(title, max_chars=160) or "Notebook analysis cell"
+    artifact, cell = _append_artifact_cell(
+        workspace,
+        task_id=task_id,
+        operation=operation,
+        artifact_type="analysis_code_cell",
+        artifact_schema=ANALYSIS_CODE_CELL_SCHEMA,
+        title=resolved_title,
+        summary=summary or resolved_title,
+        payload=payload,
+        cell_type="analysis_code",
+        dataset_id=selected_dataset_id or None,
+        depends_on=list(payload.get("context_artifact_ids") or []),
+    )
+    return {
+        "operation_id": operation["operation_id"],
+        "artifact_id": artifact["artifact_id"],
+        "cell_id": cell["cell_id"],
+        "payload": payload,
+    }
+
+
 def set_selected_dataset(workspace: dict[str, Any], dataset_id: str) -> bool:
     normalized = str(dataset_id or "").strip()
     if not normalized:
@@ -1070,15 +1310,19 @@ def task_analysis_snapshot(workspace: dict[str, Any], *, task_id: str) -> dict[s
 
 
 __all__ = [
+    "ANALYSIS_CODE_CELL_SCHEMA",
     "ANALYSIS_CONTEXT_SCHEMA",
     "ANALYSIS_NOTE_SCHEMA",
     "ANALYSIS_WORKSPACE_SCHEMA",
     "DATASET_CATALOG_SCHEMA",
     "DATASET_METADATA_PROFILE_SCHEMA",
+    "METADATA_SNAPSHOT_SCHEMA",
     "analysis_context_payload",
     "append_analysis_note_artifact",
     "append_dataset_catalog_artifact",
+    "append_metadata_snapshot_artifact",
     "append_dataset_metadata_artifact",
+    "append_notebook_code_cell_artifact",
     "build_dataset_catalog_payload",
     "canonical_dataset_id",
     "ensure_analysis_workspace",

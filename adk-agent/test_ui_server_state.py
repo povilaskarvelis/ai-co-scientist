@@ -1,3 +1,4 @@
+import asyncio
 import os
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ for _env_name in ("AI_CO_SCIENTIST_POSTGRES_DSN", "POSTGRES_DSN", "DATABASE_URL"
 import co_scientist.workflow as workflow
 import ui_server
 from co_scientist.workflow import (
+    STATE_ACTIVE_TASK_CONTEXT,
     STATE_ANALYSIS_NOTEBOOK,
     STATE_ANALYSIS_WORKSPACE,
     STATE_EXECUTOR_ACTIVE_STEP_ID,
@@ -45,6 +47,60 @@ def runtime(tmp_path, monkeypatch):
     runtime.ready = True
     runtime.ready_error = None
     return runtime
+
+
+@pytest.mark.asyncio
+async def test_runtime_shutdown_closes_runner_and_mcp_tools(tmp_path):
+    class ClosableRunner:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class ClosableMcpTools:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    runtime = ui_server.UiRuntime(tmp_path / "workflow_tasks.json")
+    runtime.ready = True
+    runtime.ready_error = None
+    runner = ClosableRunner()
+    mcp_tools = ClosableMcpTools()
+    runtime.conv_sessions["conv_test"] = ui_server.ConversationSession(
+        runner=runner,
+        session_id="sess_1",
+        app_name="app_test",
+        mcp_tools=mcp_tools,
+        mode="analysis",
+    )
+
+    await runtime.shutdown()
+
+    assert runner.closed is True
+    assert mcp_tools.closed is True
+
+
+def test_close_worker_event_loop_cancels_pending_tasks():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    state = {"cancelled": False}
+
+    async def pending_forever():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+
+    loop.create_task(pending_forever())
+    loop.run_until_complete(asyncio.sleep(0))
+    ui_server._close_worker_event_loop(loop)
+
+    assert state["cancelled"] is True
 
 
 def _sample_graph_task_state() -> dict:
@@ -229,6 +285,70 @@ def test_notebook_synthesizer_tool_outcome_surfaces_notebook_failures():
     assert "Need at least two comparison dimensions" in event["human_line"]
 
 
+def test_notebook_synthesizer_tool_outcome_surfaces_notebook_code_cell_success():
+    response = SimpleNamespace(
+        name="store_notebook_code_cell",
+        response={
+            "ok": True,
+            "message": "Stored notebook code cell. Outputs: comparison table, participants per dataset.",
+        },
+    )
+
+    event = ui_server._notebook_synthesizer_tool_outcome(
+        response,
+        author="analysis_notebook_synthesizer",
+    )
+
+    assert event is not None
+    assert event["event_type"] == "notebook.tool.completed"
+    assert event["status"] == "done"
+    assert "participants per dataset" in event["human_line"]
+
+
+def test_analysis_notebook_retry_needed_is_disabled():
+    wf_state = {
+        "notebook_synthesis_diagnostics": [
+            {
+                "status": "error",
+                "metrics": {"kind": "analysis_code_missing"},
+            }
+        ]
+    }
+    workspace = {
+        "cells": [
+            {"task_id": "task_a", "type": "dataset_comparison"},
+        ]
+    }
+
+    assert ui_server._analysis_notebook_retry_needed(
+        wf_state=wf_state,
+        workspace=workspace,
+        task_id="task_a",
+    ) is False
+
+
+def test_analysis_notebook_retry_not_needed_when_agent_code_exists():
+    wf_state = {
+        "notebook_synthesis_diagnostics": [
+            {
+                "status": "error",
+                "metrics": {"kind": "analysis_code_missing"},
+            }
+        ]
+    }
+    workspace = {
+        "cells": [
+            {"task_id": "task_a", "type": "analysis_code"},
+        ]
+    }
+
+    assert ui_server._analysis_notebook_retry_needed(
+        wf_state=wf_state,
+        workspace=workspace,
+        task_id="task_a",
+    ) is False
+
+
 def test_derive_run_error_message_strips_markdown_noise():
     message = ui_server._derive_run_error_message(
         "## Execution Error\n\nVertex AI quota or rate limit exhausted.\n\n`429 RESOURCE_EXHAUSTED`",
@@ -322,6 +442,39 @@ async def test_get_or_create_session_rehydrates_persisted_state(runtime):
 
 
 @pytest.mark.asyncio
+async def test_get_or_create_session_rehydrates_analysis_task_context_from_workflow_session(runtime):
+    runtime.store.save_workflow_session(
+        "conv_rehydrate_analysis",
+        task_id="task_rehydrate_analysis",
+        state={
+            STATE_WORKFLOW_TASK: {"objective": "Plot schizophrenia dataset metadata", "steps": []},
+            STATE_ANALYSIS_WORKSPACE: {"schema": "analysis_workspace.v1", "conversation_id": "conv_rehydrate_analysis"},
+        },
+    )
+
+    cs = await runtime._get_or_create_session("conv_rehydrate_analysis", mode="analysis")
+    session = await runtime.session_service.get_session(
+        app_name=cs.app_name,
+        user_id=runtime.user_id,
+        session_id=cs.session_id,
+    )
+
+    assert session is not None
+    assert session.state[STATE_ACTIVE_TASK_CONTEXT] == {
+        "conversation_id": "conv_rehydrate_analysis",
+        "task_id": "task_rehydrate_analysis",
+        "user_prompt": "Plot schizophrenia dataset metadata",
+        "mode": "analysis",
+    }
+    assert session.state[STATE_WORKFLOW_TASK]["analysis_runtime_context"] == {
+        "conversation_id": "conv_rehydrate_analysis",
+        "task_id": "task_rehydrate_analysis",
+        "user_prompt": "Plot schizophrenia dataset metadata",
+        "mode": "analysis",
+    }
+
+
+@pytest.mark.asyncio
 async def test_get_or_create_session_initializes_analysis_workspace(runtime):
     cs = await runtime._get_or_create_session("conv_analysis_workspace", mode="analysis")
     session = await runtime.session_service.get_session(
@@ -333,6 +486,35 @@ async def test_get_or_create_session_initializes_analysis_workspace(runtime):
     assert session is not None
     assert session.state[STATE_ANALYSIS_WORKSPACE]["schema"] == "analysis_workspace.v1"
     assert session.state[STATE_ANALYSIS_WORKSPACE]["conversation_id"] == "conv_analysis_workspace"
+
+
+@pytest.mark.asyncio
+async def test_set_active_task_context_updates_analysis_runtime_context(runtime):
+    cs = await runtime._get_or_create_session("conv_set_active_analysis", mode="analysis")
+    session = await runtime.session_service.get_session(
+        app_name=cs.app_name,
+        user_id=runtime.user_id,
+        session_id=cs.session_id,
+    )
+    assert session is not None
+    session.state[STATE_WORKFLOW_TASK] = {"objective": "Plot schizophrenia dataset metadata", "steps": []}
+
+    await runtime._set_active_task_context(
+        "conv_set_active_analysis",
+        task_id="task_set_active_analysis",
+        user_prompt="Plot schizophrenia dataset metadata",
+        mode="analysis",
+    )
+
+    updated = await runtime._read_session_state("conv_set_active_analysis")
+    assert updated is not None
+    assert updated[STATE_ACTIVE_TASK_CONTEXT]["task_id"] == "task_set_active_analysis"
+    assert updated[STATE_WORKFLOW_TASK]["analysis_runtime_context"] == {
+        "conversation_id": "conv_set_active_analysis",
+        "task_id": "task_set_active_analysis",
+        "user_prompt": "Plot schizophrenia dataset metadata",
+        "mode": "analysis",
+    }
 
 
 @pytest.mark.asyncio
@@ -410,8 +592,8 @@ async def test_get_conversation_analysis_notebook_returns_notebook(runtime):
                         "latest_artifact_ids": {},
                     }
                 },
-                "artifacts": {
-                    "artifact_1": {
+                    "artifacts": {
+                        "artifact_1": {
                         "artifact_id": "artifact_1",
                         "type": "dataset_catalog",
                         "schema": "dataset_catalog.v1",
@@ -470,23 +652,58 @@ async def test_get_conversation_analysis_notebook_returns_notebook(runtime):
                                 ]
                             },
                             "notes": ["Auto-generated comparison."],
-                            "warnings": [],
+                                "warnings": [],
+                            },
                         },
-                    }
-                },
-                "cells": [
-                    {
-                        "cell_id": "cell_1",
-                        "type": "dataset_comparison",
+                        "artifact_2": {
+                            "artifact_id": "artifact_2",
+                            "type": "analysis_code_cell",
+                            "schema": "analysis_code_cell.v1",
+                            "title": "Reusable schizophrenia datasets",
+                            "summary": "Notebook overview",
+                            "payload": {
+                                "schema": "analysis_code_cell.v1",
+                                "language": "python",
+                                "kind": "dataset_comparison",
+                                "source_code": (
+                                    "display(comparison_df[['accession', 'dataset_label']].copy())\n"
+                                ),
+                                "outputs": [
+                                    {
+                                        "output_type": "display_data",
+                                        "data": {
+                                            "text/plain": "table",
+                                            "text/html": "<table><tr><td>ds001461</td></tr></table>",
+                                        },
+                                        "metadata": {},
+                                    }
+                                ],
+                                "output_summary": ["comparison table"],
+                                "context_artifact_ids": ["artifact_1"],
+                            },
+                        },
+                    },
+                    "cells": [
+                        {
+                            "cell_id": "cell_1",
+                            "type": "dataset_comparison",
                         "task_id": "task_analysis_notebook",
                         "created_at": "2026-03-29T00:00:00Z",
-                        "title": "Reusable schizophrenia datasets",
-                        "artifact_id": "artifact_1",
-                    }
-                ],
-                "operations": [],
-            }
-        },
+                            "title": "Reusable schizophrenia datasets",
+                            "artifact_id": "artifact_1",
+                        },
+                        {
+                            "cell_id": "cell_2",
+                            "type": "analysis_code",
+                            "task_id": "task_analysis_notebook",
+                            "created_at": "2026-03-29T00:05:00Z",
+                            "title": "Reusable schizophrenia datasets",
+                            "artifact_id": "artifact_2",
+                        },
+                    ],
+                    "operations": [],
+                }
+            },
     )
 
     payload = await runtime.get_conversation_analysis_notebook("conv_analysis_notebook_read")
@@ -495,6 +712,9 @@ async def test_get_conversation_analysis_notebook_returns_notebook(runtime):
     assert payload["schema"] == "analysis_notebook.v1"
     assert payload["download_path"].endswith("/analysis-notebook.ipynb")
     assert any(cell["cell_type"] == "code" for cell in payload["notebook"]["cells"])
+    header_cell = next(cell for cell in payload["notebook"]["cells"] if cell.get("cell_type") == "markdown")
+    header_source = "".join(header_cell.get("source", []))
+    assert "Selected dataset:" not in header_source
     ipynb_text = ui_server.serialize_notebook_ipynb({"notebook": payload["notebook"]})
     assert '"nbformat": 4' in ipynb_text
 

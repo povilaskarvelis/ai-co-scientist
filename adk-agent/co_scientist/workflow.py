@@ -31,6 +31,7 @@ import random
 import time
 from typing import Any
 from typing import Mapping
+from typing import Sequence
 import urllib.parse
 import urllib.request
 
@@ -47,15 +48,25 @@ from google.genai import types
 from mcp.client.stdio import StdioServerParameters
 
 from .analysis_workspace import (
+    ANALYSIS_CODE_CELL_SCHEMA,
     analysis_context_payload,
     append_analysis_note_artifact,
     append_dataset_catalog_artifact,
     append_dataset_metadata_artifact,
+    append_metadata_snapshot_artifact,
+    append_notebook_code_cell_artifact,
+    build_dataset_catalog_payload,
+    canonical_source_key,
     ensure_analysis_workspace,
+    _is_generic_dataset_label,
     parse_json_array_text,
     parse_json_object_text,
 )
-from .analysis_notebook import build_analysis_notebook
+from .analysis_notebook import (
+    build_analysis_notebook,
+    execute_agent_notebook_cell,
+    summarize_notebook_outputs,
+)
 from . import tool_registry
 from .dataset_visualization import (
     build_dataset_visualization_bundle,
@@ -730,23 +741,52 @@ You are the notebook synthesizer for the open-data analysis workflow.
 You will receive structured task-state context and analysis-workspace context.
 
 Your job has two outputs:
-1. Append structured notebook artifacts using the provided notebook tools.
+1. Append agent-authored notebook code using the provided notebook tools.
 2. Return concise user-facing Markdown summarizing only this analysis operation.
 
 Notebook rules:
-- Every completed analysis task should append at least one notebook cell.
-- For multi-dataset search, shortlist, compare, ranking, or plotting/visualization follow-up tasks, you MUST call `store_dataset_catalog` before returning Markdown unless the current task already has a usable `dataset_comparison` cell.
-- `append_analysis_note` alone is not sufficient for dataset-comparison tasks.
+- Every completed analysis task should append at least one real notebook cell.
+- Almost every completed analysis task should also append an `analysis_note` that summarizes the step in plain language.
+- For multi-dataset comparison or visualization tasks, the runtime prepares a deterministic metadata snapshot before you are called. Use that prepared snapshot and call `store_notebook_code_cell`.
+- Do not rebuild dataset catalogs from prose. The metadata snapshot is the source of truth for notebook code.
+- For metadata-comparison or plotting tasks, `append_analysis_note` is required but not sufficient; pair it with `store_notebook_code_cell`.
 - For single-dataset inspection tasks, call `store_dataset_metadata_profile`.
-- After storing the main artifact, call `append_analysis_note` with a concise interpretation and next-step framing.
+- For metadata inspection tasks that should appear as notebook output, call `store_notebook_code_cell` after storing the metadata profile. There is no backend metadata fallback renderer.
+- Use `append_analysis_note` for the main step summary. It should explain what this step found, how well it answers the user's request, what caveats or ambiguities remain, and what next step now makes sense. Do not spend that note describing table layout or plotting mechanics.
+- When a task includes both an `analysis_note` and a code cell, prefer to append the note first so the notebook reads like a narrative summary followed by evidence.
 - Use compact JSON strings only for tool payloads.
-- Do not pass raw source payloads directly into notebook tools. Normalize NEMAR, OpenNeuro, and DANDI records into common fields first.
-- For plain dataset discovery, comparison, or plotting tasks, call `store_dataset_catalog` with `dimensions_json="[]"`; do not invent ranking dimensions just to satisfy the tool call.
-- For default dataset discovery and plotting, prefer raw metadata fields over heuristic scores. Use scores only when the user explicitly asks for ranking.
 - Do not auto-select a dataset from a multi-dataset comparison result.
 - When the task explicitly inspects one dataset, ensure the metadata profile clearly identifies that dataset.
 - If the user asks to plot, chart, graph, or visualize an already-completed comparison, reuse the current task's completed-step evidence and notebook context. Do not start a new discovery plan just to render the comparison.
 - Do not claim that visualization generation failed unless a notebook tool actually returned an error in this turn.
+
+Notebook code-cell rules:
+- `store_notebook_code_cell` executes your Python against injected notebook bindings for the current task.
+- `analysis_request`, `analysis_context`, `pd`, `np`, `plt`, `sns`, `display`, and `display_figure` are always available.
+- For comparison or retrieval-summary tasks, `metadata_snapshot`, `catalog_payload`, `catalog_df`, `comparison_df`, and `catalog_profile` are available.
+- For single-dataset inspection tasks, `dataset_profile` is available.
+- For list-like fields such as `modalities`, `diagnoses`, `tasks`, or `tags`, prefer `multivalue_long_df(...)` and `multivalue_presence_df(...)` instead of manual `explode(...).set_index(...).reindex(...)` patterns.
+- Use notebook-style code. Show tidy tables and a few high-value figures. Do not dump raw lists, dicts, or TSV text.
+- If you emit `stdout`, keep it to a brief orienting caption. The main step summary belongs in `append_analysis_note`, not in code-cell `stdout`.
+- Prefer real Python plotting with matplotlib or seaborn.
+- Choose plots from the available fields instead of assuming one fixed layout. If participant counts, modalities, tasks, diagnoses, or access fields are present, visualize the ones that best answer the user’s request.
+- Prefer quantitative and comparative views over binary 0/1 plots. If numeric metadata exists, prioritize sample-size charts, distributions, scatter plots, grouped counts, and informative heatmaps. Use presence/coverage matrices only as a secondary view when they genuinely help.
+- For metadata comparison turns, the first displayed table should cover the key fields that actually exist, prioritizing `dataset_id` / `accession`, `participant_count`, `session_count`, `modalities`, `tasks`, `diagnoses`, `doi`, and access/download flags.
+- If `participant_count` exists for any dataset, include it in that comparison table and devote at least one figure to sample size or its distribution. Do not silently omit sample size when it is available.
+- If an important field is mostly missing, show that fact explicitly in the table or a short note rather than pretending it is not part of the metadata.
+- When the query asks for a condition, population, modality, or phenotype and only part of the metadata explicitly supports that match, say so plainly. Distinguish strong matches from broad search hits or under-specified rows instead of implying they all answer the query equally well.
+- Inside notebook code, imports are limited to pandas/numpy/matplotlib/seaborn/json/math/statistics/collections/itertools. Do not import plotly, altair, tabulate, or IPython.
+- Display tables with `display(dataframe)`. Do not use `to_markdown()`, `tabulate`, or raw TSV strings.
+- Do not assume an `id` column exists. Prefer `dataset_id` or `accession` for plot axes so figures stay compact; use `dataset_label` mainly in tables when useful.
+- A good comparison notebook cell usually shows one tidy comparison table first, then 2-4 informative figures arranged with subplots when appropriate.
+- Good figure ideas when fields are available:
+  `participant_count`: sorted bar chart, histogram, box plot, or scatter against metadata richness
+  `modalities` / `tasks` / `diagnoses`: grouped count plots or heatmaps
+  metadata completeness: heatmap of populated fields by dataset
+  multiple numeric columns: scatter plots comparing dataset size, session count, and metadata richness
+- Use subplot layouts when several small views belong together instead of emitting many disconnected mini-plots.
+- Finish figures with `plt.tight_layout()` and `plt.show()` or `display_figure(fig)`.
+- If you skip `store_notebook_code_cell`, the notebook will show a diagnostic instead of a rendered comparison or metadata cell.
 
 Metadata profile rules:
 - The metadata profile should use these fixed sections:
@@ -6611,8 +6651,99 @@ def _get_active_task_context_from_state_map(state: Mapping[str, Any] | None) -> 
     return dict(context) if isinstance(context, Mapping) else {}
 
 
+def _task_state_analysis_context(task_state: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(task_state, Mapping):
+        return {}
+    context = task_state.get("analysis_runtime_context")
+    return dict(context) if isinstance(context, Mapping) else {}
+
+
+def _store_task_state_analysis_context(
+    task_state: dict[str, Any] | None,
+    *,
+    conversation_id: str = "",
+    task_id: str = "",
+    user_prompt: str = "",
+    mode: str = WORKFLOW_MODE_ANALYSIS,
+) -> None:
+    if not isinstance(task_state, dict):
+        return
+    existing = _task_state_analysis_context(task_state)
+    resolved = {
+        "conversation_id": str(
+            conversation_id or existing.get("conversation_id") or ""
+        ).strip(),
+        "task_id": str(task_id or existing.get("task_id") or "").strip(),
+        "user_prompt": str(
+            user_prompt or existing.get("user_prompt") or task_state.get("objective") or ""
+        ).strip(),
+        "mode": _normalize_workflow_mode(mode or existing.get("mode") or WORKFLOW_MODE_ANALYSIS),
+    }
+    if any(resolved.get(key) for key in ("conversation_id", "task_id", "user_prompt")):
+        task_state["analysis_runtime_context"] = resolved
+
+
+def _latest_workspace_task_context(workspace: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(workspace, Mapping):
+        return {}
+    conversation_id = str(workspace.get("conversation_id") or "").strip()
+    for operation in reversed(list(workspace.get("operations", []) or [])):
+        if not isinstance(operation, Mapping):
+            continue
+        task_id = str(operation.get("task_id") or "").strip()
+        if not task_id:
+            continue
+        return {
+            "conversation_id": conversation_id,
+            "task_id": task_id,
+            "user_prompt": str(operation.get("user_prompt") or "").strip(),
+            "mode": WORKFLOW_MODE_ANALYSIS,
+        }
+    for cell in reversed(list(workspace.get("cells", []) or [])):
+        if not isinstance(cell, Mapping):
+            continue
+        task_id = str(cell.get("task_id") or "").strip()
+        if not task_id:
+            continue
+        return {
+            "conversation_id": conversation_id,
+            "task_id": task_id,
+            "user_prompt": "",
+            "mode": WORKFLOW_MODE_ANALYSIS,
+        }
+    return {"conversation_id": conversation_id, "mode": WORKFLOW_MODE_ANALYSIS} if conversation_id else {}
+
+
+def _resolve_analysis_runtime_context(
+    *,
+    state: Mapping[str, Any] | None,
+    task_state: Mapping[str, Any] | None = None,
+    workspace: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    state_context = _get_active_task_context_from_state_map(state)
+    task_context = _task_state_analysis_context(task_state)
+    workspace_context = _latest_workspace_task_context(workspace)
+    resolved: dict[str, Any] = {}
+    for source in (workspace_context, task_context, state_context):
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("conversation_id", "task_id", "user_prompt", "mode"):
+            value = str(source.get(key) or "").strip()
+            if value:
+                resolved[key] = value
+    if "mode" not in resolved:
+        resolved["mode"] = WORKFLOW_MODE_ANALYSIS
+    return resolved
+
+
 def _get_active_task_context(callback_context: CallbackContext) -> dict[str, Any]:
-    return _get_active_task_context_from_state_map(callback_context.state)
+    task_state = _get_task_state(callback_context)
+    workspace = _get_analysis_workspace(callback_context)
+    return _resolve_analysis_runtime_context(
+        state=callback_context.state,
+        task_state=task_state,
+        workspace=workspace,
+    )
 
 
 def _derive_analysis_intent_hint(user_text: str, workspace: dict[str, Any] | None = None) -> str:
@@ -6687,12 +6818,28 @@ def _analysis_completed_step_corpus(task_state: dict[str, Any]) -> str:
     for step in task_state.get("steps", []) or []:
         if str(step.get("status", "")).strip() != "completed":
             continue
-        parts.append(str(step.get("result_summary") or ""))
+        for key in ("result_summary", "step_progress_note", "executor_prose", "output", "tool_trace"):
+            value = step.get(key)
+            if value not in (None, "", [], {}):
+                parts.append(str(value))
         for eid in step.get("evidence_ids") or []:
             parts.append(str(eid))
         for entry in step.get("tool_log") or []:
-            parts.append(str(entry.get("summary") or ""))
-            parts.append(str(entry.get("result") or ""))
+            for key in ("summary", "result", "evidence_text"):
+                value = entry.get(key)
+                if value not in (None, "", [], {}):
+                    parts.append(str(value))
+    for event in task_state.get("progress_events", []) or []:
+        if not isinstance(event, Mapping):
+            continue
+        if str(event.get("status", "")).strip() not in {"done", "completed"}:
+            continue
+        parts.append(str(event.get("human_line") or ""))
+        metrics = event.get("metrics") if isinstance(event.get("metrics"), Mapping) else {}
+        for key in ("findings", "rendered_step_markdown", "message", "progress"):
+            value = metrics.get(key)
+            if value not in (None, "", [], {}):
+                parts.append(str(value))
     return "\n".join(parts)
 
 
@@ -6716,22 +6863,114 @@ def _score_scale_range(value: float, lo: float, hi: float) -> float:
 
 
 def _openneuro_chunk_for_accession(corpus: str, accession: str) -> str:
+    text = str(corpus or "")
     esc = re.escape(accession)
-    matches = list(re.finditer(rf"\b{esc}\b", corpus, flags=re.IGNORECASE))
-    if not matches:
+    candidates: list[str] = []
+    max_chunk_chars = 900
+
+    def _add_candidate(raw: str) -> None:
+        normalized = re.sub(r"\s+", " ", str(raw or "").strip())[:max_chunk_chars]
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    for match in re.finditer(
+        rf"\*{{0,2}}{esc}\*{{0,2}}\s*:",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        start = match.start()
+        next_head = re.search(
+            r"\*{0,2}ds\d{6,}\*{0,2}\s*:",
+            text[match.end() :],
+            flags=re.IGNORECASE,
+        )
+        end = match.end() + next_head.start() if next_head else min(len(text), start + max_chunk_chars)
+        _add_candidate(text[start:end])
+
+    for match in re.finditer(
+        rf"\(\s*{esc}\s*\)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        prefix = text[: match.start()]
+        start = prefix.rfind("OpenNeuro:")
+        if start == -1:
+            start = max(0, match.start() - 220)
+        suffix = text[match.end() :]
+        next_openneuro = suffix.find("OpenNeuro:")
+        next_markdown = re.search(r"\*{0,2}ds\d{6,}\*{0,2}\s*:", suffix, flags=re.IGNORECASE)
+        end_candidates = [
+            pos
+            for pos in (
+                next_openneuro if next_openneuro >= 0 else None,
+                next_markdown.start() if next_markdown else None,
+            )
+            if pos is not None and pos >= 0
+        ]
+        end = match.end() + (min(end_candidates) if end_candidates else min(len(suffix), 320))
+        _add_candidate(text[start:end])
+
+    for line in text.splitlines():
+        if re.search(rf"\b{esc}\b", line, flags=re.IGNORECASE):
+            _add_candidate(line)
+
+    matches = list(re.finditer(rf"\b{esc}\b", text, flags=re.IGNORECASE))
+    if not matches and not candidates:
         return accession
-    m0 = matches[0]
-    tail = corpus[m0.start() :]
-    m_next = re.search(r"\bds\d{6,}\b", tail[len(accession) :], flags=re.IGNORECASE)
-    if m_next:
-        return tail[: len(accession) + m_next.start()]
-    return tail[:400]
+    if not candidates:
+        for match in matches:
+            start = max(0, match.start() - 180)
+            tail = text[start : min(len(text), match.start() + 420)]
+            _add_candidate(tail)
+
+    def _chunk_score(chunk: str) -> tuple[int, int]:
+        lowered = chunk.lower()
+        score = 0
+        if re.match(rf'^\*{{0,2}}{esc}\*{{0,2}}\s*:', chunk, flags=re.IGNORECASE):
+            score += 10
+        if re.match(r"^OpenNeuro:", chunk, flags=re.IGNORECASE):
+            score += 8
+        if re.search(r"\b(?:subjects?|participants?)\s*:\s*\d+\b", chunk, flags=re.IGNORECASE):
+            score += 12
+        if re.search(r"\b\d+\s*(?:subjects?|participants?)\b", chunk, flags=re.IGNORECASE):
+            score += 12
+        if re.search(r"10\.18112/openneuro\.", chunk, flags=re.IGNORECASE):
+            score += 8
+        accession_hits = re.findall(r"\bds\d{6,}\b", chunk, flags=re.IGNORECASE)
+        other_hits = [hit for hit in accession_hits if hit.lower() != accession.lower()]
+        if other_hits:
+            score -= 10 * len(other_hits)
+        if "task" in lowered:
+            score += 4
+        if "diagnosis" in lowered or "schizo" in lowered or "psychosis" in lowered:
+            score += 3
+        if "modality" in lowered or "modalities" in lowered:
+            score += 3
+        return score, len(chunk)
+
+    return max(candidates, key=_chunk_score)[:max_chunk_chars]
 
 
 def _openneuro_named_title_for_accession(corpus: str, accession: str) -> str:
+    for line in str(corpus or "").splitlines():
+        if not re.search(rf"\b{re.escape(accession)}\b", line, flags=re.IGNORECASE):
+            continue
+        line_patterns = (
+            rf"OpenNeuro:\s*(.+?)\s*\(\s*{re.escape(accession)}\s*\)",
+            rf"\*{{0,2}}{re.escape(accession)}\*{{0,2}}\s*:\s*[\"“]?(.+?)[\"”]?(?:\s*\(|\s+with\b|$)",
+        )
+        for pattern in line_patterns:
+            match = re.search(pattern, line, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = re.sub(r"\s+", " ", str(match.group(1) or "").strip()).strip(" ,.;")
+            if candidate and accession.lower() not in candidate.lower():
+                if len(candidate) > 160:
+                    candidate = f"{candidate[:157].rstrip()}..."
+                return candidate
     patterns = (
         rf"OpenNeuro:\s*(.+?)\s*\(\s*{re.escape(accession)}\s*\)",
-        rf"\b{re.escape(accession)}\s*:\s*([^.\n]+?)(?=\s+\bds\d{{6,}}\b|$)",
+        rf"\b{re.escape(accession)}\b\s*:\s*(.+?)(?:\s*\(|\s+with\b|$)",
     )
     for pattern in patterns:
         match = re.search(pattern, corpus, flags=re.IGNORECASE)
@@ -6747,18 +6986,47 @@ def _openneuro_named_title_for_accession(corpus: str, accession: str) -> str:
 
 def _openneuro_title_from_chunk(chunk: str) -> str:
     text = str(chunk or "").strip()
+    text = re.sub(r"^[-*]\s*Querying OpenNeuro\s*[→-]\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^\*{0,2}ds\d{6,}\*{0,2}\s*:\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^OpenNeuro:\s*", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"^ds\d{6,}\s*", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"^[:—–-]\s*", "", text)
     line = text.splitlines()[0] if text else ""
-    if "(" in line:
-        line = line[: line.index("(")]
-    line = re.sub(r"\s+", " ", line).strip(" ,.;")
+    line = re.sub(r"\(\s*ds\d{6,}\s*\)\.?", "", line, flags=re.IGNORECASE)
+    line = re.sub(r"\s+with\s+\d+\s+(?:subjects?|participants?).*$", "", line, flags=re.IGNORECASE)
+    line = re.sub(r"\s+latest snapshot.*$", "", line, flags=re.IGNORECASE)
+    line = re.sub(r"\s+-\s*Querying OpenNeuro.*$", "", line, flags=re.IGNORECASE)
+    line = re.sub(r"\s+\((?:eeg|meg|mri|fmri|rsfmri|pet|ieeg)\)$", "", line, flags=re.IGNORECASE)
+    line = re.sub(r"\s+", " ", line).strip(" ,.;\"“”")
     if len(line) > 140:
         line = f"{line[:137]}..."
     return line
 
 
-def _openneuro_modalities_from_chunk(chunk: str) -> list[str]:
+def _openneuro_modalities_from_chunk(chunk: str, *, title: str = "") -> list[str]:
+    modality_checks = (
+        ("rsfMRI", r"rsfmri|resting[- ]state f\s*mri"),
+        ("EEG", r"\beeg\b|electroencephalography"),
+        ("MEG", r"\bmeg\b|magnetoencephalographic"),
+        ("PET", r"\bpet\b|positron emission tomography"),
+        ("iEEG", r"\bieeg\b|intracranial eeg"),
+        ("fMRI", r"(?<!rs)fmri|functional mri"),
+        ("MRI", r"\bmri\b|magnetic resonance imaging"),
+    )
+
+    def _detect(text: str) -> list[str]:
+        detected: list[str] = []
+        for label, pattern in modality_checks:
+            if re.search(pattern, text, flags=re.IGNORECASE):
+                detected.append(label)
+        return _dedupe_str_list(detected, limit=6)
+
+    title_detected = _detect(str(title or ""))
+    if title_detected:
+        return title_detected
+    chunk_detected = _detect(str(chunk or ""))
+    if chunk_detected:
+        return chunk_detected
     paren = re.search(r"\(([^)]{1,120})\)", str(chunk or ""))
     if not paren:
         return []
@@ -6766,7 +7034,7 @@ def _openneuro_modalities_from_chunk(chunk: str) -> list[str]:
     out: list[str] = []
     for piece in parts:
         token = re.sub(r"\s+", " ", piece.strip())
-        if 2 <= len(token) <= 32 and token.isascii():
+        if 2 <= len(token) <= 32 and token.isascii() and not re.fullmatch(r"ds\d{6,}", token, flags=re.IGNORECASE):
             out.append(token)
     return _dedupe_str_list(out, limit=6)
 
@@ -6775,6 +7043,8 @@ def _openneuro_subject_count_from_chunk(chunk: str) -> int | None:
     text = str(chunk or "")
     patterns = (
         r"(?:approx\.?\s*)?(?:subject|participants?)\s+count\s+of\s+(\d+)",
+        r"\bapprox\.?\s*(?:subjects?|participants?)(?:\s+in\s+public\s+summary)?\s*:\s*(\d+)\b",
+        r"\b(?:subjects?|participants?)\s*:\s*(\d+)\b",
         r"\b(\d+)\s*(?:subjects?|participants?)\b",
     )
     for pat in patterns:
@@ -6788,13 +7058,9 @@ def _openneuro_subject_count_from_chunk(chunk: str) -> int | None:
 
 
 def _openneuro_subject_count_for_accession(corpus: str, accession: str) -> int | None:
-    """Search only the accession-local chunk to avoid copying another dataset's subject count."""
-    for match in re.finditer(rf"\b{re.escape(accession)}\b", corpus, flags=re.IGNORECASE):
-        window = _openneuro_chunk_for_accession(corpus[match.start() : match.start() + 280], accession)
-        found = _openneuro_subject_count_from_chunk(window)
-        if found is not None:
-            return found
-    return None
+    """Parse the best accession-local chunk for this dataset."""
+    chunk = _openneuro_chunk_for_accession(corpus, accession)
+    return _openneuro_subject_count_from_chunk(chunk)
 
 
 def _openneuro_conditions_from_chunk(chunk: str) -> list[str]:
@@ -6827,8 +7093,7 @@ def _build_openneuro_fallback_catalog_payloads(
     *,
     user_prompt: str,
 ) -> dict[str, Any] | None:
-    """When the notebook synthesizer skips store_dataset_catalog, derive a comparison
-    from completed OpenNeuro executor text so raw metadata plots still render."""
+    """Derive a normalized catalog from completed OpenNeuro task evidence."""
     if not _task_state_mentions_openneuro_execution(task_state):
         return None
     corpus = _analysis_completed_step_corpus(task_state)
@@ -6846,8 +7111,8 @@ def _build_openneuro_fallback_catalog_payloads(
     datasets: list[dict[str, Any]] = []
     for acc in ordered_ids[:OPENNEURO_EXECUTOR_FALLBACK_MAX_DATASETS]:
         chunk = _openneuro_chunk_for_accession(corpus, acc)
-        title = _openneuro_named_title_for_accession(corpus, acc) or _openneuro_title_from_chunk(chunk)
-        modalities = _openneuro_modalities_from_chunk(chunk)
+        title = _openneuro_title_from_chunk(chunk) or _openneuro_named_title_for_accession(corpus, acc)
+        modalities = _openneuro_modalities_from_chunk(chunk, title=title)
         diagnoses = _openneuro_conditions_from_chunk(f"{chunk}\n{title}")
         n_sub = _openneuro_subject_count_for_accession(corpus, acc)
         doi = doi_by_ds.get(acc, "")
@@ -6886,14 +7151,88 @@ def _build_openneuro_fallback_catalog_payloads(
         "datasets": datasets,
         "objective": objective,
         "summary": (
-            f"Raw metadata view of {len(datasets)} OpenNeuro datasets parsed from step outputs "
-            "(auto-generated because the synthesizer did not call store_dataset_catalog)."
+            f"Metadata overview of {len(datasets)} OpenNeuro datasets prepared from completed task evidence."
         ),
         "notes": [
-            "Participant counts, modalities, and DOI fields were heuristically parsed from completed step text.",
+            "Participant counts, modalities, and DOI fields were parsed from completed task evidence.",
             "Open each dataset on OpenNeuro to verify metadata before download, QC, or preprocessing.",
         ],
     }
+
+
+def _recover_dataset_catalog_payload_from_task_evidence(
+    task_state: Mapping[str, Any] | None,
+    *,
+    user_prompt: str,
+) -> tuple[dict[str, Any] | None, str]:
+    if not isinstance(task_state, Mapping):
+        return None, ""
+    payload = _build_openneuro_fallback_catalog_payloads(
+        dict(task_state),
+        user_prompt=user_prompt,
+    )
+    if isinstance(payload, Mapping) and not _catalog_payload_is_low_quality(payload):
+        return dict(payload), "completed OpenNeuro task evidence"
+    return None, ""
+
+
+def _append_metadata_snapshot_for_task(
+    *,
+    task_state: dict[str, Any],
+    workspace: dict[str, Any],
+    task_id: str,
+    user_prompt: str,
+) -> Mapping[str, Any] | None:
+    payload, source_label = _recover_dataset_catalog_payload_from_task_evidence(
+        task_state,
+        user_prompt=user_prompt,
+    )
+    if not isinstance(payload, Mapping):
+        return None
+    result = append_metadata_snapshot_artifact(
+        workspace,
+        task_id=task_id,
+        user_prompt=user_prompt,
+        objective=str(payload.get("objective") or task_state.get("objective") or "").strip(),
+        summary=str(payload.get("summary") or "").strip(),
+        dimensions=list(payload.get("dimensions", []) or []),
+        datasets=list(payload.get("datasets", []) or []),
+        notes=list(payload.get("notes", []) or []),
+    )
+    _clear_notebook_diag_kinds(
+        task_state,
+        kinds=[
+            "catalog_fallback_disabled_bundle",
+            "catalog_fallback_disabled_executor",
+            "catalog_quality_rejected",
+            "notebook_context_missing",
+            "metadata_snapshot_missing",
+        ],
+    )
+    dataset_count = len(
+        [
+            row
+            for row in list((payload.get("datasets", []) or []))
+            if isinstance(row, Mapping)
+        ]
+    )
+    _record_notebook_synthesis_diagnostic(
+        task_state,
+        human_line=(
+            "Notebook: prepared a metadata snapshot from "
+            f"{source_label} ({dataset_count} dataset{'s' if dataset_count != 1 else ''})."
+        ),
+        status="done",
+        kind="metadata_snapshot_prepared",
+        dataset_count=dataset_count,
+        source_label=source_label,
+    )
+    _record_dataset_catalog_field_summary(
+        task_state,
+        payload=payload,
+        origin_kind="catalog_fields",
+    )
+    return result
 
 
 def _analysis_task_cell_types(
@@ -6931,6 +7270,8 @@ def _analysis_task_has_cell_type(
 def _dataset_catalog_payload_is_underspecified(payload: Mapping[str, Any] | None) -> bool:
     if not isinstance(payload, Mapping):
         return False
+    if _catalog_payload_is_low_quality(payload):
+        return True
     datasets = [item for item in list(payload.get("datasets", []) or []) if isinstance(item, Mapping)]
     if not datasets:
         return False
@@ -6999,6 +7340,48 @@ def _remove_task_dataset_comparison_cells(
     return len(removed_cell_ids)
 
 
+def _remove_task_analysis_code_cells(
+    workspace: dict[str, Any] | None,
+    *,
+    task_id: str,
+) -> int:
+    if not workspace:
+        return 0
+    normalized_task_id = str(task_id or "").strip()
+    if not normalized_task_id:
+        return 0
+    cells = list(workspace.get("cells", []) or [])
+    artifacts = dict(workspace.get("artifacts") or {})
+    removed_cell_ids: set[str] = set()
+    removed_artifact_ids: set[str] = set()
+    kept_cells: list[dict[str, Any]] = []
+    for cell in cells:
+        if str(cell.get("task_id") or "").strip() != normalized_task_id or str(cell.get("type") or "").strip() != "analysis_code":
+            kept_cells.append(cell)
+            continue
+        artifact_id = str(cell.get("artifact_id") or "").strip()
+        removed_cell_ids.add(str(cell.get("cell_id") or "").strip())
+        if artifact_id:
+            removed_artifact_ids.add(artifact_id)
+    if not removed_cell_ids and not removed_artifact_ids:
+        return 0
+    workspace["cells"] = kept_cells
+    if removed_artifact_ids:
+        workspace["artifacts"] = {
+            key: value
+            for key, value in artifacts.items()
+            if key not in removed_artifact_ids
+        }
+    for operation in list(workspace.get("operations", []) or []):
+        operation["produced_cell_ids"] = [
+            cell_id
+            for cell_id in list(operation.get("produced_cell_ids", []) or [])
+            if str(cell_id or "").strip() not in removed_cell_ids
+        ]
+    workspace["revision"] = int(workspace.get("revision", 0) or 0) + 1
+    return len(removed_cell_ids)
+
+
 def _record_notebook_synthesis_diagnostic(
     task_state: dict[str, Any],
     *,
@@ -7024,6 +7407,263 @@ def _record_notebook_synthesis_diagnostic(
     bucket.append(row)
     if len(bucket) > 24:
         del bucket[:-24]
+    logger.info("[notebook] %s | metrics=%s", line, row["metrics"])
+
+
+def _notebook_diag_kind_recorded(task_state: Mapping[str, Any] | None, kind: str) -> bool:
+    normalized_kind = str(kind or "").strip()
+    if not normalized_kind or not isinstance(task_state, Mapping):
+        return False
+    for item in list(task_state.get("notebook_synthesis_diagnostics", []) or []):
+        if not isinstance(item, Mapping):
+            continue
+        metrics = item.get("metrics") if isinstance(item.get("metrics"), Mapping) else {}
+        if str(metrics.get("kind") or "").strip() == normalized_kind:
+            return True
+    return False
+
+
+def _clear_notebook_diag_kinds(task_state: dict[str, Any] | None, kinds: Sequence[str]) -> None:
+    if not isinstance(task_state, dict):
+        return
+    target = {
+        str(kind or "").strip()
+        for kind in list(kinds or [])
+        if str(kind or "").strip()
+    }
+    if not target:
+        return
+    bucket = task_state.get("notebook_synthesis_diagnostics")
+    if not isinstance(bucket, list):
+        return
+    filtered: list[dict[str, Any]] = []
+    for item in bucket:
+        if not isinstance(item, dict):
+            filtered.append(item)
+            continue
+        metrics = item.get("metrics") if isinstance(item.get("metrics"), Mapping) else {}
+        if str(metrics.get("kind") or "").strip() in target:
+            continue
+        filtered.append(item)
+    task_state["notebook_synthesis_diagnostics"] = filtered
+
+
+def _dataset_catalog_available_fields(payload: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(payload, Mapping):
+        return []
+    datasets = [
+        item for item in list(payload.get("datasets", []) or [])
+        if isinstance(item, Mapping)
+    ]
+    if not datasets:
+        return []
+
+    def _has_field(name: str) -> bool:
+        for row in datasets:
+            value = row.get(name)
+            if value not in (None, "", [], {}):
+                return True
+        return False
+
+    plan: list[str] = []
+    if _has_field("participant_count"):
+        plan.append("participant counts")
+    if _has_field("session_count"):
+        plan.append("session counts")
+    if _has_field("modalities"):
+        plan.append("modalities")
+    if _has_field("tasks"):
+        plan.append("tasks")
+    if _has_field("diagnoses"):
+        plan.append("diagnoses")
+    if any(_has_field(name) for name in ("public_download", "license", "doi", "bids")):
+        plan.append("access metadata")
+    deduped: list[str] = []
+    for item in plan:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
+def _catalog_payload_is_low_quality(payload: Mapping[str, Any] | None) -> bool:
+    if not isinstance(payload, Mapping):
+        return True
+    datasets = [
+        item
+        for item in list(payload.get("datasets", []) or [])
+        if isinstance(item, Mapping)
+    ]
+    if not datasets:
+        return True
+    if len(datasets) < 2:
+        return False
+    source_keys = {
+        canonical_source_key(item.get("source"))
+        for item in datasets
+        if str(item.get("source") or "").strip()
+    }
+    source_key = next(iter(source_keys), "")
+    nonempty_accessions = [
+        str(item.get("accession") or "").strip()
+        for item in datasets
+        if str(item.get("accession") or "").strip()
+    ]
+    unique_accessions = {value.lower() for value in nonempty_accessions}
+    generic_labels = 0
+    repeated_source_ids = 0
+    for item in datasets:
+        label = str(item.get("dataset_label") or "").strip()
+        dataset_id = str(item.get("dataset_id") or "").strip().lower()
+        source = str(item.get("source") or "").strip()
+        if _is_generic_dataset_label(label, source):
+            generic_labels += 1
+        if source_key and dataset_id == f"{source_key}:{source_key}":
+            repeated_source_ids += 1
+    dataset_count = len(datasets)
+    if repeated_source_ids > 0:
+        return True
+    if unique_accessions and len(unique_accessions) >= max(2, dataset_count // 2):
+        return False
+    generic_ratio = generic_labels / float(dataset_count)
+    missing_accession_ratio = 1.0 - (len(nonempty_accessions) / float(dataset_count))
+    return generic_ratio >= 0.35 or missing_accession_ratio >= 0.5
+
+
+def _rank_catalog_label_fields(datasets: Sequence[Mapping[str, Any]]) -> list[str]:
+    field_priority = {"accession": 3, "dataset_label": 2, "dataset_id": 1}
+    ranked: list[tuple[tuple[int, int, int, int], str]] = []
+    for field in ("accession", "dataset_label", "dataset_id"):
+        nonempty_values: list[str] = []
+        unique_values: set[str] = set()
+        generic_count = 0
+        for row in datasets:
+            value = str(row.get(field) or "").strip()
+            if not value:
+                continue
+            nonempty_values.append(value)
+            unique_values.add(value.casefold())
+            source = str(row.get("source") or "").strip()
+            source_key = canonical_source_key(source)
+            normalized_value = value.casefold()
+            if field == "dataset_label" and _is_generic_dataset_label(value, source):
+                generic_count += 1
+            elif field == "dataset_id" and source_key and normalized_value == f"{source_key}:{source_key}":
+                generic_count += 1
+            elif field == "accession" and normalized_value in {source_key, source.casefold(), "dataset"}:
+                generic_count += 1
+        if not nonempty_values:
+            continue
+        ranked.append(
+            (
+                (
+                    len(unique_values) - generic_count,
+                    len(nonempty_values) - generic_count,
+                    -generic_count,
+                    field_priority[field],
+                ),
+                field,
+            )
+        )
+    ranked.sort(reverse=True)
+    return [field for _, field in ranked]
+
+
+def _task_dataset_catalog_payload(
+    workspace: Mapping[str, Any] | None,
+    *,
+    task_id: str,
+) -> Mapping[str, Any] | None:
+    for cell_type in ("metadata_snapshot", "dataset_comparison"):
+        artifact = _task_latest_artifact(
+            workspace,
+            task_id=task_id,
+            cell_type=cell_type,
+        )
+        payload = artifact.get("payload") if isinstance(artifact, Mapping) else None
+        if isinstance(payload, Mapping):
+            return payload
+    return None
+
+
+def _task_latest_artifact(
+    workspace: Mapping[str, Any] | None,
+    *,
+    task_id: str,
+    cell_type: str,
+) -> Mapping[str, Any] | None:
+    if not isinstance(workspace, Mapping):
+        return None
+    normalized_task_id = str(task_id or "").strip()
+    if not normalized_task_id:
+        return None
+    artifacts = workspace.get("artifacts") if isinstance(workspace.get("artifacts"), Mapping) else {}
+    for cell in reversed(list(workspace.get("cells", []) or [])):
+        if not isinstance(cell, Mapping):
+            continue
+        if str(cell.get("task_id") or "").strip() != normalized_task_id:
+            continue
+        if str(cell.get("type") or "").strip() != str(cell_type or "").strip():
+            continue
+        artifact = artifacts.get(str(cell.get("artifact_id") or "").strip()) if isinstance(artifacts, Mapping) else None
+        if isinstance(artifact, Mapping):
+            return artifact
+    return None
+
+
+def _latest_workspace_artifact(
+    workspace: Mapping[str, Any] | None,
+    *,
+    cell_type: str,
+) -> Mapping[str, Any] | None:
+    if not isinstance(workspace, Mapping):
+        return None
+    artifacts = workspace.get("artifacts") if isinstance(workspace.get("artifacts"), Mapping) else {}
+    for cell in reversed(list(workspace.get("cells", []) or [])):
+        if not isinstance(cell, Mapping):
+            continue
+        if str(cell.get("type") or "").strip() != str(cell_type or "").strip():
+            continue
+        artifact = artifacts.get(str(cell.get("artifact_id") or "").strip()) if isinstance(artifacts, Mapping) else None
+        if isinstance(artifact, Mapping):
+            return artifact
+    return None
+
+
+def _task_dataset_metadata_payload(
+    workspace: Mapping[str, Any] | None,
+    *,
+    task_id: str,
+) -> Mapping[str, Any] | None:
+    artifact = _task_latest_artifact(
+        workspace,
+        task_id=task_id,
+        cell_type="dataset_metadata",
+    )
+    payload = artifact.get("payload") if isinstance(artifact, Mapping) else None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _record_dataset_catalog_field_summary(
+    task_state: dict[str, Any],
+    *,
+    payload: Mapping[str, Any] | None,
+    origin_kind: str,
+) -> list[str]:
+    field_summary = _dataset_catalog_available_fields(payload)
+    if not field_summary:
+        return []
+    _record_notebook_synthesis_diagnostic(
+        task_state,
+        human_line=(
+            "Notebook: available metadata fields: "
+            + ", ".join(field_summary)
+            + "."
+        ),
+        status="done",
+        kind=origin_kind,
+        available_fields=list(field_summary),
+    )
+    return field_summary
 
 
 def _analysis_try_append_dataset_comparison_from_sources(
@@ -7033,134 +7673,69 @@ def _analysis_try_append_dataset_comparison_from_sources(
     task_id: str,
     user_prompt: str,
 ) -> None:
-    """Append dataset_comparison from visualization bundle or OpenNeuro executor text if missing."""
+    """Ensure a deterministic metadata snapshot exists before notebook code generation."""
     current_cell_types = set(_analysis_task_cell_types(workspace, task_id=task_id))
-    bundle = task_state.get("latest_dataset_visualizations")
-
-    if (
-        isinstance(bundle, dict)
-        and list(bundle.get("rows", []) or [])
-        and "dataset_comparison" not in current_cell_types
-    ):
-        bundle_payload = {
-            "datasets": list(bundle.get("rows", []) or []),
-            "dimensions": list(bundle.get("dimensions", []) or []),
-        }
-        if _dataset_catalog_payload_is_underspecified(bundle_payload):
-            _record_notebook_synthesis_diagnostic(
-                task_state,
-                human_line=(
-                    "Notebook: skipped legacy visualization bundle because it lacked dataset identifiers "
-                    "and usable raw metadata."
-                ),
-                status="progress",
-                kind="catalog_from_bundle_skipped",
-            )
-        else:
-            try:
-                append_dataset_catalog_artifact(
-                    workspace,
-                    task_id=task_id,
-                    user_prompt=user_prompt,
-                    objective=str(bundle.get("objective") or task_state.get("objective") or "").strip(),
-                    summary=str(bundle.get("summary") or task_state.get("objective") or "").strip(),
-                    dimensions=list(bundle.get("dimensions", []) or []),
-                    datasets=list(bundle.get("rows", []) or []),
-                    notes=[
-                        str(note).strip()
-                        for note in list(bundle.get("notes", []) or [])
-                        if str(note).strip()
-                    ],
-                )
-                _record_notebook_synthesis_diagnostic(
-                    task_state,
-                    human_line=(
-                        "Notebook: appended dataset_comparison from stored visualization bundle "
-                        "(latest_dataset_visualizations)."
-                    ),
-                    status="done",
-                    kind="catalog_from_bundle",
-                )
-            except ValueError as exc:
-                logger.warning(
-                    "Analysis notebook fallback failed to append dataset catalog for task %s: %s",
-                    task_id or "<unknown>",
-                    exc,
-                )
-                _record_notebook_synthesis_diagnostic(
-                    task_state,
-                    human_line=f"Notebook: could not build comparison from visualization bundle — {exc}",
-                    status="error",
-                    kind="catalog_bundle_error",
-                    error=str(exc),
-                )
-        current_cell_types = set(_analysis_task_cell_types(workspace, task_id=task_id))
-
-    if "dataset_comparison" not in current_cell_types and (
+    current_payload = _task_dataset_catalog_payload(workspace, task_id=task_id)
+    current_catalog_usable = isinstance(current_payload, Mapping) and not _catalog_payload_is_low_quality(current_payload)
+    wants_comparison_cell = (
         _derive_analysis_intent_hint(user_prompt, workspace) == "dataset_search_compare"
         or _is_analysis_plot_request(user_prompt)
+    )
+
+    if (
+        ("metadata_snapshot" in current_cell_types or "dataset_comparison" in current_cell_types)
+        and current_catalog_usable
+        and wants_comparison_cell
+        and not _notebook_diag_kind_recorded(task_state, "metadata_snapshot_reused")
     ):
-        fallback_payload = _build_openneuro_fallback_catalog_payloads(
+        _record_dataset_catalog_field_summary(
             task_state,
+            payload=current_payload,
+            origin_kind="catalog_fields",
+        )
+        _record_notebook_synthesis_diagnostic(
+            task_state,
+            human_line="Notebook: reused the prepared metadata snapshot for this task.",
+            status="done",
+            kind="metadata_snapshot_reused",
+        )
+        return
+
+    if ("metadata_snapshot" in current_cell_types or "dataset_comparison" in current_cell_types) and wants_comparison_cell and not current_catalog_usable:
+        _record_notebook_synthesis_diagnostic(
+            task_state,
+            human_line=(
+                "Notebook: an existing metadata snapshot for this task is low quality, so it will be replaced before plotting."
+            ),
+            status="progress",
+            kind="metadata_snapshot_quality_recovery",
+        )
+
+    if "metadata_snapshot" not in current_cell_types and wants_comparison_cell:
+        recovered = _append_metadata_snapshot_for_task(
+            task_state=task_state,
+            workspace=workspace,
+            task_id=task_id,
             user_prompt=user_prompt,
         )
-        if fallback_payload:
-            try:
-                catalog_result = append_dataset_catalog_artifact(
-                    workspace,
-                    task_id=task_id,
-                    user_prompt=user_prompt,
-                    objective=str(fallback_payload.get("objective") or "").strip(),
-                    summary=str(fallback_payload.get("summary") or "").strip(),
-                    dimensions=list(fallback_payload.get("dimensions") or []),
-                    datasets=list(fallback_payload.get("datasets") or []),
-                    notes=list(fallback_payload.get("notes") or []),
-                )
-                viz_bundle = dict(
-                    (catalog_result.get("payload") or {}).get("visualizations") or {}
-                )
-                if viz_bundle:
-                    task_state["latest_dataset_visualizations"] = viz_bundle
-                n_ds = len(list(fallback_payload.get("datasets") or []))
-                _record_notebook_synthesis_diagnostic(
-                    task_state,
-                    human_line=(
-                        f"Notebook: auto-built dataset_comparison for {n_ds} OpenNeuro dataset(s) "
-                        "(synthesizer did not call store_dataset_catalog; parsed executor summaries)."
-                    ),
-                    status="done",
-                    kind="openneuro_catalog_fallback",
-                    dataset_count=n_ds,
-                )
-            except ValueError as exc:
-                logger.warning(
-                    "OpenNeuro dataset catalog fallback failed for task %s: %s",
-                    task_id or "<unknown>",
-                    exc,
-                )
-                _record_notebook_synthesis_diagnostic(
-                    task_state,
-                    human_line=f"Notebook: OpenNeuro comparison auto-build failed — {exc}",
-                    status="error",
-                    kind="openneuro_fallback_error",
-                    error=str(exc),
-                )
-        elif _task_state_mentions_openneuro_execution(task_state):
+        if recovered:
+            return
+        if _task_state_mentions_openneuro_execution(task_state):
             _record_notebook_synthesis_diagnostic(
                 task_state,
                 human_line=(
-                    "Notebook: skipped OpenNeuro auto-comparison (need ≥2 dataset ids in completed step text)."
+                    "Notebook: completed OpenNeuro task evidence did not contain enough structured metadata "
+                    "to prepare a metadata snapshot."
                 ),
-                status="progress",
-                kind="openneuro_fallback_skipped",
+                status="error",
+                kind="metadata_snapshot_missing",
             )
 
 
-def _materialize_analysis_notebook_fallback(
+def _prepare_analysis_notebook_workspace(
     *,
     callback_context: CallbackContext,
     task_state: dict[str, Any],
-    final_markdown: str,
 ) -> dict[str, Any] | None:
     active_task_context = _get_active_task_context(callback_context)
     conversation_id = str(active_task_context.get("conversation_id") or "").strip()
@@ -7204,76 +7779,8 @@ def _materialize_analysis_notebook_fallback(
         task_id=task_id,
         user_prompt=user_prompt,
     )
-    current_cell_types = set(_analysis_task_cell_types(workspace, task_id=task_id))
-
-    if final_markdown and "analysis_note" not in current_cell_types:
-        related_dataset_ids: list[str] = []
-        if _derive_analysis_intent_hint(user_prompt, workspace) == "dataset_metadata":
-            selected_dataset_id = str(workspace.get("selected_dataset_id") or "").strip()
-            if selected_dataset_id:
-                related_dataset_ids = [selected_dataset_id]
-        try:
-            append_analysis_note_artifact(
-                workspace,
-                task_id=task_id,
-                user_prompt=user_prompt,
-                markdown=final_markdown,
-                title=str(task_state.get("objective") or "Analysis note").strip(),
-                related_dataset_ids=related_dataset_ids,
-            )
-        except ValueError as exc:
-            logger.warning(
-                "Analysis notebook fallback failed to append note for task %s: %s",
-                task_id or "<unknown>",
-                exc,
-            )
-            _record_notebook_synthesis_diagnostic(
-                task_state,
-                human_line=f"Notebook: failed to append analysis note — {exc}",
-                status="error",
-                kind="analysis_note_error",
-                error=str(exc),
-            )
-
-    final_cell_types = set(_analysis_task_cell_types(workspace, task_id=task_id))
-    wants_comparison_cell = (
-        _derive_analysis_intent_hint(user_prompt, workspace) == "dataset_search_compare"
-        or _is_analysis_plot_request(user_prompt)
-    )
-    if wants_comparison_cell and "dataset_comparison" not in final_cell_types:
-        already_recorded = any(
-            str((item.get("metrics") or {}).get("kind") or "").strip() in {
-                "catalog_from_bundle",
-                "openneuro_catalog_fallback",
-            }
-            and str(item.get("status") or "").strip() == "done"
-            for item in list(task_state.get("notebook_synthesis_diagnostics", []) or [])
-            if isinstance(item, Mapping)
-        )
-        if already_recorded:
-            callback_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
-            _refresh_analysis_notebook_state_from_workspace(
-                callback_context.state,
-                workspace=workspace,
-                task_state=task_state,
-            )
-            return workspace
-        _record_notebook_synthesis_diagnostic(
-            task_state,
-            human_line=(
-                "Notebook: no dataset_comparison cell after synthesis "
-                "(check whether the model called store_dataset_catalog and whether step text included ≥2 ds ids)."
-            ),
-            status="error",
-            kind="notebook_comparison_missing",
-        )
 
     callback_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
-    _refresh_analysis_notebook_state_from_workspace(
-        callback_context.state,
-        workspace=workspace,
-        task_state=task_state,
-    )
     return workspace
 
 
@@ -9594,6 +10101,139 @@ def _synth_context_instructions(task_state: dict[str, Any], callback_context: Ca
     return instructions
 
 
+def _catalog_payload_binding_summary(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        return {}
+    datasets = [
+        item
+        for item in list(payload.get("datasets", []) or [])
+        if isinstance(item, Mapping)
+    ]
+    dataset_count = len(datasets)
+    nonempty_counts: dict[str, int] = {}
+    sample_labels: list[str] = []
+    for row in datasets:
+        label = str(row.get("accession") or row.get("dataset_label") or "").strip()
+        if label and label not in sample_labels and len(sample_labels) < 6:
+            sample_labels.append(label)
+        for key, value in row.items():
+            if value in (None, "", [], {}):
+                continue
+            nonempty_counts[key] = nonempty_counts.get(key, 0) + 1
+    available_fields = _dataset_catalog_available_fields(payload)
+    frame_columns: list[str] = []
+    for row in datasets:
+        for key in row.keys():
+            key_text = str(key or "").strip()
+            if key_text and key_text not in frame_columns:
+                frame_columns.append(key_text)
+    preferred_label_fields = [
+        field
+        for field in _rank_catalog_label_fields(datasets)
+        if field in frame_columns
+    ]
+    if not preferred_label_fields:
+        preferred_label_fields = [
+            field
+            for field in ("accession", "dataset_label", "dataset_id")
+            if field in frame_columns
+        ]
+    return {
+        "dataset_count": dataset_count,
+        "available_fields": available_fields,
+        "frame_columns": frame_columns,
+        "preferred_label_fields": preferred_label_fields,
+        "sample_datasets": sample_labels,
+        "nonempty_field_counts": nonempty_counts,
+    }
+
+
+def _notebook_code_repair_hint(
+    *,
+    error_message: str,
+    comparison_fields: Sequence[str] | None = None,
+) -> str:
+    message = str(error_message or "").strip()
+    normalized = message.lower()
+    available = [str(field).strip() for field in list(comparison_fields or []) if str(field).strip()]
+    label_fields = [field for field in ("accession", "dataset_label", "dataset_id") if field in available]
+    if (
+        "imports must be limited" in normalized
+        or "import '" in normalized
+        or "importerror" in normalized
+    ):
+        if "tabulate" in normalized:
+            return (
+                "Use `display(dataframe)` for tables instead of `to_markdown()` or `tabulate`. "
+                "Use only the notebook runtime plus pandas/numpy/matplotlib/seaborn/json/math/statistics/collections/itertools."
+            )
+        return (
+            "Use only pandas/numpy/matplotlib/seaborn/json/math/statistics/collections/itertools imports. "
+            "Do not import plotly, altair, tabulate, or IPython. "
+            "Use `display(...)` for tables and `plt.show()` or `display_figure(fig)` for figures."
+        )
+    if "keyerror: 'id'" in normalized:
+        if label_fields:
+            return (
+                "Do not assume an `id` column. Use one of the available label columns: "
+                + ", ".join(label_fields)
+                + "."
+            )
+        return "Do not assume an `id` column; use the actual columns available in `catalog_df` or `comparison_df`."
+    if "all arrays must be of the same length" in normalized:
+        return (
+            "Build tables by selecting columns from `catalog_df` or `comparison_df` directly instead of constructing a new "
+            "DataFrame from unequal-length Python lists."
+        )
+    if (
+        "cannot reindex on an axis with duplicate labels" in normalized
+        or "reindexing only valid with uniquely valued index objects" in normalized
+        or "invalidindexerror" in normalized
+    ):
+        return (
+            "A multivalue dataframe likely kept duplicate index labels after `explode()`. "
+            "Use `multivalue_long_df(comparison_df, index_col='dataset_id', column='modalities')` or "
+            "`multivalue_presence_df(...)` instead of `explode(...).set_index(...).reindex(...)` or concatenating "
+            "dummy matrices on duplicate indices."
+        )
+    if "multivalue_matrix_svg() got an unexpected keyword argument" in normalized:
+        return (
+            "`multivalue_matrix_svg` expects `column=` and optional `row_label_col=`. "
+            "Example: `multivalue_matrix_svg(comparison_df, column='modalities', row_label_col='accession', title='Modalities by dataset')`."
+        )
+    if "must produce at least one visible output" in normalized:
+        return "Finish the cell with `display(dataframe)`, `plt.show()`, `display_figure(fig)`, or another visible expression."
+    if "no agent-authored code cell was produced" in normalized:
+        return "Call `store_notebook_code_cell` with valid Python that displays at least one table or figure."
+    return (
+        "Display DataFrames directly with `display(...)`, use real matplotlib/seaborn plots for figures, "
+        "and only reference columns that exist in `catalog_df`, `comparison_df`, or `dataset_profile`."
+    )
+
+
+def _metadata_payload_binding_summary(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        return {}
+    section_names = [
+        key
+        for key in (
+            "identity",
+            "access_download",
+            "subjects_sessions",
+            "modalities_tasks",
+            "standards_file_formats",
+            "links_publications",
+            "source_raw_highlights",
+        )
+        if payload.get(key) not in (None, "", [], {})
+    ]
+    return {
+        "dataset_id": str(payload.get("dataset_id") or "").strip(),
+        "dataset_label": str(payload.get("dataset_label") or "").strip(),
+        "available_sections": section_names,
+    }
+
+
 def _analysis_synth_context_instructions(
     task_state: dict[str, Any],
     callback_context: CallbackContext | None = None,
@@ -9604,11 +10244,62 @@ def _analysis_synth_context_instructions(
     user_text = _extract_user_turn_text(callback_context) if callback_context is not None else ""
     intent_hint = _derive_analysis_intent_hint(user_text, workspace)
     current_task_cell_types = _analysis_task_cell_types(workspace, task_id=current_task_id)
-    has_comparison_cell = _analysis_task_has_cell_type(
+    current_catalog_payload = _task_dataset_catalog_payload(workspace, task_id=current_task_id)
+    current_metadata_payload = _task_dataset_metadata_payload(workspace, task_id=current_task_id)
+    current_catalog_low_quality = _catalog_payload_is_low_quality(current_catalog_payload)
+    has_metadata_snapshot = isinstance(current_catalog_payload, Mapping) and not current_catalog_low_quality
+    has_notebook_code_cell = _analysis_task_has_cell_type(
         workspace,
         task_id=current_task_id,
-        cell_type="dataset_comparison",
+        cell_type="analysis_code",
     )
+    current_catalog_binding = (
+        {}
+        if current_catalog_low_quality
+        else _catalog_payload_binding_summary(current_catalog_payload)
+    )
+    current_metadata_binding = _metadata_payload_binding_summary(current_metadata_payload)
+    reusable_catalog_artifact = (
+        _task_latest_artifact(
+            workspace,
+            task_id=current_task_id,
+            cell_type="metadata_snapshot",
+        )
+        if current_task_id
+        else None
+    ) or (
+        _task_latest_artifact(
+            workspace,
+            task_id=current_task_id,
+            cell_type="dataset_comparison",
+        )
+        if current_task_id
+        else None
+    ) or _latest_workspace_artifact(workspace, cell_type="metadata_snapshot") or _latest_workspace_artifact(workspace, cell_type="dataset_comparison")
+    reusable_metadata_artifact = (
+        _task_latest_artifact(
+            workspace,
+            task_id=current_task_id,
+            cell_type="dataset_metadata",
+        )
+        if current_task_id
+        else None
+    ) or _latest_workspace_artifact(workspace, cell_type="dataset_metadata")
+    reusable_catalog_payload = (
+        reusable_catalog_artifact.get("payload")
+        if isinstance(reusable_catalog_artifact, Mapping) and isinstance(reusable_catalog_artifact.get("payload"), Mapping)
+        else None
+    )
+    if _catalog_payload_is_low_quality(reusable_catalog_payload):
+        reusable_catalog_payload = None
+    reusable_metadata_payload = (
+        reusable_metadata_artifact.get("payload")
+        if isinstance(reusable_metadata_artifact, Mapping) and isinstance(reusable_metadata_artifact.get("payload"), Mapping)
+        else None
+    )
+    reusable_catalog_binding = _catalog_payload_binding_summary(reusable_catalog_payload)
+    reusable_metadata_binding = _metadata_payload_binding_summary(reusable_metadata_payload)
+    active_catalog_binding = current_catalog_binding or reusable_catalog_binding
     payload = {
         "schema": "analysis_synthesis_context.v1",
         "objective": task_state.get("objective", ""),
@@ -9617,8 +10308,18 @@ def _analysis_synth_context_instructions(
         "current_task": {
             "task_id": current_task_id,
             "cell_types": current_task_cell_types,
-            "has_dataset_comparison_cell": has_comparison_cell,
-            "plot_followup_requested": _is_analysis_plot_request(user_text),
+            "has_metadata_snapshot": has_metadata_snapshot,
+            "has_notebook_code_cell": has_notebook_code_cell,
+                "plot_followup_requested": _is_analysis_plot_request(user_text),
+                "metadata_snapshot_low_quality": current_catalog_low_quality,
+                "notebook_bindings": {
+                    "metadata_snapshot": current_catalog_binding,
+                    "dataset_metadata": current_metadata_binding,
+                },
+            "workspace_reusable_bindings": {
+                "metadata_snapshot": reusable_catalog_binding,
+                "dataset_metadata": reusable_metadata_binding,
+            },
         },
         "steps": [
             {
@@ -9647,21 +10348,72 @@ def _analysis_synth_context_instructions(
             )
         )
     if intent_hint == "dataset_search_compare":
-        if not has_comparison_cell:
+        if not has_metadata_snapshot and reusable_catalog_payload and _is_analysis_plot_request(user_text):
             instructions.append(
                 "Notebook requirement for this turn:\n"
-                "- This task is acting as a dataset-search/compare operation and it does not yet have a `dataset_comparison` cell.\n"
-                "- You MUST call `store_dataset_catalog` before returning Markdown.\n"
-                "- For plain metadata comparison or plotting, use `dimensions_json=\"[]\"` rather than inventing ranking dimensions.\n"
-                "- `append_analysis_note` alone is not sufficient.\n"
-                "- Reuse the completed-step evidence from this task instead of reopening planning or discovery."
+                "- This is a plotting follow-up and a reusable metadata snapshot already exists in workspace context.\n"
+                "- Reuse that stored snapshot directly with `store_notebook_code_cell`; do not rerun discovery just to rebuild metadata rows.\n"
+                "- There is no automatic notebook fallback; if you skip the code cell, the notebook will show a diagnostic instead of a rendered result."
             )
-        elif _is_analysis_plot_request(user_text):
+        elif not has_metadata_snapshot:
             instructions.append(
                 "Notebook requirement for this turn:\n"
-                "- A comparison cell already exists for this task. Do not create a duplicate unless you are materially updating the comparison.\n"
-                "- Use the Markdown to orient the user to the existing notebook visuals."
+                "- This task does not have a prepared metadata snapshot.\n"
+                "- Do not invent or normalize dataset rows yourself in the notebook stage.\n"
+                "- If no snapshot is available, do not fake notebook output; summarize the gap plainly.\n"
+                "- If the step still completed with a meaningful conclusion or blocker, capture that in `append_analysis_note`.\n"
+                "- `append_analysis_note` alone is not sufficient for a completed plotting task."
             )
+        elif _is_analysis_plot_request(user_text) or not has_notebook_code_cell:
+            instructions.append(
+                "Notebook requirement for this turn:\n"
+                "- Reuse the stored metadata snapshot already available in notebook context.\n"
+                "- If the notebook does not yet have an agent-authored code cell, call `store_notebook_code_cell` now.\n"
+                "- Also call `append_analysis_note` with a query-facing step summary; do not make the code-cell stdout carry the whole explanation.\n"
+                "- If an agent-authored code cell already exists, update it only when you are materially improving the notebook output.\n"
+                "- There is no automatic notebook fallback; if you skip the code cell, the notebook will show a diagnostic instead of a rendered result.\n"
+                "- Use the available field summary in `current_task.workspace_reusable_bindings.metadata_snapshot` to decide which tables and figures are worth showing."
+            )
+    if intent_hint == "dataset_metadata" and current_metadata_payload:
+        instructions.append(
+            "Metadata notebook guidance:\n"
+            "- Prefer a compact metadata table plus 1-2 small summaries when that improves readability.\n"
+            "- Add an `append_analysis_note` summary that explains what matters about this dataset for the user's request.\n"
+            "- Call `store_notebook_code_cell` after `store_dataset_metadata_profile`; there is no backend metadata renderer."
+        )
+    elif intent_hint == "dataset_metadata" and reusable_metadata_payload:
+        instructions.append(
+            "Metadata notebook guidance:\n"
+            "- A reusable metadata profile already exists in workspace context.\n"
+            "- Add an `append_analysis_note` summary that explains what this metadata means for the user's request.\n"
+            "- Call `store_notebook_code_cell` to turn that stored metadata into a real notebook cell for this turn."
+        )
+    if active_catalog_binding:
+        frame_columns = [
+            str(field).strip()
+            for field in list(active_catalog_binding.get("frame_columns") or [])
+            if str(field).strip()
+        ]
+        preferred_label_fields = [
+            str(field).strip()
+            for field in list(active_catalog_binding.get("preferred_label_fields") or [])
+            if str(field).strip()
+        ]
+        if frame_columns or preferred_label_fields:
+            guidance_lines = [
+                "Notebook code safety for this metadata snapshot:",
+                "- Only reference columns that actually exist in `catalog_df` or `comparison_df`.",
+                "- Display DataFrames directly with `display(...)`; do not render markdown tables.",
+                "- Prefer real matplotlib/seaborn figures.",
+                "- If numeric metadata exists, lead with quantitative views such as sample-size bars, histograms, or scatter plots before using coverage heatmaps.",
+            ]
+            if frame_columns:
+                guidance_lines.append("- Available metadata columns: " + ", ".join(frame_columns[:18]) + ".")
+            if preferred_label_fields:
+                guidance_lines.append("- Preferred dataset label columns: " + ", ".join(preferred_label_fields) + ".")
+            if "dataset_id" in frame_columns:
+                guidance_lines.append("- Use `dataset_id` for plot axes and matrix row labels unless the user explicitly asks for descriptive titles.")
+            instructions.append("\n".join(guidance_lines))
     instructions.append(
         "Return user-facing Markdown summarizing only this new analysis operation. "
         "Store notebook artifacts before finalizing the text."
@@ -11424,13 +12176,6 @@ def _analysis_synth_before_model_callback(
     task_state["notebook_synthesis_diagnostics"] = []
     callback_context.state[STATE_WORKFLOW_TASK] = task_state
 
-    callback_context.state[STATE_SYNTH_BUFFER] = ""
-    llm_request.config = llm_request.config or types.GenerateContentConfig()
-    llm_request.config.response_mime_type = None
-    llm_request.append_instructions(
-        _analysis_synth_context_instructions(task_state, callback_context)
-    )
-
     active_task_context = _get_active_task_context(callback_context)
     conversation_id = str(active_task_context.get("conversation_id") or "").strip()
     task_id = str(active_task_context.get("task_id") or "").strip()
@@ -11439,6 +12184,14 @@ def _analysis_synth_before_model_callback(
         or task_state.get("objective")
         or ""
     ).strip()
+    _store_task_state_analysis_context(
+        task_state,
+        conversation_id=conversation_id,
+        task_id=task_id,
+        user_prompt=user_prompt,
+        mode=str(active_task_context.get("mode") or WORKFLOW_MODE_ANALYSIS).strip(),
+    )
+    callback_context.state[STATE_WORKFLOW_TASK] = task_state
     if task_id:
         workspace = _get_analysis_workspace(callback_context)
         if workspace is None and conversation_id:
@@ -11454,7 +12207,6 @@ def _analysis_synth_before_model_callback(
                 only_if_underspecified=True,
             )
             _analysis_try_append_dataset_comparison_from_sources(
-                callback_context=callback_context,
                 task_state=task_state,
                 workspace=workspace,
                 task_id=task_id,
@@ -11466,6 +12218,30 @@ def _analysis_synth_before_model_callback(
                 workspace=workspace,
                 task_state=task_state,
             )
+            current_cell_types = _analysis_task_cell_types(workspace, task_id=task_id)
+            if current_cell_types:
+                visible_labels = [
+                    "prepared metadata snapshot" if value == "metadata_snapshot" else value
+                    for value in current_cell_types
+                ]
+                _record_notebook_synthesis_diagnostic(
+                    task_state,
+                    human_line=(
+                        "Notebook: synthesis context prepared with cells: "
+                        + ", ".join(visible_labels)
+                        + "."
+                    ),
+                    status="progress",
+                    kind="notebook_context_prepared",
+                    cell_types=list(current_cell_types),
+                )
+
+    callback_context.state[STATE_SYNTH_BUFFER] = ""
+    llm_request.config = llm_request.config or types.GenerateContentConfig()
+    llm_request.config.response_mime_type = None
+    llm_request.append_instructions(
+        _analysis_synth_context_instructions(task_state, callback_context)
+    )
     callback_context.state[STATE_WORKFLOW_TASK] = task_state
     return None
 
@@ -11495,11 +12271,114 @@ def _analysis_synth_after_model_callback(
     buffered = str(callback_context.state.get(STATE_SYNTH_BUFFER, "") or "")
     callback_context.state[STATE_SYNTH_BUFFER] = ""
     final_markdown = (buffered + text).strip()
-    workspace = _materialize_analysis_notebook_fallback(
+    workspace = _prepare_analysis_notebook_workspace(
         callback_context=callback_context,
         task_state=task_state,
-        final_markdown=final_markdown,
     )
+    active_task_context = _get_active_task_context(callback_context)
+    task_id = str(active_task_context.get("task_id") or "").strip()
+    user_prompt = str(active_task_context.get("user_prompt") or task_state.get("objective") or "").strip()
+    if workspace is not None and task_id:
+        intent_hint = _derive_analysis_intent_hint(user_prompt, workspace)
+        wants_comparison_cell = (
+            intent_hint == "dataset_search_compare"
+            or _is_analysis_plot_request(user_prompt)
+        )
+        wants_metadata_cell = intent_hint == "dataset_metadata"
+        current_cell_types = _analysis_task_cell_types(workspace, task_id=task_id)
+        has_analysis_note = "analysis_note" in current_cell_types
+        has_metadata_snapshot = isinstance(
+            _task_dataset_catalog_payload(workspace, task_id=task_id),
+            Mapping,
+        )
+        if "analysis_code" in current_cell_types:
+            if not has_analysis_note:
+                _record_notebook_synthesis_diagnostic(
+                    task_state,
+                    human_line=(
+                        "Notebook: this task stored a notebook code cell but no step-summary note. "
+                        "Call `append_analysis_note` so the notebook explains the finding, not just the table or figure."
+                    ),
+                    status="error",
+                    kind="analysis_note_missing",
+                    cell_types=list(current_cell_types),
+                    required_tool_calls=["append_analysis_note"],
+                    response_preview=final_markdown[:240],
+                )
+            _record_notebook_synthesis_diagnostic(
+                task_state,
+                human_line="Notebook: using a notebook code cell for this task.",
+                status="done",
+                kind="analysis_code_present",
+                cell_types=list(current_cell_types),
+            )
+        elif wants_comparison_cell and has_metadata_snapshot:
+            _record_notebook_synthesis_diagnostic(
+                task_state,
+                human_line=(
+                    "Notebook: synthesis ended without `store_notebook_code_cell`. "
+                    "The current task has a prepared metadata snapshot but no agent-authored notebook code cell, so only diagnostics will be shown."
+                ),
+                status="error",
+                kind="analysis_code_missing",
+                cell_types=list(current_cell_types),
+                required_tool_calls=["store_notebook_code_cell"],
+                response_preview=final_markdown[:240],
+            )
+        elif wants_metadata_cell and "dataset_metadata" in current_cell_types:
+            _record_notebook_synthesis_diagnostic(
+                task_state,
+                human_line=(
+                    "Notebook: synthesis ended without `store_notebook_code_cell`. "
+                    "The current task has a stored metadata profile but no agent-authored notebook code cell, so only diagnostics will be shown."
+                ),
+                status="error",
+                kind="analysis_code_missing",
+                cell_types=list(current_cell_types),
+                required_tool_calls=["store_notebook_code_cell"],
+                response_preview=final_markdown[:240],
+            )
+        elif wants_comparison_cell or wants_metadata_cell:
+            missing_tool_calls = (
+                ["store_dataset_metadata_profile", "store_notebook_code_cell"]
+                if wants_metadata_cell
+                else ["store_notebook_code_cell"]
+            )
+            _record_notebook_synthesis_diagnostic(
+                task_state,
+                human_line=(
+                    "Notebook: synthesis ended without the required notebook tool calls. "
+                    "No notebook-ready data artifact was stored for this task."
+                ),
+                status="error",
+                kind="notebook_context_missing",
+                cell_types=list(current_cell_types),
+                required_tool_calls=missing_tool_calls,
+                response_preview=final_markdown[:240],
+            )
+        notebook_payload = _refresh_analysis_notebook_state_from_workspace(
+            callback_context.state,
+            workspace=workspace,
+            task_state=task_state,
+        )
+        if isinstance(notebook_payload, Mapping):
+            _record_notebook_synthesis_diagnostic(
+                task_state,
+                human_line=(
+                    f"Notebook: rebuilt notebook view from workspace revision "
+                    f"{int(notebook_payload.get('workspace_revision', 0) or 0)} "
+                    f"with {int(notebook_payload.get('cell_count', 0) or 0)} visible cell(s)."
+                ),
+                status="done",
+                kind="notebook_rebuilt",
+                workspace_revision=int(notebook_payload.get("workspace_revision", 0) or 0),
+                cell_count=int(notebook_payload.get("cell_count", 0) or 0),
+            )
+            _refresh_analysis_notebook_state_from_workspace(
+                callback_context.state,
+                workspace=workspace,
+                task_state=task_state,
+            )
     task_state["latest_synthesis"] = {
         "schema": "analysis_turn_summary.v1",
         "coverage_status": _compute_coverage_status(task_state),
@@ -12200,11 +13079,12 @@ def _tool_workspace_context(tool_context: ToolContext | None) -> tuple[dict[str,
         return None, None, {}
     task_state = _get_task_state_from_state_map(tool_context.state)
     workspace = _get_analysis_workspace_from_state_map(tool_context.state)
-    active_task_context = _get_active_task_context_from_state_map(tool_context.state)
-    if active_task_context:
-        conversation_id = str(active_task_context.get("conversation_id") or "").strip()
-    else:
-        conversation_id = ""
+    active_task_context = _resolve_analysis_runtime_context(
+        state=tool_context.state,
+        task_state=task_state,
+        workspace=workspace,
+    )
+    conversation_id = str(active_task_context.get("conversation_id") or "").strip()
     if workspace is None and conversation_id:
         workspace = ensure_analysis_workspace(
             None,
@@ -12216,6 +13096,15 @@ def _tool_workspace_context(tool_context: ToolContext | None) -> tuple[dict[str,
             workspace=workspace,
             task_state=task_state,
         )
+    if task_state is not None and active_task_context:
+        _store_task_state_analysis_context(
+            task_state,
+            conversation_id=str(active_task_context.get("conversation_id") or "").strip(),
+            task_id=str(active_task_context.get("task_id") or "").strip(),
+            user_prompt=str(active_task_context.get("user_prompt") or "").strip(),
+            mode=str(active_task_context.get("mode") or WORKFLOW_MODE_ANALYSIS).strip(),
+        )
+        tool_context.state[STATE_WORKFLOW_TASK] = task_state
     return task_state, workspace, active_task_context
 
 
@@ -12331,6 +13220,12 @@ def store_dataset_catalog(
             "ok": False,
             "message": "Analysis notebook storage is unavailable because task or workspace state is missing.",
         }
+    task_id = str(active_task_context.get("task_id") or "").strip()
+    if not task_id:
+        return {
+            "ok": False,
+            "message": "Dataset catalog storage requires an active task id.",
+        }
 
     try:
         dimensions = parse_visualization_json_array(
@@ -12346,12 +13241,74 @@ def store_dataset_catalog(
             field_name="notes_json",
         )
         notes = [str(note).strip() for note in notes_raw if str(note).strip()]
+        objective_text = objective or str(task_state.get("objective", "") or "")
+        summary_text = summary
+        candidate_payload = build_dataset_catalog_payload(
+            objective=objective_text,
+            summary=summary_text,
+            dimensions=dimensions,
+            datasets=datasets,
+            notes=notes,
+        )
+        if _catalog_payload_is_low_quality(candidate_payload):
+            recovered = _append_metadata_snapshot_for_task(
+                task_state=task_state,
+                workspace=workspace,
+                task_id=task_id,
+                user_prompt=str(active_task_context.get("user_prompt") or task_state.get("objective") or "").strip(),
+            )
+            if recovered:
+                payload = dict(recovered.get("payload") or {})
+                bundle = dict(payload.get("visualizations", {}) or {})
+                tool_context.state[STATE_WORKFLOW_TASK] = task_state
+                tool_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
+                _refresh_analysis_notebook_state_from_workspace(
+                    tool_context.state,
+                    workspace=workspace,
+                    task_state=task_state,
+                )
+                available_fields = _dataset_catalog_available_fields(payload)
+                summary_cards = dict(payload.get("summary_cards", {}) or {})
+                dataset_count = int(summary_cards.get("dataset_count", 0) or 0)
+                message = f"Appended dataset comparison cell with {dataset_count} datasets."
+                if available_fields:
+                    message += " Available fields: " + ", ".join(available_fields[:6]) + "."
+                message += " Recovered dataset identifiers from completed task evidence."
+                task_state["latest_dataset_visualizations"] = bundle
+                return {
+                    "ok": True,
+                    "message": message,
+                    "operation_id": recovered.get("operation_id", ""),
+                    "cell_id": recovered.get("cell_id", ""),
+                    "artifact_id": recovered.get("artifact_id", ""),
+                    "summary_cards": summary_cards,
+                    "warnings": list(payload.get("warnings", []) or []),
+                    "available_fields": available_fields,
+                }
+            _record_notebook_synthesis_diagnostic(
+                task_state,
+                human_line=(
+                    "Notebook: rejected the dataset catalog because too many rows lacked dataset-specific identifiers, "
+                    "and task evidence was not rich enough to recover them."
+                ),
+                status="error",
+                kind="catalog_quality_rejected",
+            )
+            return {
+                "ok": False,
+                "message": (
+                    "Dataset catalog rows were too underspecified to store reliably, and this task did not expose "
+                    "enough dataset-specific identifiers in completed evidence to recover them automatically. "
+                    "Include per-dataset accession, dataset_id, title, or doi fields for each row."
+                ),
+            }
+
         result = append_dataset_catalog_artifact(
             workspace,
-            task_id=str(active_task_context.get("task_id") or "").strip(),
+            task_id=task_id,
             user_prompt=str(active_task_context.get("user_prompt") or task_state.get("objective") or "").strip(),
-            objective=objective or str(task_state.get("objective", "") or ""),
-            summary=summary,
+            objective=objective_text,
+            summary=summary_text,
             dimensions=dimensions,
             datasets=datasets,
             notes=notes,
@@ -12372,16 +13329,340 @@ def store_dataset_catalog(
         workspace=workspace,
         task_state=task_state,
     )
+    available_fields = _record_dataset_catalog_field_summary(
+        task_state,
+        payload=payload,
+        origin_kind="catalog_fields",
+    )
+    summary_cards = dict(payload.get("summary_cards", {}) or {})
+    dataset_count = int(summary_cards.get("dataset_count", 0) or 0)
+    message = f"Appended dataset comparison cell with {dataset_count} datasets."
+    if available_fields:
+        message += " Available fields: " + ", ".join(available_fields[:6]) + "."
     return {
         "ok": True,
-        "message": (
-            f"Appended dataset comparison cell with {int((payload.get('summary_cards', {}) or {}).get('dataset_count', 0) or 0)} datasets."
-        ),
+        "message": message,
         "operation_id": result.get("operation_id", ""),
         "cell_id": result.get("cell_id", ""),
         "artifact_id": result.get("artifact_id", ""),
-        "summary_cards": dict(payload.get("summary_cards", {}) or {}),
+        "summary_cards": summary_cards,
         "warnings": list(payload.get("warnings", []) or []),
+        "available_fields": available_fields,
+    }
+
+
+def store_notebook_code_cell(
+    source_code: str,
+    title: str = "",
+    summary: str = "",
+    output_summary_json: str = "[]",
+    tool_context: ToolContext | None = None,
+) -> dict[str, Any]:
+    """Store an agent-authored notebook code cell for the current analysis task.
+
+    The execution context auto-binds the current task's latest metadata snapshot
+    payload (`metadata_snapshot`, `catalog_payload`, `catalog_df`, `comparison_df`) and/or metadata payload
+    (`dataset_profile`) when available, and falls back to the latest compatible
+    workspace artifact when the current task is a plotting follow-up.
+    """
+    task_state, workspace, active_task_context = _tool_workspace_context(tool_context)
+    if tool_context is None or task_state is None or workspace is None:
+        return {
+            "ok": False,
+            "message": "Notebook code-cell storage is unavailable because task or workspace state is missing.",
+        }
+
+    task_id = str(active_task_context.get("task_id") or "").strip()
+    user_prompt = str(active_task_context.get("user_prompt") or task_state.get("objective") or "").strip()
+    if not task_id:
+        return {
+            "ok": False,
+            "message": "Notebook code-cell storage requires an active task id.",
+        }
+
+    try:
+        planned_outputs = [
+            str(value).strip()
+            for value in parse_json_array_text(
+                output_summary_json,
+                field_name="output_summary_json",
+            )
+            if str(value).strip()
+        ]
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "message": str(exc),
+        }
+
+    comparison_artifact = _task_latest_artifact(
+        workspace,
+        task_id=task_id,
+        cell_type="metadata_snapshot",
+    )
+    if not comparison_artifact:
+        comparison_artifact = _task_latest_artifact(
+            workspace,
+            task_id=task_id,
+            cell_type="dataset_comparison",
+        )
+    comparison_context = "current_task" if comparison_artifact else ""
+    metadata_artifact = _task_latest_artifact(
+        workspace,
+        task_id=task_id,
+        cell_type="dataset_metadata",
+    )
+    metadata_context = "current_task" if metadata_artifact else ""
+    if not comparison_artifact:
+        comparison_artifact = _latest_workspace_artifact(
+            workspace,
+            cell_type="metadata_snapshot",
+        )
+        if not comparison_artifact:
+            comparison_artifact = _latest_workspace_artifact(
+                workspace,
+                cell_type="dataset_comparison",
+            )
+        if comparison_artifact:
+            comparison_context = "workspace_latest"
+    if not metadata_artifact:
+        metadata_artifact = _latest_workspace_artifact(
+            workspace,
+            cell_type="dataset_metadata",
+        )
+        if metadata_artifact:
+            metadata_context = "workspace_latest"
+    comparison_payload = comparison_artifact.get("payload") if isinstance(comparison_artifact, Mapping) and isinstance(comparison_artifact.get("payload"), Mapping) else None
+    metadata_payload = metadata_artifact.get("payload") if isinstance(metadata_artifact, Mapping) and isinstance(metadata_artifact.get("payload"), Mapping) else None
+    if not comparison_payload and not metadata_payload:
+        return {
+            "ok": False,
+            "message": "Notebook code cells require a prepared metadata snapshot or dataset metadata artifact in workspace state.",
+        }
+    if _catalog_payload_is_low_quality(comparison_payload) and metadata_payload:
+        comparison_payload = None
+        comparison_artifact = None
+        comparison_context = ""
+    if _catalog_payload_is_low_quality(comparison_payload) and not metadata_payload:
+        recovered = _append_metadata_snapshot_for_task(
+            task_state=task_state,
+            workspace=workspace,
+            task_id=task_id,
+            user_prompt=user_prompt,
+        )
+        if recovered:
+            comparison_artifact = recovered
+            comparison_payload = recovered.get("payload") if isinstance(recovered.get("payload"), Mapping) else None
+            comparison_context = "current_task"
+            tool_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
+            _refresh_analysis_notebook_state_from_workspace(
+                tool_context.state,
+                workspace=workspace,
+                task_state=task_state,
+            )
+    if _catalog_payload_is_low_quality(comparison_payload) and not metadata_payload:
+        _record_notebook_synthesis_diagnostic(
+            task_state,
+            human_line=(
+                "Notebook: the prepared metadata snapshot is low quality, so agent-authored plotting code was not executed. "
+                "Completed task evidence was not rich enough to recover a usable snapshot automatically."
+            ),
+            status="error",
+            kind="catalog_quality_rejected",
+        )
+        return {
+            "ok": False,
+            "message": (
+                "Notebook code-cell storage could not find a metadata snapshot with reliable dataset identifiers. "
+                "Rerun retrieval with richer metadata or store a clean dataset metadata artifact first."
+            ),
+        }
+
+    comparison_fields = _dataset_catalog_available_fields(comparison_payload)
+    dataset_count = 0
+    if isinstance(comparison_payload, Mapping):
+        dataset_count = len(
+            [
+                item
+                for item in list(comparison_payload.get("datasets", []) or [])
+                if isinstance(item, Mapping)
+            ]
+        )
+    if comparison_context == "workspace_latest" or metadata_context == "workspace_latest":
+        context_parts: list[str] = []
+        if comparison_context == "workspace_latest" and isinstance(comparison_artifact, Mapping):
+            context_parts.append(
+                "metadata snapshot from task "
+                + str(comparison_artifact.get("task_id") or "unknown").strip()
+            )
+        if metadata_context == "workspace_latest" and isinstance(metadata_artifact, Mapping):
+            context_parts.append(
+                "metadata profile from task "
+                + str(metadata_artifact.get("task_id") or "unknown").strip()
+            )
+        _record_notebook_synthesis_diagnostic(
+            task_state,
+            human_line=(
+                "Notebook: reusing "
+                + " and ".join(context_parts)
+                + " because this task does not yet have its own stored notebook context."
+            ),
+            status="progress",
+            kind="analysis_code_context_reused",
+            context_sources=list(context_parts),
+        )
+    _record_notebook_synthesis_diagnostic(
+        task_state,
+        human_line=(
+            "Notebook: executing agent-authored code cell against "
+            + (f"{dataset_count} dataset(s)" if dataset_count else "the current notebook context")
+            + (
+                f" with fields: {', '.join(comparison_fields[:6])}."
+                if comparison_fields
+                else "."
+            )
+        ),
+        status="progress",
+        kind="analysis_code_executing",
+        dataset_count=dataset_count or None,
+        available_fields=list(comparison_fields),
+        planned_outputs=list(planned_outputs),
+    )
+    tool_context.state[STATE_WORKFLOW_TASK] = task_state
+
+    try:
+        analysis_request = {
+            "user_prompt": user_prompt,
+            "objective": str(task_state.get("objective") or "").strip(),
+            "task_id": task_id,
+        }
+        catalog_profile = _catalog_payload_binding_summary(comparison_payload)
+        analysis_context = {
+            "task_id": task_id,
+            "user_prompt": user_prompt,
+            "objective": str(task_state.get("objective") or "").strip(),
+            "available_bindings": {
+                "metadata_snapshot": bool(comparison_payload),
+                "dataset_profile": bool(metadata_payload),
+                "catalog_profile": bool(comparison_payload),
+            },
+            "current_task": {
+                "dataset_count": dataset_count,
+                "comparison_fields": list(comparison_fields),
+            },
+            "workspace": analysis_context_payload(workspace),
+        }
+        execution = execute_agent_notebook_cell(
+            source_code=source_code,
+            catalog_payload=comparison_payload,
+            dataset_profile=metadata_payload,
+            analysis_request=analysis_request,
+            catalog_profile=catalog_profile,
+            analysis_context=analysis_context,
+        )
+    except ValueError as exc:
+        repair_hint = _notebook_code_repair_hint(
+            error_message=str(exc),
+            comparison_fields=comparison_fields,
+        )
+        message = str(exc).strip()
+        if repair_hint:
+            message = f"{message} {repair_hint}".strip()
+        _record_notebook_synthesis_diagnostic(
+            task_state,
+            human_line=f"Notebook: agent-authored code cell execution failed — {message}",
+            status="error",
+            kind="analysis_code_error",
+            error=str(exc),
+            repair_hint=repair_hint,
+            source_preview=re.sub(r"\s+", " ", source_code).strip()[:320],
+        )
+        tool_context.state[STATE_WORKFLOW_TASK] = task_state
+        return {
+            "ok": False,
+            "message": message,
+            "repair_hint": repair_hint,
+        }
+
+    outputs = [dict(item) for item in list(execution.get("outputs", []) or []) if isinstance(item, Mapping)]
+    if not outputs:
+        message = (
+            "Notebook code cells must produce at least one visible output. "
+            + _notebook_code_repair_hint(
+                error_message="must produce at least one visible output",
+                comparison_fields=comparison_fields,
+            )
+        )
+        return {
+            "ok": False,
+            "message": message,
+        }
+
+    removed_existing = _remove_task_analysis_code_cells(
+        workspace,
+        task_id=task_id,
+    )
+    output_summary = planned_outputs or summarize_notebook_outputs(outputs)
+    selected_dataset_id = ""
+    if isinstance(metadata_payload, Mapping):
+        selected_dataset_id = str(metadata_payload.get("dataset_id") or "").strip()
+    try:
+        result = append_notebook_code_cell_artifact(
+            workspace,
+            task_id=task_id,
+            user_prompt=user_prompt,
+            source_code=source_code,
+            outputs=outputs,
+            title=title,
+            summary=summary,
+            cell_kind="dataset_metadata" if metadata_payload and not comparison_payload else "dataset_comparison",
+            output_summary=output_summary,
+            context_artifact_ids=[
+                value
+                for value in (
+                    str((comparison_artifact or {}).get("artifact_id") or "").strip(),
+                    str((metadata_artifact or {}).get("artifact_id") or "").strip(),
+                )
+                if value
+            ],
+            selected_dataset_id=selected_dataset_id or None,
+        )
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "message": str(exc),
+        }
+
+    tool_context.state[STATE_ANALYSIS_WORKSPACE] = workspace
+    _refresh_analysis_notebook_state_from_workspace(
+        tool_context.state,
+        workspace=workspace,
+        task_state=task_state,
+    )
+    _record_notebook_synthesis_diagnostic(
+        task_state,
+        human_line=(
+            "Notebook: stored agent-authored code cell"
+            + (" (replaced prior notebook cell)" if removed_existing else "")
+            + (f" with outputs: {', '.join(output_summary)}." if output_summary else ".")
+        ),
+        status="done",
+        kind="analysis_code_stored",
+        replaced_count=removed_existing,
+        output_summary=list(output_summary),
+    )
+    tool_context.state[STATE_WORKFLOW_TASK] = task_state
+
+    message = "Stored notebook code cell."
+    if output_summary:
+        message += " Outputs: " + ", ".join(output_summary[:6]) + "."
+    return {
+        "ok": True,
+        "message": message,
+        "operation_id": result.get("operation_id", ""),
+        "cell_id": result.get("cell_id", ""),
+        "artifact_id": result.get("artifact_id", ""),
+        "output_summary": output_summary,
     }
 
 
@@ -12398,6 +13679,12 @@ def store_dataset_metadata_profile(
             "ok": False,
             "message": "Analysis notebook storage is unavailable because task or workspace state is missing.",
         }
+    task_id = str(active_task_context.get("task_id") or "").strip()
+    if not task_id:
+        return {
+            "ok": False,
+            "message": "Metadata profile storage requires an active task id.",
+        }
 
     try:
         metadata = parse_json_object_text(
@@ -12406,7 +13693,7 @@ def store_dataset_metadata_profile(
         )
         result = append_dataset_metadata_artifact(
             workspace,
-            task_id=str(active_task_context.get("task_id") or "").strip(),
+            task_id=task_id,
             user_prompt=str(active_task_context.get("user_prompt") or task_state.get("objective") or "").strip(),
             metadata=metadata,
             title=title,
@@ -12449,6 +13736,12 @@ def append_analysis_note(
             "ok": False,
             "message": "Analysis notebook storage is unavailable because task or workspace state is missing.",
         }
+    task_id = str(active_task_context.get("task_id") or "").strip()
+    if not task_id:
+        return {
+            "ok": False,
+            "message": "Notebook note storage requires an active task id.",
+        }
 
     try:
         related_dataset_ids = [
@@ -12461,7 +13754,7 @@ def append_analysis_note(
         ]
         result = append_analysis_note_artifact(
             workspace,
-            task_id=str(active_task_context.get("task_id") or "").strip(),
+            task_id=task_id,
             user_prompt=str(active_task_context.get("user_prompt") or task_state.get("objective") or "").strip(),
             markdown=markdown,
             title=title,
@@ -12618,7 +13911,7 @@ def build_analysis_tool_profile(
         _, execution_skill_toolset = create_execution_skill_toolset()
         workflow_lookup_tools.insert(0, execution_skill_toolset)
     synthesizer_tools = [
-        FunctionTool(store_dataset_catalog),
+        FunctionTool(store_notebook_code_cell),
         FunctionTool(store_dataset_metadata_profile),
         FunctionTool(append_analysis_note),
     ]

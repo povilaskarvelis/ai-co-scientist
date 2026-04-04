@@ -789,6 +789,10 @@ body.expanded .workspace.report-open .report-panel {
   margin-top: 10px;
 }
 
+.nb-artifact-body {
+  margin-top: 12px;
+}
+
 .nb-prompt {
   padding-top: 10px;
   color: #7aa2f7;
@@ -820,6 +824,10 @@ body.expanded .workspace.report-open .report-panel {
   gap: 10px;
 }
 
+.nb-cell-artifact .nb-output-stack {
+  gap: 14px;
+}
+
 .nb-output-item {
   min-width: 0;
 }
@@ -831,7 +839,8 @@ body.expanded .workspace.report-open .report-panel {
 }
 
 .nb-output-rich,
-.nb-output-svg {
+.nb-output-svg,
+.nb-output-image {
   border: 1px solid #243244;
   border-radius: 6px;
   background: #ffffff;
@@ -840,7 +849,48 @@ body.expanded .workspace.report-open .report-panel {
   overflow-x: auto;
 }
 
+.nb-output-rich table,
+.nb-output-rich table.dataframe {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+  color: #0f172a;
+}
+
+.nb-output-rich table th,
+.nb-output-rich table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid #dbe4ef;
+  text-align: left;
+  vertical-align: top;
+}
+
+.nb-output-rich table th {
+  background: #f8fbff;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+.nb-output-rich table tr:last-child td {
+  border-bottom: 0;
+}
+
+.nb-output-rich p {
+  margin: 0 0 10px;
+  color: #475569;
+}
+
+.nb-output-rich p:last-child {
+  margin-bottom: 0;
+}
+
 .nb-output-svg svg {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
+.nb-output-image img {
   max-width: 100%;
   height: auto;
   display: block;
@@ -1799,12 +1849,13 @@ body.expanded .messages {
 }
 
 .activity-log-step {
-  padding: 0 0 0 12px;
-  border-left: 2px solid #2d3948;
+  padding: 0;
 }
 
 .activity-log-step + .activity-log-step {
-  border-top: 0;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #25303b;
 }
 
 .activity-log-step-head {
@@ -1832,6 +1883,10 @@ body.expanded .messages {
 
 .activity-log-step.is-blocked .activity-log-step-dot {
   background: #ff96ad;
+}
+
+.activity-log-step.is-notebook .activity-log-step-dot {
+  background: #8dc7ff;
 }
 
 .activity-log-step-copy {
@@ -1870,7 +1925,6 @@ body.expanded .messages {
 }
 
 .activity-log-step-body {
-  margin-left: 18px;
   margin-top: 6px;
   display: grid;
   gap: 6px;
@@ -1903,20 +1957,6 @@ body.expanded .messages {
 
 .activity-log-step-section:not(.is-summary) .activity-log-step-item {
   color: #adc1d6;
-}
-
-.activity-log-tools-pre {
-  margin: 0;
-  padding: 7px 9px;
-  border-radius: 6px;
-  border: 1px solid #2d3a49;
-  background: #111823;
-  color: #c8d9ea;
-  font-size: 0.72rem;
-  line-height: 1.45;
-  overflow-x: auto;
-  white-space: pre-wrap;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
 .message {

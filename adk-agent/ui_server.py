@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+import contextlib
 import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import sys
 import threading
 import time
 import traceback
@@ -42,6 +44,7 @@ from co_scientist.analysis_workspace import (
 )
 from co_scientist.analysis_notebook import (
     build_analysis_notebook,
+    notebook_runtime_status,
     notebook_json_for_api,
     serialize_notebook_ipynb,
 )
@@ -76,6 +79,25 @@ VALID_TASK_MODES = {TASK_MODE_REPORT, TASK_MODE_ANALYSIS}
 _global_turn_semaphore = threading.Semaphore(MAX_CONCURRENT_TURNS)
 GA4_MEASUREMENT_ID = os.environ.get("GA4_MEASUREMENT_ID", "").strip()
 _GA4_ID_PATTERN = re.compile(r"^G-[A-Z0-9]+$")
+ANALYSIS_NOTEBOOK_MAX_RETRIES = 0
+_ANALYSIS_NOTEBOOK_RETRYABLE_KINDS = frozenset()
+
+
+def _project_venv_python() -> Path:
+    return Path(__file__).resolve().parents[1] / ".venv" / "bin" / "python"
+
+
+def _format_notebook_runtime_startup_line() -> str:
+    status = notebook_runtime_status()
+    return (
+        "[ui] Notebook runtime: "
+        f"python={status.get('python_executable') or sys.executable} "
+        f"(v{status.get('python_version') or 'unknown'}), "
+        f"pandas={'ok' if status.get('pandas', {}).get('available') else 'missing'}, "
+        f"numpy={'ok' if status.get('numpy', {}).get('available') else 'missing'}, "
+        f"matplotlib={'ok' if status.get('matplotlib', {}).get('available') else 'missing'}, "
+        f"seaborn={'ok' if status.get('seaborn', {}).get('available') else 'missing'}"
+    )
 
 
 class RateLimiter:
@@ -125,6 +147,20 @@ def _enforce_rate_limit(request: Request) -> None:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _close_worker_event_loop(loop: asyncio.AbstractEventLoop) -> None:
+    pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    with contextlib.suppress(Exception):
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    with contextlib.suppress(Exception):
+        loop.run_until_complete(loop.shutdown_default_executor())
+    asyncio.set_event_loop(None)
+    loop.close()
 
 
 def _compact_text(value: str, *, max_chars: int = 180) -> str:
@@ -331,6 +367,7 @@ def _extract_tool_error_metrics(function_response) -> dict | None:
 _NOTEBOOK_SYNTH_TOOL_NAMES = frozenset(
     {
         "store_dataset_catalog",
+        "store_notebook_code_cell",
         "store_dataset_visualizations",
         "store_dataset_metadata_profile",
         "append_analysis_note",
@@ -379,6 +416,8 @@ def _notebook_synthesizer_tool_outcome(function_response, *, author: str) -> dic
         )
     elif tool_name == "store_dataset_visualizations":
         line = message or "Notebook: stored dataset visualization bundle."
+    elif tool_name == "store_notebook_code_cell":
+        line = message or "Notebook: stored agent-authored notebook code cell."
     elif tool_name == "store_dataset_metadata_profile":
         line = message or "Notebook: stored metadata profile cell."
     elif tool_name == "append_analysis_note":
@@ -408,6 +447,57 @@ def _extract_persistable_session_state(session_state: dict | None) -> dict:
         if key in session_state and session_state[key] is not None:
             persisted[key] = copy.deepcopy(session_state[key])
     return persisted
+
+
+def _merge_analysis_runtime_context(
+    task_state: dict | None,
+    *,
+    conversation_id: str = "",
+    task_id: str = "",
+    user_prompt: str = "",
+    mode: str = TASK_MODE_ANALYSIS,
+) -> dict[str, str]:
+    existing = dict(task_state.get("analysis_runtime_context") or {}) if isinstance(task_state, dict) else {}
+    resolved = {
+        "conversation_id": str(
+            conversation_id or existing.get("conversation_id") or ""
+        ).strip(),
+        "task_id": str(task_id or existing.get("task_id") or "").strip(),
+        "user_prompt": str(
+            user_prompt
+            or existing.get("user_prompt")
+            or (task_state.get("objective") if isinstance(task_state, dict) else "")
+            or ""
+        ).strip(),
+        "mode": _normalize_task_mode(mode or existing.get("mode") or TASK_MODE_ANALYSIS),
+    }
+    if isinstance(task_state, dict) and any(resolved.get(key) for key in ("conversation_id", "task_id", "user_prompt")):
+        task_state["analysis_runtime_context"] = resolved
+    return resolved
+
+
+def _rehydrate_analysis_runtime_state(
+    session_state: dict | None,
+    *,
+    conversation_id: str,
+    task_id: str = "",
+    mode: str = TASK_MODE_ANALYSIS,
+) -> dict:
+    state = dict(session_state or {})
+    task_state = state.get(STATE_WORKFLOW_TASK)
+    if not isinstance(task_state, dict):
+        task_state = {}
+    resolved = _merge_analysis_runtime_context(
+        task_state,
+        conversation_id=conversation_id,
+        task_id=task_id,
+        mode=mode,
+    )
+    if task_state:
+        state[STATE_WORKFLOW_TASK] = task_state
+    if resolved.get("task_id"):
+        state[STATE_ACTIVE_TASK_CONTEXT] = dict(resolved)
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +784,36 @@ def _sync_task_analysis_workspace_fields(task: dict, workspace: dict | None) -> 
     task["selected_dataset_id_snapshot"] = str(snapshot["selected_dataset_id_snapshot"] or "")
 
 
+def _analysis_workspace_has_task_cell_type(
+    workspace: dict | None,
+    *,
+    task_id: str,
+    cell_type: str,
+) -> bool:
+    if not isinstance(workspace, dict):
+        return False
+    normalized_task_id = str(task_id or "").strip()
+    normalized_cell_type = str(cell_type or "").strip()
+    if not normalized_task_id or not normalized_cell_type:
+        return False
+    return any(
+        str(cell.get("task_id", "") or "").strip() == normalized_task_id
+        and str(cell.get("type", "") or "").strip() == normalized_cell_type
+        for cell in list(workspace.get("cells", []) or [])
+        if isinstance(cell, dict)
+    )
+
+
+def _analysis_notebook_retry_needed(
+    *,
+    wf_state: dict | None,
+    workspace: dict | None,
+    task_id: str,
+) -> bool:
+    del wf_state, workspace, task_id
+    return False
+
+
 def _normalize_steps_for_ui(steps: list[dict] | None) -> list[dict]:
     """Ensure plan steps are user-facing (database names, not tool ids)."""
     normalized: list[dict] = []
@@ -871,6 +991,18 @@ class UiRuntime:
             logger.warning("Marked %d incomplete runs as failed during startup.", interrupted)
         self.ready = True
         self.ready_error = None
+        logger.info(_format_notebook_runtime_startup_line())
+        expected_venv_python = _project_venv_python()
+        if expected_venv_python.exists():
+            try:
+                if Path(sys.executable).resolve() != expected_venv_python.resolve():
+                    logger.warning(
+                        "[ui] Server is running outside the project virtualenv. current=%s expected=%s",
+                        sys.executable,
+                        expected_venv_python,
+                    )
+            except Exception:
+                logger.debug("Failed to compare current interpreter with project virtualenv.", exc_info=True)
 
     async def shutdown(self) -> None:
         pending = list(self.background_tasks)
@@ -878,13 +1010,21 @@ class UiRuntime:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-        self._thread_pool.shutdown(wait=False)
         for cs in self.conv_sessions.values():
+            try:
+                await cs.runner.close()
+            except Exception:
+                logger.debug("Failed to close ADK runner during shutdown.", exc_info=True)
             if cs.mcp_tools is not None:
                 try:
                     await cs.mcp_tools.close()
                 except Exception:
-                    pass
+                    logger.debug("Failed to close MCP tools during shutdown.", exc_info=True)
+        if self.conv_sessions:
+            # Give async HTTP client cleanup tasks a chance to finish before
+            # the process tears down the event loop.
+            await asyncio.sleep(0.1)
+        self._thread_pool.shutdown(wait=True)
 
     def _get_conv_thread_lock(self, conversation_id: str) -> threading.Lock:
         if conversation_id not in self.conv_thread_locks:
@@ -925,12 +1065,19 @@ class UiRuntime:
         )
         restored_session = self.store.get_workflow_session(conversation_id)
         restored_state = None
+        restored_task_id = ""
         if isinstance(restored_session, dict):
+            restored_task_id = str(restored_session.get("task_id", "") or "").strip()
             payload = restored_session.get("state")
             if isinstance(payload, dict):
                 restored_state = _extract_persistable_session_state(payload) or None
         if normalized_mode == TASK_MODE_ANALYSIS:
-            restored_state = dict(restored_state or {})
+            restored_state = _rehydrate_analysis_runtime_state(
+                restored_state,
+                conversation_id=conversation_id,
+                task_id=restored_task_id,
+                mode=normalized_mode,
+            )
             restored_state[STATE_ANALYSIS_WORKSPACE] = ensure_analysis_workspace(
                 restored_state.get(STATE_ANALYSIS_WORKSPACE) if isinstance(restored_state, dict) else None,
                 conversation_id=conversation_id,
@@ -960,12 +1107,25 @@ class UiRuntime:
             session_id=cs.session_id,
         )
 
+    def _get_storage_session(self, conversation_id: str):
+        cs = self.conv_sessions.get(conversation_id)
+        if not cs or not isinstance(self.session_service, InMemorySessionService):
+            return None
+        return (
+            self.session_service.sessions
+            .get(cs.app_name, {})
+            .get(self.user_id, {})
+            .get(cs.session_id)
+        )
+
     async def _update_session_state(
         self,
         conversation_id: str,
         updater,
     ) -> dict | None:
-        session = await self._get_session(conversation_id)
+        session = self._get_storage_session(conversation_id)
+        if session is None:
+            session = await self._get_session(conversation_id)
         if not session:
             return None
         state = session.state if isinstance(session.state, dict) else {}
@@ -1009,6 +1169,77 @@ class UiRuntime:
         if notebook is None:
             return None
         return notebook
+
+    async def _retry_analysis_notebook_stage_if_needed(
+        self,
+        *,
+        conversation_id: str,
+        task_id: str,
+        run_id: str,
+        task: dict,
+        response_text: str,
+        responding_author: str,
+        wf_state: dict | None,
+    ) -> tuple[str, str, dict | None]:
+        if _normalize_task_mode(task.get("mode")) != TASK_MODE_ANALYSIS:
+            return response_text, responding_author, wf_state
+        if ANALYSIS_NOTEBOOK_MAX_RETRIES <= 0:
+            return response_text, responding_author, wf_state
+
+        workspace = await self._read_analysis_workspace(conversation_id)
+        if not _analysis_notebook_retry_needed(
+            wf_state=wf_state,
+            workspace=workspace,
+            task_id=task_id,
+        ):
+            return response_text, responding_author, wf_state
+
+        retry_prompt = "finalize"
+        original_prompt = str(task.get("user_query", "") or task.get("objective", "") or "").strip()
+
+        for attempt in range(1, ANALYSIS_NOTEBOOK_MAX_RETRIES + 1):
+            await self._append_progress_event(
+                run_id,
+                phase="synthesize",
+                event_type="notebook.retry",
+                status="progress",
+                human_line=(
+                    f"Retrying notebook synthesis from stored analysis state "
+                    f"(attempt {attempt}/{ANALYSIS_NOTEBOOK_MAX_RETRIES})."
+                ),
+                task_id=task_id,
+                metrics={"attempt": attempt, "max_attempts": ANALYSIS_NOTEBOOK_MAX_RETRIES},
+            )
+            await self._set_active_task_context(
+                conversation_id,
+                task_id=task_id,
+                user_prompt=original_prompt,
+                mode=TASK_MODE_ANALYSIS,
+            )
+            response_text, responding_author = await self._run_workflow_turn_filtered(
+                conversation_id,
+                retry_prompt,
+                run_id=run_id,
+            )
+            wf_state = await self._read_workflow_state(conversation_id)
+            workspace = await self._read_analysis_workspace(conversation_id)
+            if not _analysis_notebook_retry_needed(
+                wf_state=wf_state,
+                workspace=workspace,
+                task_id=task_id,
+            ):
+                await self._append_progress_event(
+                    run_id,
+                    phase="synthesize",
+                    event_type="notebook.retry.completed",
+                    status="done",
+                    human_line="Notebook synthesis retry completed using stored analysis state.",
+                    task_id=task_id,
+                    metrics={"attempt": attempt},
+                )
+                break
+
+        return response_text, responding_author, wf_state
 
     async def _build_analysis_notebook_payload(
         self,
@@ -1055,6 +1286,16 @@ class UiRuntime:
                 "mode": normalized_mode,
             }
             if normalized_mode == TASK_MODE_ANALYSIS:
+                task_state = state.get(STATE_WORKFLOW_TASK)
+                if isinstance(task_state, dict):
+                    _merge_analysis_runtime_context(
+                        task_state,
+                        conversation_id=conversation_id,
+                        task_id=task_id,
+                        user_prompt=user_prompt,
+                        mode=normalized_mode,
+                    )
+                    state[STATE_WORKFLOW_TASK] = task_state
                 state[STATE_ANALYSIS_WORKSPACE] = ensure_analysis_workspace(
                     _analysis_workspace_from_session_state(state),
                     conversation_id=conversation_id,
@@ -1102,12 +1343,13 @@ class UiRuntime:
                 thread_lock.acquire()
                 try:
                     loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
                     try:
                         return loop.run_until_complete(
                             self._workflow_turn_inner(cs, conversation_id, prompt, run_id=run_id, caller_loop=main_loop)
                         )
                     finally:
-                        loop.close()
+                        _close_worker_event_loop(loop)
                 finally:
                     thread_lock.release()
             finally:
@@ -1167,6 +1409,7 @@ class UiRuntime:
         step_started_ids: set[str] = set()
         step_completed_ids: set[str] = set()
         tool_error_signatures: set[tuple[str, str, str]] = set()
+        saw_notebook_activity = False
 
         def _step_source_label(tn: str) -> str:
             return _resolve_source_label(tn or "")
@@ -1294,6 +1537,7 @@ class UiRuntime:
                     continue
                 notebook_outcome = _notebook_synthesizer_tool_outcome(fr, author=author)
                 if notebook_outcome:
+                    saw_notebook_activity = True
                     _fire_progress(
                         phase="synthesize",
                         event_type=str(notebook_outcome.get("event_type") or "notebook.tool.completed"),
@@ -1377,6 +1621,8 @@ class UiRuntime:
                 )
 
             elif author in {"report_synthesizer", "analysis_notebook_synthesizer"} and not bool(getattr(event, "partial", False)):
+                if author == "analysis_notebook_synthesizer":
+                    saw_notebook_activity = True
                 _synth_done_line = (
                     "Analysis notebook synthesis completed (check notebook + research log for cell tools)."
                     if author == "analysis_notebook_synthesizer"
@@ -1418,7 +1664,7 @@ class UiRuntime:
                 caller_loop,
                 label=f"emit_step_summary:{run_id}",
             )
-        if wf_state:
+        if wf_state and saw_notebook_activity:
             diagnostics = wf_state.get("notebook_synthesis_diagnostics")
             if isinstance(diagnostics, list) and diagnostics:
                 for diag in diagnostics:
@@ -1745,6 +1991,27 @@ class UiRuntime:
             )
 
             if not terminal_error and not direct_response_detected:
+                response_text, responding_author, wf_state = await self._retry_analysis_notebook_stage_if_needed(
+                    conversation_id=conv_id,
+                    task_id=task_id,
+                    run_id=run_id,
+                    task=task,
+                    response_text=response_text,
+                    responding_author=responding_author,
+                    wf_state=wf_state,
+                )
+                plan_pending = await self._is_plan_pending_approval(conv_id)
+                has_steps = bool(_steps_from_workflow_state(wf_state))
+                terminal_error = _is_terminal_workflow_error_response(response_text)
+                direct_response_detected = (
+                    not terminal_error
+                    and (
+                        responding_author in _DIRECT_RESPONSE_AGENTS
+                        or (not wf_state and not plan_pending and not has_steps)
+                    )
+                )
+
+            if not terminal_error and not direct_response_detected:
                 await self._append_progress_event(
                     run_id,
                     phase="intake",
@@ -1966,6 +2233,33 @@ class UiRuntime:
 
                 wf_state = await self._read_workflow_state(conv_id)
                 plan_pending = await self._is_plan_pending_approval(conv_id)
+                response_text, _, wf_state = await self._retry_analysis_notebook_stage_if_needed(
+                    conversation_id=conv_id,
+                    task_id=task_id,
+                    run_id=run_id,
+                    task=task,
+                    response_text=response_text,
+                    responding_author="",
+                    wf_state=wf_state,
+                )
+                if _is_terminal_workflow_error_response(response_text):
+                    run_error = _derive_run_error_message(response_text, "Run failed.")
+                    task["status"] = "failed"
+                    task["report_markdown"] = response_text
+                    await self._save_task_with_progress(task, run_id)
+                    await self._append_progress_event(
+                        run_id,
+                        phase="execute",
+                        event_type="run.failed",
+                        status="error",
+                        human_line=run_error,
+                        task_id=task_id,
+                    )
+                    await self._update_run(
+                        run_id, status="failed", task_id=task_id, error=run_error,
+                    )
+                    break
+                plan_pending = await self._is_plan_pending_approval(conv_id)
 
                 task["steps"] = _steps_from_workflow_state(wf_state)
                 completed_steps = sum(
@@ -2123,6 +2417,33 @@ class UiRuntime:
                 return
 
             wf_state = await self._read_workflow_state(conv_id)
+            plan_pending = await self._is_plan_pending_approval(conv_id)
+            response_text, _, wf_state = await self._retry_analysis_notebook_stage_if_needed(
+                conversation_id=conv_id,
+                task_id=task_id,
+                run_id=run_id,
+                task=task,
+                response_text=response_text,
+                responding_author="",
+                wf_state=wf_state,
+            )
+            if _is_terminal_workflow_error_response(response_text):
+                run_error = _derive_run_error_message(response_text, "Run failed.")
+                task["status"] = "failed"
+                task["report_markdown"] = response_text
+                await self._save_task_with_progress(task, run_id)
+                await self._append_progress_event(
+                    run_id,
+                    phase="plan",
+                    event_type="run.failed",
+                    status="error",
+                    human_line=run_error,
+                    task_id=task_id,
+                )
+                await self._update_run(
+                    run_id, status="failed", task_id=task_id, error=run_error,
+                )
+                return
             plan_pending = await self._is_plan_pending_approval(conv_id)
 
             task["steps"] = _steps_from_workflow_state(wf_state)
@@ -2743,6 +3064,17 @@ async def _startup() -> None:
     if runtime.ready:
         _port = int(os.environ.get("CO_SCI_UI_PORT", "8080"))
         print(f"[ui] Server ready at http://127.0.0.1:{_port}")
+        print(_format_notebook_runtime_startup_line())
+        expected_venv_python = _project_venv_python()
+        if expected_venv_python.exists():
+            try:
+                if Path(sys.executable).resolve() != expected_venv_python.resolve():
+                    print(
+                        "[ui] Startup warning: server is not using the project virtualenv. "
+                        f"current={sys.executable} expected={expected_venv_python}"
+                    )
+            except Exception:
+                logger.debug("Failed to print project virtualenv startup warning.", exc_info=True)
     else:
         print(f"[ui] Startup warning: {runtime.ready_error}")
 
