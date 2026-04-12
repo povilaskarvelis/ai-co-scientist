@@ -49,6 +49,7 @@ from . import tool_registry
 from .skill_loader import create_execution_skill_toolset
 from .skill_loader import create_planner_skill_toolset
 from .skill_loader import create_report_assistant_skill_toolset
+from .skill_loader import load_planner_skill_frontmatters
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,18 @@ BQ_PRIORITY_TOOLS = [
     "list_bigquery_tables",
     "run_bigquery_select_query",
 ]
+BIGQUERY_TOOL_NAMES = set(BQ_PRIORITY_TOOLS)
+BIGQUERY_DATASET_TOOL_HINTS = {
+    "open_targets_platform",
+    "ebi_chembl",
+    "gnomad",
+    "human_genome_variants",
+    "human_variant_annotation",
+    "nlm_rxnorm",
+    "fda_drug",
+    "umiami_lincs",
+    "ebi_surechembl",
+}
 
 STATE_WORKFLOW_TASK = "workflow_task_state"
 STATE_WORKFLOW_TASK_LEGACY_APP = "app:workflow_task_state"
@@ -406,6 +419,215 @@ TOOL_HINT_INFERENCE_RULES: list[tuple[tuple[str, ...], str]] = [
     ),
 ]
 
+PLAN_COVERAGE_ARCHETYPES = {
+    "target_validation",
+    "dataset_discovery",
+    "clinical_trials",
+    "comparative_assessment",
+    "structured_data",
+    "entity_resolution",
+    "safety_risk",
+    "literature_review",
+    "other",
+}
+
+TARGET_VALIDATION_QUERY_TERMS = (
+    "therapeutic target",
+    "drug target",
+    "target validation",
+    "target validity",
+    "target quality",
+    "is a target",
+    "as a target",
+    "targeting",
+    "druggability",
+    "tractability",
+    "essentiality",
+    "dependency",
+    "selective vulnerability",
+    "vulnerability",
+)
+
+ONCOLOGY_QUERY_TERMS = (
+    "cancer",
+    "tumor",
+    "tumour",
+    "oncology",
+    "glioblastoma",
+    "gbm",
+    "glioma",
+    "carcinoma",
+    "sarcoma",
+    "leukemia",
+    "lymphoma",
+    "melanoma",
+    "myeloma",
+    "neoplasm",
+    "adenocarcinoma",
+)
+
+TARGET_VALIDATION_DIMENSION_RULES: dict[str, dict[str, Any]] = {
+    "human_disease_association": {
+        "label": "human disease-association evidence",
+        "tools": (
+            "get_open_targets_association",
+            "get_open_targets_l2g",
+            "open_targets_platform",
+            "query_monarch_associations",
+            "get_clingen_gene_curation",
+            "search_gwas_associations",
+        ),
+        "keywords": (
+            "open targets",
+            "association score",
+            "target-disease",
+            "target disease",
+            "human disease",
+            "gene-disease",
+            "gene disease",
+            "genetic association",
+            "gwas",
+            "l2g",
+            "clingen",
+        ),
+    },
+    "tumor_context": {
+        "label": "tumor context or alteration evidence",
+        "tools": ("get_cancer_mutation_profile", "search_civic_genes", "search_civic_variants"),
+        "keywords": (
+            "cancer mutation",
+            "mutation profile",
+            "cbiop",
+            "cbioportal",
+            "tumor context",
+            "tumour context",
+            "alteration",
+            "oncogenic",
+            "tumor mutation",
+            "tumour mutation",
+        ),
+    },
+    "dependency_selectivity": {
+        "label": "dependency and selectivity evidence",
+        "tools": ("get_depmap_gene_dependency", "get_biogrid_orcs_gene_summary"),
+        "keywords": (
+            "depmap",
+            "dependency",
+            "essentiality",
+            "crispr",
+            "screen evidence",
+            "orcs",
+            "selectivity",
+            "selective vulnerability",
+            "pan-essential",
+            "pan essential",
+        ),
+    },
+    "tractability_pharmacology": {
+        "label": "tractability or pharmacology evidence",
+        "tools": (
+            "search_drug_gene_interactions",
+            "get_guidetopharmacology_target",
+            "get_gtopdb_ligand_reference",
+            "get_chembl_bioactivities",
+            "get_pubchem_compound",
+            "get_dailymed_drug_label",
+        ),
+        "keywords": (
+            "dgidb",
+            "guide to pharmacology",
+            "gtopdb",
+            "drug-gene",
+            "drug gene",
+            "druggability",
+            "tractability",
+            "pharmacology",
+            "ligand",
+            "compound",
+            "bioactivity",
+            "chembl",
+            "pubchem",
+        ),
+    },
+    "clinical_translation": {
+        "label": "clinical translation or safety evidence",
+        "tools": (
+            "search_clinical_trials",
+            "get_clinical_trial",
+            "summarize_clinical_trials_landscape",
+            "search_fda_adverse_events",
+        ),
+        "keywords": (
+            "clinical trial",
+            "clinical trials",
+            "nct",
+            "clinical translation",
+            "clinical relevance",
+            "faers",
+            "adverse event",
+            "safety",
+        ),
+    },
+    "model_organism_context": {
+        "label": "model-organism or translational biology evidence",
+        "tools": ("get_alliance_genome_gene_profile",),
+        "keywords": (
+            "alliance genome",
+            "model organism",
+            "ortholog",
+            "mouse model",
+            "zebrafish",
+            "drosophila",
+            "worm model",
+        ),
+    },
+    "literature_corroboration": {
+        "label": "citation-backed literature corroboration",
+        "tools": (
+            "search_pubmed",
+            "search_pubmed_advanced",
+            "get_pubmed_abstract",
+            "get_paper_fulltext",
+            "search_openalex_works",
+            "search_europe_pmc_literature",
+        ),
+        "keywords": (
+            "pubmed",
+            "pmid",
+            "doi",
+            "literature",
+            "paper",
+            "papers",
+            "citation",
+            "corroborate",
+            "openalex",
+            "europe pmc",
+        ),
+    },
+}
+
+ENTITY_PLACEHOLDER_RE = re.compile(
+    r"\b(?:"
+    r"(?:target|candidate|lead)\s+(?:gene|gene\s+symbol|disease|condition|drug|compound|protein|target|entity|query)|"
+    r"(?:the|this|that|a|an)\s+(?:target\s+)?(?:gene|gene\s+symbol|disease|condition|drug|compound|protein|target|entity|query)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+MISSING_REQUIRED_INPUT_RE = re.compile(
+    r"(?:"
+    r"\bI\s+need\b.{0,140}\b(?:gene|gene symbol|disease|drug|compound|identifier|query|input)\b|"
+    r"\bplease\s+provide\b.{0,140}\b(?:gene|gene symbol|disease|drug|compound|identifier|query|input)\b|"
+    r"\b(?:gene|gene symbol|disease|drug|compound|identifier|query|input)\b.{0,80}\b(?:has|have|was|were)\s+not\s+provided\b|"
+    r"\brequires?\s+(?:a|an|the)?\s*(?:specific\s+)?(?:gene|gene symbol|disease|drug|compound|identifier|query|input)\b"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+BIGQUERY_PROJECT_DATASET_RE = re.compile(
+    r"\b[A-Za-z][A-Za-z0-9_-]*-[A-Za-z0-9_-]*\d+\.([A-Za-z_][A-Za-z0-9_]*)\b"
+)
+
 
 def _normalize_lookup_key(text: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
@@ -449,6 +671,11 @@ __SKILL_POLICY__
 Rules:
 - Build a concrete execution plan before any evidence collection begins.
 - Break the objective into ordered, atomic subtasks.
+- Preserve specific entities supplied by the user (genes, diseases, drugs, cohorts, variants, datasets)
+  in the objective and relevant step goals. Do not replace real entities with placeholders like
+  "target gene", "the gene", "target disease", or "the compound".
+- Do not invent example values or IDs. If an entity is missing and the plan cannot be executed without it,
+  ask for clarification instead of emitting placeholder-based steps.
 - Prioritize high-signal subtasks that reduce uncertainty first.
 - When the objective is centered on clinical trials, GEO datasets, or oncology target validation, load the matching planning skill before finalizing the step sequence.
 - For archive-style dataset discovery (for example OpenNeuro, NEMAR, DANDI, Brain-CODE, CONP), prefer one archive per step and plan around simple keyword or modality checks rather than compound boolean expressions.
@@ -467,8 +694,20 @@ Rules:
 - Pick domains from the domain list above. Include 1-3 domains most relevant to the step.
   The executor will always have access to 'data' and 'literature' tools in addition to
   the domains you specify. Choose domains that match the step's investigation area.
-- NEVER put example values or IDs in the goal or completion_condition.
+- NEVER put invented example values or IDs in the goal or completion_condition. Real user-provided entities
+  are not examples; keep them.
 - Use step ids S1, S2, S3, ... in order.
+
+Coverage contract:
+- Before writing steps, choose one coverage.archetype: target_validation, dataset_discovery, clinical_trials,
+  comparative_assessment, structured_data, entity_resolution, safety_risk, literature_review, or other.
+- Record the planning skills you actually used in coverage.selected_skills.
+- For target-validation objectives, coverage.covered_dimensions should reflect the evidence families actually represented
+  by steps: human_disease_association, tumor_context, dependency_selectivity, tractability_pharmacology,
+  clinical_translation, model_organism_context, and literature_corroboration.
+- If an expected evidence family is intentionally skipped, add it to coverage.omitted_dimensions with a short reason.
+- Prefer steps whose completion condition matches one primary evidence dimension. Pair complementary sources in one step
+  only when they answer the same dimension and the completion condition names both.
 
 Citation requirement:
 - A final report without citations is incomplete. Every plan MUST include at least one step
@@ -495,6 +734,15 @@ Output requirements:
     "schema": "plan_internal.v1",
     "objective": "<restated objective — a single clear research question; if this is a revision, synthesize the original query and revision feedback into one coherent question>",
     "success_criteria": ["..."],
+    "coverage": {
+      "archetype": "<target_validation | dataset_discovery | clinical_trials | comparative_assessment | structured_data | entity_resolution | safety_risk | literature_review | other>",
+      "selected_skills": ["<skill names actually loaded, if any>"],
+      "covered_dimensions": ["<evidence dimensions represented by the steps>"],
+      "omitted_dimensions": [
+        {"dimension": "<expected evidence dimension skipped>", "reason": "<why it is out of scope>"}
+      ],
+      "notes": "<brief rationale for the coverage shape>"
+    },
     "steps": [
       {
         "id": "S1",
@@ -1388,7 +1636,7 @@ def _is_obvious_research_workflow_query(user_text: str) -> bool:
         return True
 
     if (
-        stripped.startswith(("which ", "for "))
+        stripped.startswith(("which ", "for ", "find "))
         and any(term in normalized for term in (" dataset ", " datasets ", " mri ", " fmri ", " eeg ", " meg ", " openneuro ", " nemar ", " dandi ", " brain-code ", " braincode "))
         and (
             any(term in normalized for term in dataset_evaluation_terms)
@@ -2099,7 +2347,7 @@ def _describe_tool_result(name: str, response: Any) -> str:
             response = {}
     err = response.get("error") or response.get("error_message")
     if err:
-        return f"Error in {name}: {str(err)[:400]}"
+        return f"Error in {name}: {_sanitize_bigquery_project_refs(str(err))[:400]}"
 
     result_meta = _extract_mcp_result_meta(response)
 
@@ -2134,12 +2382,12 @@ def _describe_tool_result(name: str, response: Any) -> str:
                 "get_pubmed_abstract",
             )
             max_chars = 500 if name in long_output_tools else 380
-            return _truncate_summary(summary_line, max_chars=max_chars)
+            return _truncate_summary(_sanitize_bigquery_project_refs(summary_line), max_chars=max_chars)
 
     # Try structured dict keys (for non-MCP tools / direct function tools)
     summary = _extract_result_summary(name, response)
     if summary:
-        return summary
+        return _sanitize_bigquery_project_refs(summary)
     return f"{source} returned results"
 
 
@@ -2172,7 +2420,7 @@ def _extract_tool_result_evidence_text(name: str, response: Any, *, max_chars: i
     if not chunks:
         return ""
 
-    combined = "\n\n".join(chunk for chunk in chunks if chunk).strip()
+    combined = _sanitize_bigquery_project_refs("\n\n".join(chunk for chunk in chunks if chunk).strip())
     if len(combined) <= max_chars:
         return combined
     return combined[: max_chars - 1].rstrip() + "…"
@@ -3014,6 +3262,8 @@ def _score_summary_sentence(sentence: str) -> float:
     lowered = cleaned.lower()
     if lowered.startswith("act:") or lowered.startswith("observe:"):
         return -10.0
+    if _is_missing_required_input_response(cleaned):
+        return -5.0
 
     score = 0.0
     if len(cleaned) >= 40:
@@ -3059,6 +3309,8 @@ def _select_informative_summary_text(text: str, *, max_sentences: int = 3, max_c
     if not selected:
         for sentence in sentences:
             lowered = sentence.lower()
+            if _is_missing_required_input_response(sentence):
+                continue
             if any(lowered.startswith(prefix) for prefix in _SUMMARY_PROCESS_PREFIXES):
                 continue
             if any(marker in lowered for marker in _SUMMARY_PROCESS_MARKERS):
@@ -3073,6 +3325,8 @@ def _preferred_model_result_summary(value: Any) -> str:
     """Use the executor-provided result_summary when it looks substantive."""
     cleaned = _clean_executor_summary_text(str(value or ""))
     if not cleaned:
+        return ""
+    if _is_missing_required_input_response(cleaned):
         return ""
     candidate_sentences = []
     for sentence in _split_summary_sentences(cleaned):
@@ -3204,6 +3458,8 @@ def _infer_step_status_from_output(final_text: str, tool_log: list[dict[str, Any
     lowered = str(final_text or "").lower()
     if re.search(r"\bblocked\b", lowered):
         return "blocked"
+    if _is_missing_required_input_response(final_text):
+        return "blocked"
 
     done_count = sum(1 for entry in tool_log if entry.get("status") == "done")
     error_count = 0
@@ -3282,10 +3538,23 @@ def _build_deterministic_step_result(
         limit=10,
     )
 
+    status = str(base.get("status") or _infer_step_status_from_output(final_text, tool_log)).strip().lower() or "completed"
+    if status == "completed" and _is_missing_required_input_response(
+        " ".join(
+            str(value or "")
+            for value in (
+                final_text,
+                base.get("result_summary", ""),
+                base.get("step_progress_note", ""),
+            )
+        )
+    ):
+        status = "blocked"
+
     result = {
         "schema": STEP_RESULT_SCHEMA,
         "step_id": step_id,
-        "status": str(base.get("status") or _infer_step_status_from_output(final_text, tool_log)).strip().lower() or "completed",
+        "status": status,
         "step_progress_note": _first_sentence(summary_text, max_chars=200) or "Step completed.",
         "result_summary": summary_text,
         "evidence_ids": evidence_ids,
@@ -3317,6 +3586,242 @@ def _as_string_list(value: Any, field_name: str, *, limit: int = 20) -> list[str
     if not isinstance(value, list):
         raise ValueError(f"{field_name} must be a list")
     return _dedupe_str_list(value, limit=limit)
+
+
+def _optional_string_list(value: Any, *, limit: int = 20) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return _dedupe_str_list(value, limit=limit)
+
+
+def _canonicalize_plan_label(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _plan_match_text(*values: Any) -> str:
+    return re.sub(r"\s+", " ", " ".join(str(value or "") for value in values)).strip().lower()
+
+
+def _contains_entity_placeholder(text: Any) -> bool:
+    return bool(ENTITY_PLACEHOLDER_RE.search(str(text or "")))
+
+
+def _is_missing_required_input_response(text: Any) -> bool:
+    return bool(MISSING_REQUIRED_INPUT_RE.search(str(text or "")))
+
+
+def _sanitize_bigquery_project_refs(text: Any) -> str:
+    return BIGQUERY_PROJECT_DATASET_RE.sub(r"\1", str(text or ""))
+
+
+def _step_match_text(step: dict[str, Any]) -> str:
+    domains = " ".join(str(domain) for domain in (step.get("domains") or []))
+    return _plan_match_text(
+        step.get("goal"),
+        step.get("completion_condition"),
+        step.get("tool_hint"),
+        domains,
+    )
+
+
+def _is_oncology_text(text: str) -> bool:
+    lowered = _plan_match_text(text)
+    return any(term in lowered for term in ONCOLOGY_QUERY_TERMS)
+
+
+def _is_target_validation_objective(objective: str, steps: list[dict[str, Any]]) -> bool:
+    text = _plan_match_text(
+        objective,
+        " ".join(str(step.get("goal", "")) for step in steps[:4]),
+        " ".join(str(step.get("completion_condition", "")) for step in steps[:4]),
+    )
+    if any(term in text for term in TARGET_VALIDATION_QUERY_TERMS):
+        return True
+    if _is_oncology_text(text) and re.search(r"\b(target|targets|gene|genes|protein|proteins)\b", text):
+        return True
+    return bool(
+        re.search(r"\b(target|targets|gene|genes|protein|proteins)\b", text)
+        and any(term in text for term in ("druggability", "tractability", "dependency", "essentiality"))
+    )
+
+
+def _infer_plan_archetype(objective: str, steps: list[dict[str, Any]], requested: Any = None) -> str:
+    requested_arch = _canonicalize_plan_label(requested)
+    if requested_arch in PLAN_COVERAGE_ARCHETYPES:
+        return requested_arch
+
+    text = _plan_match_text(
+        objective,
+        " ".join(str(step.get("goal", "")) for step in steps),
+        " ".join(str(step.get("tool_hint", "")) for step in steps),
+    )
+    if _is_target_validation_objective(objective, steps):
+        return "target_validation"
+    if any(term in text for term in ("clinical trial", "clinical trials", "nct")):
+        return "clinical_trials"
+    if any(term in text for term in ("dataset", "datasets", "cohort", "archive")):
+        return "dataset_discovery"
+    if any(term in text for term in ("compare", "rank", "prioritize", "versus", "vs.")):
+        return "comparative_assessment"
+    if any(term in text for term in ("identifier", "identifiers", "normalize", "resolve", "mapping")):
+        return "entity_resolution"
+    if any(term in text for term in ("safety", "adverse event", "faers", "toxicity")):
+        return "safety_risk"
+    if any(term in text for term in ("bigquery", "structured", "database", "table-backed")):
+        return "structured_data"
+    if any(term in text for term in ("literature", "pubmed", "paper", "papers", "review")):
+        return "literature_review"
+    return "other"
+
+
+def _step_covers_target_validation_dimension(step: dict[str, Any], dimension: str) -> bool:
+    rule = TARGET_VALIDATION_DIMENSION_RULES.get(dimension)
+    if not rule:
+        return False
+    tool_hint = str(step.get("tool_hint", "") or "").strip()
+    if tool_hint in set(rule.get("tools", ())):
+        return True
+    text = _step_match_text(step)
+    return any(str(keyword).lower() in text for keyword in rule.get("keywords", ()))
+
+
+def _infer_target_validation_dimensions(steps: list[dict[str, Any]]) -> list[str]:
+    covered: list[str] = []
+    for step in steps:
+        for dimension in TARGET_VALIDATION_DIMENSION_RULES:
+            if _step_covers_target_validation_dimension(step, dimension):
+                covered.append(dimension)
+    return _dedupe_str_list(covered, limit=12)
+
+
+def _normalize_omitted_coverage_dimensions(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    omitted: list[dict[str, str]] = []
+    for item in value:
+        if isinstance(item, dict):
+            dimension = _canonicalize_plan_label(item.get("dimension"))
+            reason = re.sub(r"\s+", " ", str(item.get("reason", "") or "").strip())
+        else:
+            dimension = _canonicalize_plan_label(item)
+            reason = ""
+        if not dimension:
+            continue
+        omitted.append({"dimension": dimension, "reason": reason})
+        if len(omitted) >= 12:
+            break
+    return omitted
+
+
+def _normalize_plan_coverage(raw: Any, *, objective: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
+    coverage_raw = raw if isinstance(raw, dict) else {}
+    archetype = _infer_plan_archetype(objective, steps, coverage_raw.get("archetype"))
+    claimed_dimensions = [
+        _canonicalize_plan_label(value)
+        for value in _optional_string_list(coverage_raw.get("covered_dimensions"), limit=12)
+    ]
+    claimed_dimensions = [dimension for dimension in claimed_dimensions if dimension]
+    inferred_dimensions = _infer_target_validation_dimensions(steps) if archetype == "target_validation" else []
+    omitted_dimensions = _normalize_omitted_coverage_dimensions(coverage_raw.get("omitted_dimensions"))
+    notes = re.sub(r"\s+", " ", str(coverage_raw.get("notes", "") or "").strip())
+    selected_skills = _optional_string_list(coverage_raw.get("selected_skills"), limit=10)
+    return {
+        "archetype": archetype,
+        "selected_skills": selected_skills,
+        "covered_dimensions": inferred_dimensions or _dedupe_str_list(claimed_dimensions, limit=12),
+        "claimed_covered_dimensions": _dedupe_str_list(claimed_dimensions, limit=12),
+        "omitted_dimensions": omitted_dimensions,
+        "notes": notes,
+    }
+
+
+def _dimension_display_name(dimension: str) -> str:
+    rule = TARGET_VALIDATION_DIMENSION_RULES.get(dimension)
+    if rule:
+        return str(rule.get("label") or dimension.replace("_", " "))
+    return dimension.replace("_", " ")
+
+
+def _build_plan_entity_binding_warnings(objective: str, steps: list[dict[str, Any]]) -> list[str]:
+    warnings: list[str] = []
+    if _contains_entity_placeholder(objective):
+        warnings.append(
+            "Entity binding gap: the objective still uses a placeholder such as `target gene` or `the disease`. "
+            "Revise the plan so concrete user-provided entities are bound before execution."
+        )
+    for step in steps:
+        step_text = _plan_match_text(step.get("goal"), step.get("completion_condition"))
+        if not _contains_entity_placeholder(step_text):
+            continue
+        warnings.append(
+            f"Entity binding gap: {step.get('id', 'S?')} uses a placeholder entity in its goal or completion "
+            "condition. Bind the gene, disease, drug, compound, or dataset from the user objective before running tools."
+        )
+    return _dedupe_str_list(warnings, limit=8)
+
+
+def _required_target_validation_dimensions(objective: str) -> list[str]:
+    text = _plan_match_text(objective)
+    required = [
+        "human_disease_association",
+        "dependency_selectivity",
+        "tractability_pharmacology",
+        "literature_corroboration",
+    ]
+    if _is_oncology_text(text):
+        required.insert(1, "tumor_context")
+    if any(term in text for term in ("clinical", "trial", "therapeutic", "therapy", "treat", "translation")):
+        required.append("clinical_translation")
+    return _dedupe_str_list(required, limit=10)
+
+
+def _build_plan_quality_warnings(validated_plan: dict[str, Any]) -> list[str]:
+    objective = str(validated_plan.get("objective", "") or "")
+    steps = list(validated_plan.get("steps", []) or [])
+    warnings: list[str] = _build_plan_entity_binding_warnings(objective, steps)
+    coverage = validated_plan.get("coverage") if isinstance(validated_plan.get("coverage"), dict) else {}
+    if coverage.get("archetype") != "target_validation":
+        return _dedupe_str_list(warnings, limit=8)
+
+    actual_dimensions = set(_infer_target_validation_dimensions(steps))
+    omitted_dimensions = {
+        str(item.get("dimension", "")).strip()
+        for item in coverage.get("omitted_dimensions", [])
+        if isinstance(item, dict)
+    }
+
+    for dimension in _required_target_validation_dimensions(objective):
+        if dimension in actual_dimensions or dimension in omitted_dimensions:
+            continue
+        warnings.append(
+            "Coverage gap: this target-validation plan has no apparent "
+            f"{_dimension_display_name(dimension)} step. Add one, or record why it is out of scope."
+        )
+
+    claimed_dimensions = set(coverage.get("claimed_covered_dimensions") or [])
+    unsupported_claims = sorted(claimed_dimensions - actual_dimensions - omitted_dimensions)
+    if unsupported_claims:
+        labels = ", ".join(_dimension_display_name(dimension) for dimension in unsupported_claims[:4])
+        warnings.append(
+            "Coverage map check: the plan claims coverage for "
+            f"{labels}, but no step appears to gather that evidence."
+        )
+
+    for step in steps:
+        step_dimensions = [
+            dimension
+            for dimension in TARGET_VALIDATION_DIMENSION_RULES
+            if _step_covers_target_validation_dimension(step, dimension)
+        ]
+        if len(step_dimensions) <= 1:
+            continue
+        labels = ", ".join(_dimension_display_name(dimension) for dimension in step_dimensions[:3])
+        warnings.append(
+            f"Atomicity check: {step.get('id', 'S?')} appears to span multiple evidence dimensions "
+            f"({labels}). Split it if those require separate source calls or separate acceptance criteria."
+        )
+
+    return _dedupe_str_list(warnings, limit=8)
 
 
 def _canonicalize_tool_hint_candidate(value: Any) -> str:
@@ -3403,11 +3908,24 @@ def _validate_plan_internal(raw: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
+    coverage = _normalize_plan_coverage(raw.get("coverage"), objective=objective, steps=steps)
+    planning_warnings = _build_plan_quality_warnings(
+        {
+            "schema": PLAN_SCHEMA,
+            "objective": objective,
+            "success_criteria": success_criteria,
+            "steps": steps,
+            "coverage": coverage,
+        }
+    )
+
     return {
         "schema": PLAN_SCHEMA,
         "objective": objective,
         "success_criteria": success_criteria,
         "steps": steps,
+        "coverage": coverage,
+        "planning_warnings": planning_warnings,
     }
 
 
@@ -3436,16 +3954,23 @@ def _initialize_task_state_from_plan(plan: dict[str, Any], *, objective_text: st
         }
         for step in validated["steps"]
     ]
-    objective = validated["objective"] or objective_text
+    validated_objective = validated["objective"] or objective_text
+    if _contains_entity_placeholder(validated_objective) and str(objective_text or "").strip():
+        objective = str(objective_text or "").strip()
+    else:
+        objective = validated_objective
     task_state = {
         "schema": WORKFLOW_TASK_SCHEMA,
         "objective": objective,
+        "original_objective": str(objective_text or "").strip() or objective,
         "objective_fingerprint": _normalize_user_text(objective_text or objective),
         "plan_status": "ready",
         "current_step_id": steps[0]["id"] if steps else None,
         "last_completed_step_id": None,
         "steps": steps,
         "success_criteria": validated["success_criteria"],
+        "planning_coverage": validated.get("coverage", {}),
+        "planning_warnings": validated.get("planning_warnings", []),
         "latest_synthesis": None,
         "evidence_store": _new_evidence_store(),
         "execution_metrics": _new_execution_metrics_bundle(),
@@ -4534,7 +5059,7 @@ def _humanize_biolink_predicate(value: str) -> str:
 
 
 def _sanitize_internal_report_text(text: str) -> str:
-    cleaned = re.sub(r"\s+", " ", str(text or "").strip())
+    cleaned = re.sub(r"\s+", " ", _sanitize_bigquery_project_refs(text).strip())
     if not cleaned:
         return ""
 
@@ -6393,6 +6918,17 @@ def _render_plan_markdown(task_state: dict[str, Any]) -> str:
     if objective:
         lines.append(f"**Objective:** {objective}")
         lines.append("")
+    planning_warnings = [
+        re.sub(r"\s+", " ", str(warning or "").strip())
+        for warning in task_state.get("planning_warnings", [])
+        if str(warning or "").strip()
+    ]
+    if planning_warnings:
+        lines.append("**Planning checks:**")
+        lines.append("")
+        for warning in planning_warnings:
+            lines.append(f"- {warning}")
+        lines.append("")
     for step in task_state.get("steps", []):
         tool_hint = step.get("tool_hint", "").strip()
         source_label = _resolve_source_label(tool_hint)
@@ -6517,8 +7053,8 @@ def _render_react_step_progress(
     if tool_log:
         for entry in tool_log:
             tool = entry.get("tool", "?")
-            summary = entry.get("summary", "").strip()
-            entry_result = entry.get("result", "").strip()
+            summary = _sanitize_bigquery_project_refs(entry.get("summary", "")).strip()
+            entry_result = _sanitize_bigquery_project_refs(entry.get("result", "")).strip()
             entry_status = entry.get("status", "")
             if summary and entry_result:
                 lines.append(f"- {summary} → {entry_result}")
@@ -8177,6 +8713,13 @@ def _render_no_plan_to_finalize_message() -> str:
 def _planner_json_instruction_suffix() -> str:
     return (
         "Return ONLY valid JSON matching `plan_internal.v1` for this objective. "
+        "Preserve concrete entities from the user's objective in the objective and step goals; "
+        "do not replace TP53, glioblastoma, named drugs, diseases, datasets, or variants with placeholders like "
+        "`target gene`, `the gene`, or `the disease`. "
+        "Include a `coverage` object with `archetype`, `selected_skills`, `covered_dimensions`, "
+        "`omitted_dimensions`, and `notes`; for target-validation plans, use the evidence dimensions "
+        "human_disease_association, tumor_context, dependency_selectivity, tractability_pharmacology, "
+        "clinical_translation, model_organism_context, and literature_corroboration. "
         "Each step MUST include a \"domains\" array with 1-3 domain names from: "
         f"{', '.join(tool_registry.ALL_DOMAIN_NAMES)}. "
         "If you are unsure which tool fits a step, choose the closest valid tool from the catalog instead of leaving "
@@ -8208,6 +8751,7 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
     payload = {
         "schema": "react_step_context.v1",
         "objective": task_state.get("objective", ""),
+        "original_objective": task_state.get("original_objective", task_state.get("objective", "")),
         "current_step": {
             "id": active_step.get("id"),
             "goal": active_step.get("goal"),
@@ -8238,6 +8782,23 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
         instructions.append(routing_guidance)
     if structured_observation_guidance:
         instructions.append(structured_observation_guidance)
+
+    objective_text = str(task_state.get("objective", "") or "")
+    original_objective_text = str(task_state.get("original_objective", "") or "")
+    if _contains_entity_placeholder(goal_text) or _contains_entity_placeholder(active_step.get("completion_condition", "")):
+        instructions.append(
+            "Entity binding guardrails:\n"
+            "- The current step contains generic wording such as `target gene`, `the gene`, `target disease`, or `the compound`.\n"
+            "- Bind those placeholders to the concrete entities in `objective` / `original_objective` before calling tools.\n"
+            "- Do not ask the user for an entity that is already present in the objective context.\n"
+            "- If the objective context truly lacks a required entity, mark the step BLOCKED instead of reporting it as completed."
+        )
+    elif _contains_entity_placeholder(objective_text) or _contains_entity_placeholder(original_objective_text):
+        instructions.append(
+            "Entity binding guardrails:\n"
+            "- If a required gene, disease, drug, compound, or dataset is not concretely named in the objective context, mark the step BLOCKED.\n"
+            "- Do not report a step as completed when the finding is only that more input is needed."
+        )
 
     if focus_terms:
         instructions.append(
@@ -10174,64 +10735,65 @@ def _synth_after_model_callback(*, callback_context: CallbackContext, llm_respon
     return _replace_llm_response_text(llm_response, final_markdown)
 
 
-BQ_EXECUTOR_POLICY = """- BigQuery-first policy: For any structured data lookup, prefer `list_bigquery_tables` \
-and `run_bigquery_select_query` over non-BQ tools. \
-Available datasets: open_targets_platform (targets, diseases, drugs, evidence), ebi_chembl (bioactivity), \
-gnomAD (variant frequencies), human_genome_variants, human_variant_annotation (ClinVar), \
-nlm_rxnorm (drug nomenclature), fda_drug (drug labels, NDC, enforcement), \
-umiami_lincs (perturbation signatures), ebi_surechembl (patents).
-CRITICAL SQL syntax: Always wrap table references in backticks in your SQL queries. \
-Short names are auto-expanded: `open_targets_platform.target` → `bigquery-public-data.open_targets_platform.target`. \
-Example: SELECT id, approvedSymbol FROM `open_targets_platform.target` WHERE approvedSymbol = 'BRCA1'.
-If a filter value contains an apostrophe, escape it as two single quotes: `WHERE name = 'Alzheimer''s disease'`. \
-For unfamiliar or nested-field queries, first run the same SQL with `dryRun=true` to catch syntax issues before executing it. \
-Before writing queries:
-  1. Call `list_bigquery_tables(dataset="<dataset_name>")` to see all available tables.
-  2. Call `list_bigquery_tables(dataset="<dataset_name>", table="<table_name>")` to get the full column schema (names, types, descriptions).
-  NEVER guess column names — always inspect the schema first. \
-  Column names are often singular (e.g. "target" not "targets") \
-  and use IDs rather than human-readable names (e.g. targetId is an Ensembl ID like "ENSG00000012048", \
-  diseaseId is an EFO ID like "EFO_0001075"). Look up IDs from reference tables first.
-For `umiami_lincs`, restrict BigQuery usage to metadata-sized tables (`signature`, `perturbagen`, `small_molecule`, `model_system`, `cell_line`) unless you already have exact signature IDs or have explicitly raised the bytes-billed cap. The `readout` table is extremely large and broad gene-list filters usually still scan roughly the full table. \
-Fall back to non-BQ tools for: literature search (search_pubmed, get_paper_fulltext, search_openalex_works), \
-Europe PMC literature/preprints/citations (search_europe_pmc_literature), \
-IEDB epitope / assay evidence (search_iedb_epitope_evidence), \
-ClinicalTrials.gov, UniProt, Reactome pathways, STRING interactions, \
-IntAct experimental interactions (get_intact_interactions), \
-BioGRID experimental interactions (get_biogrid_interactions), \
-gene identifier normalization (resolve_gene_identifiers via MyGene.info), \
-ontology cross-mapping (map_ontology_terms_oxo via EBI OxO), \
-GO ontology lookup and annotations (search_quickgo_terms, get_quickgo_annotations via QuickGO), \
-variant effect predictions (annotate_variants_vep for SIFT/PolyPhen/AlphaMissense), \
-variant discovery by gene (search_variants_by_gene when only gene is known), \
-aggregated variant annotations (get_variant_annotations for ClinVar/CADD/dbSNP/gnomAD/COSMIC — requires rsID/HGVS), \
-clinical variant interpretations (search_civic_variants, search_civic_genes for CIViC), \
-protein structure predictions (get_alphafold_structure for pLDDT), \
-GWAS associations (search_gwas_associations), drug-gene interactions (search_drug_gene_interactions), \
-tissue expression (get_gene_tissue_expression), protein atlas summaries (get_human_protein_atlas_gene), \
-target dependency / vulnerability (get_depmap_gene_dependency), \
-published CRISPR screen summaries (get_biogrid_orcs_gene_summary), \
-drug sensitivity / pharmacogenomics (get_gdsc_drug_sensitivity), \
-PRISM repurposing response (get_prism_repurposing_response), \
-PharmacoDB cross-dataset pharmacogenomics (get_pharmacodb_compound_response), \
-single-cell dataset discovery (search_cellxgene_datasets), ClinGen curations (get_clingen_gene_curation), \
-Alliance Genome Resources translational summaries (get_alliance_genome_gene_profile), \
-Pathway Commons pathway search (search_pathway_commons_top_pathways), \
-Guide to Pharmacology curated target-ligand summaries (get_guidetopharmacology_target), \
-DailyMed label summaries (get_dailymed_drug_label), experimental structures (search_protein_structures), \
-cancer mutations (get_cancer_mutation_profile), \
-drug bioactivity and selectivity (get_chembl_bioactivities — prefer over BigQuery ebi_chembl), \
-chemical compound data (get_pubchem_compound), \
-and post-marketing adverse events (search_fda_adverse_events for openFDA FAERS — \
-prefer this over BigQuery fda_drug for adverse event reports)."""
+BQ_EXECUTOR_POLICY = """- BigQuery policy: For structured-data, identifier-ready, or BigQuery-backed steps, load `structured-data-execution` and `references/bigquery-execution-playbook.md` before choosing SQL versus a dedicated source tool. Keep BigQuery queries read-only, schema-inspected, and narrow; use the playbook for dataset coverage, SQL syntax, LINCS limits, and fallback rules."""
+
+
+def _compact_tool_description(description: str, *, max_chars: int = 120) -> str:
+    text = re.sub(r"\s+", " ", str(description or "").strip())
+    if len(text) <= max_chars:
+        return text
+    clipped = text[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;:.")
+    return f"{clipped}..."
+
+
+def _dedupe_tool_names(tool_hints: list[str]) -> list[str]:
+    seen: set[str] = set()
+    names: list[str] = []
+    for raw in tool_hints:
+        name = str(raw or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
 
 
 def _format_tool_catalog(tool_hints: list[str]) -> str:
-    lines = []
-    for name in tool_hints[:80]:
-        desc = tool_registry.TOOL_DESCRIPTIONS.get(name)
-        lines.append(f"- {name} — {desc}" if desc else f"- {name}")
-    return "\n".join(lines) or "- No tools available."
+    available = _dedupe_tool_names(tool_hints)
+    if not available:
+        return "- No tools available."
+
+    available_set = set(available)
+    assigned: set[str] = set()
+    lines: list[str] = []
+
+    for domain in tool_registry.ALL_DOMAIN_NAMES:
+        domain_tools = [
+            tool for tool in tool_registry.TOOL_DOMAINS.get(domain, [])
+            if tool in available_set and tool not in assigned
+        ]
+        if not domain_tools:
+            continue
+        lines.append(f"### {domain}")
+        for name in domain_tools:
+            assigned.add(name)
+            source = tool_registry.TOOL_SOURCE_NAMES.get(name, "").strip()
+            desc = _compact_tool_description(tool_registry.TOOL_DESCRIPTIONS.get(name, ""))
+            source_text = f" ({source})" if source else ""
+            desc_text = f": {desc}" if desc else ""
+            lines.append(f"- `{name}`{source_text}{desc_text}")
+
+    other_tools = [name for name in available if name not in assigned]
+    if other_tools:
+        lines.append("### other")
+        for name in other_tools:
+            source = tool_registry.TOOL_SOURCE_NAMES.get(name, "").strip()
+            desc = _compact_tool_description(tool_registry.TOOL_DESCRIPTIONS.get(name, ""))
+            source_text = f" ({source})" if source else ""
+            desc_text = f": {desc}" if desc else ""
+            lines.append(f"- `{name}`{source_text}{desc_text}")
+
+    return "\n".join(lines)
 
 
 def _format_source_precedence_rules(tool_hints: list[str]) -> str:
@@ -10301,6 +10863,11 @@ def _format_step_routing_guidance(tool_hint: str, available_tools: list[str]) ->
         parts.append(
             "- Keep target-vulnerability work inside specialized screening and dependency tools unless the step explicitly names a "
             "BigQuery dataset or requires a confirmed structured-data slice."
+        )
+    if overlap_group == "variant_evidence":
+        parts.append(
+            "- Keep variant annotation work inside MyVariant.info, Ensembl VEP, CIViC, ClinGen, RegulomeDB, gnomAD API, "
+            "or dbSNP tools. Do not query `gnomad_public` or other BigQuery datasets unless the step explicitly asks for BigQuery."
         )
     return "\n".join(parts)
 
@@ -10377,6 +10944,45 @@ def _format_structured_observation_guidance(tool_hint: str, available_tools: lis
     return "\n".join(lines)
 
 
+def _step_explicitly_requests_bigquery(step: dict[str, Any]) -> bool:
+    tool_hint = str(step.get("tool_hint", "") or "").strip()
+    if tool_hint in BIGQUERY_TOOL_NAMES or tool_hint in BIGQUERY_DATASET_TOOL_HINTS:
+        return True
+    text = _plan_match_text(
+        step.get("goal"),
+        step.get("completion_condition"),
+        step.get("notes"),
+        step.get("rationale"),
+        tool_hint,
+    )
+    return any(
+        marker in text
+        for marker in (
+            "bigquery",
+            " bq ",
+            "sql",
+            "dataset table",
+            "table schema",
+            "schema inspection",
+            "gnomad_public",
+        )
+    )
+
+
+def _step_should_suppress_bigquery_detours(step: dict[str, Any]) -> bool:
+    if _step_explicitly_requests_bigquery(step):
+        return False
+    tool_hint = str(step.get("tool_hint", "") or "").strip()
+    overlap_group = str(tool_registry.TOOL_ROUTING_METADATA.get(tool_hint, {}).get("overlap_group", "")).strip()
+    if overlap_group == "variant_evidence":
+        return True
+    text = _plan_match_text(step.get("goal"), step.get("completion_condition"), tool_hint)
+    return (
+        any(marker in text for marker in ("variant", "missense", "hgvs", "rsid", "dbsnp", "gnomad", "vep", "allele frequency"))
+        and not any(marker in text for marker in ("gene constraint", "pli", "loss-of-function intolerance", "highest allele frequency region"))
+    )
+
+
 def _resolve_step_tools(domains: list[str] | None, *, available_tools: set[str] | None = None) -> list[str]:
     """Resolve a list of domain names into a deduplicated, ordered tool list.
 
@@ -10424,6 +11030,9 @@ def _resolve_step_tool_allowlist(
     for tool_name in [tool_hint, *fallback_tools]:
         if tool_name and tool_name in available_set and tool_name not in focused_tools:
             focused_tools.append(tool_name)
+
+    if focused_tools and _step_should_suppress_bigquery_detours(active_step):
+        focused_tools = [tool_name for tool_name in focused_tools if tool_name not in BIGQUERY_TOOL_NAMES]
 
     if not focused_tools:
         return available
@@ -10516,7 +11125,7 @@ def _format_domain_catalog() -> str:
     lines = []
     for domain in tool_registry.ALL_DOMAIN_NAMES:
         tools = tool_registry.TOOL_DOMAINS.get(domain, [])
-        tool_names = ", ".join(tools[:12])
+        tool_names = ", ".join(f"`{tool}`" for tool in tools)
         always = " (always included)" if domain in tool_registry.ALWAYS_AVAILABLE_DOMAINS else ""
         lines.append(f"- {domain}{always}: {tool_names}")
     return "\n".join(lines)
@@ -10525,17 +11134,12 @@ def _format_domain_catalog() -> str:
 def _planner_skill_guidance(*, planner_skills_enabled: bool) -> str:
     if not planner_skills_enabled:
         return "- No specialized planning skills are available for this run."
-    return (
-        "- Use `structured-data-planning` before planning BigQuery-backed, identifier-ready, or aggregate structured-data investigations.\n"
-        "- Use `archive-dataset-discovery-planning` before planning archive or neuroscience dataset discovery tasks.\n"
-        "- Use `clinical-trials-planning` before planning trial-landscape, outcome, sponsor, label, or safety-driven investigations.\n"
-        "- Use `geo-dataset-discovery-planning` before planning GEO-centric transcriptomics dataset discovery or accession-triage tasks.\n"
-        "- Use `oncology-target-validation-planning` before planning multi-source oncology target-validation work.\n"
-        "- Use `comparative-assessment-planning` before planning head-to-head comparisons that should be aligned by shared dimensions.\n"
-        "- Use `entity-resolution-planning` before planning tasks that depend on resolving aliases, ontology terms, or ambiguous biomedical entities.\n"
-        "- Use `safety-risk-interpretation-planning` before planning risk- or safety-driven investigations that combine trial, label, and post-market evidence.\n"
-        "- Load only the skills relevant to the current objective, then return the final plan JSON."
-    )
+    lines = []
+    for frontmatter in load_planner_skill_frontmatters():
+        description = re.sub(r"\s+", " ", str(frontmatter.description or "").strip())
+        lines.append(f"- `{frontmatter.name}`: {description}")
+    lines.append("- Load only the skills relevant to the current objective, then return the final plan JSON.")
+    return "\n".join(lines)
 
 
 def _build_planner_instruction(

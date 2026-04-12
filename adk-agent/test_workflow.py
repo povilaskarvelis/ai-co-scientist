@@ -11,6 +11,7 @@ from google.genai import types
 
 import co_scientist.tool_registry as tool_registry
 import co_scientist.workflow as workflow
+from co_scientist.skill_loader import load_planner_skill_frontmatters
 from co_scientist.workflow import create_workflow_agent
 
 
@@ -543,6 +544,13 @@ def test_planner_instruction_preserves_core_rules_but_trims_large_playbooks():
     )
 
     assert '"schema": "plan_internal.v1"' in instruction
+    assert '"coverage": {' in instruction
+    assert "Coverage contract:" in instruction
+    assert "target_validation" in instruction
+    assert "dependency_selectivity" in instruction
+    assert "Preserve specific entities supplied by the user" in instruction
+    assert "target gene" in instruction
+    assert "Real user-provided entities" in instruction
     assert "Every plan MUST include at least one step" in instruction
     assert "structured-data-planning" in instruction
     assert "archive-dataset-discovery-planning" in instruction
@@ -556,6 +564,38 @@ def test_planner_instruction_preserves_core_rules_but_trims_large_playbooks():
     assert "Available BigQuery datasets" not in instruction
     assert "open_targets_platform.target" not in instruction
     assert "Avoid boolean strings like `A OR B`" not in instruction
+
+
+def test_planner_skill_guidance_uses_skill_frontmatter_descriptions():
+    guidance = workflow._planner_skill_guidance(planner_skills_enabled=True)
+
+    for frontmatter in load_planner_skill_frontmatters():
+        assert f"- `{frontmatter.name}`: {frontmatter.description}" in guidance
+
+    assert "before planning BigQuery-backed" not in guidance
+    assert "Load only the skills relevant to the current objective" in guidance
+
+
+def test_planner_tool_catalog_includes_every_requested_tool():
+    catalog = workflow._format_tool_catalog(workflow.KNOWN_MCP_TOOLS)
+
+    for tool_name in workflow.KNOWN_MCP_TOOLS:
+        assert f"`{tool_name}`" in catalog
+
+    # These used to fall beyond the first-80 planner catalog cap.
+    assert "`get_clingen_gene_curation`" in catalog
+    assert "`get_alliance_genome_gene_profile`" in catalog
+    assert "`search_openneuro_datasets`" in catalog
+    assert "`get_zenodo_record`" in catalog
+
+
+def test_planner_domain_catalog_does_not_truncate_long_domains():
+    catalog = workflow._format_domain_catalog()
+
+    assert "`get_pharmacodb_compound_response`" in catalog
+    assert "`get_ena_experiment_profile`" in catalog
+    assert "`list_openneuro_files`" in catalog
+    assert "`get_enigma_dataset_info`" in catalog
 
 
 def test_trimmed_tool_registry_descriptions_remove_strategy_prose():
@@ -782,6 +822,184 @@ def test_validate_plan_internal_canonicalizes_source_label_tool_hint():
     assert validated["steps"][0]["tool_hint"] == "search_pubmed"
 
 
+def test_plan_with_placeholder_entities_gets_binding_warning_and_uses_user_objective():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Evaluate the target gene as a therapeutic target in the disease",
+        "success_criteria": ["Summarize target-validity evidence with citations"],
+        "coverage": {
+            "archetype": "target_validation",
+            "selected_skills": ["oncology-target-validation-planning"],
+            "covered_dimensions": ["human_disease_association", "literature_corroboration"],
+            "omitted_dimensions": [],
+            "notes": "Placeholder regression case.",
+        },
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Get Open Targets target-disease association scores for the target gene",
+                "tool_hint": "get_open_targets_association",
+                "domains": ["genomics"],
+                "completion_condition": "Association scores for the target gene are retrieved",
+            },
+            {
+                "id": "S2",
+                "goal": "Search PubMed literature for the gene and disease",
+                "tool_hint": "search_pubmed",
+                "domains": ["literature"],
+                "completion_condition": "At least three PMIDs are recorded",
+            },
+        ],
+    }
+
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Evaluate TP53 as a therapeutic target in glioblastoma",
+    )
+
+    assert task_state["objective"] == "Evaluate TP53 as a therapeutic target in glioblastoma"
+    assert task_state["original_objective"] == "Evaluate TP53 as a therapeutic target in glioblastoma"
+    assert any("Entity binding gap" in warning for warning in task_state["planning_warnings"])
+
+
+def test_target_validation_plan_warns_about_missing_coverage_dimensions():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Evaluate TP53 as a therapeutic target in glioblastoma",
+        "success_criteria": ["Summarize target-validity evidence with citations"],
+        "coverage": {
+            "archetype": "target_validation",
+            "selected_skills": ["oncology-target-validation-planning"],
+            "covered_dimensions": [
+                "dependency_selectivity",
+                "tractability_pharmacology",
+                "clinical_translation",
+                "literature_corroboration",
+            ],
+            "omitted_dimensions": [],
+            "notes": "Initial broad coverage.",
+        },
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Summarize DepMap gene dependency data for TP53",
+                "tool_hint": "get_depmap_gene_dependency",
+                "domains": ["genomics"],
+                "completion_condition": "Dependency metrics for TP53 are summarized",
+            },
+            {
+                "id": "S2",
+                "goal": "Identify known drug-gene interactions for TP53",
+                "tool_hint": "search_drug_gene_interactions",
+                "domains": ["chemistry"],
+                "completion_condition": "Drug-gene interactions and interaction types are recorded",
+            },
+            {
+                "id": "S3",
+                "goal": "Search clinical trials for TP53 modulation in glioblastoma",
+                "tool_hint": "search_clinical_trials",
+                "domains": ["clinical"],
+                "completion_condition": "Relevant NCT IDs are recorded",
+            },
+            {
+                "id": "S4",
+                "goal": "Find literature discussing TP53 as a therapeutic target in glioblastoma",
+                "tool_hint": "search_pubmed",
+                "domains": ["literature"],
+                "completion_condition": "At least three PMIDs are recorded",
+            },
+        ],
+    }
+
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Evaluate TP53 as a therapeutic target in glioblastoma",
+    )
+
+    warnings = task_state["planning_warnings"]
+    assert any("human disease-association evidence" in warning for warning in warnings)
+    assert any("tumor context or alteration evidence" in warning for warning in warnings)
+    assert not any("tractability or pharmacology evidence" in warning for warning in warnings)
+
+    rendered = workflow._render_plan_markdown(task_state)
+    assert "**Planning checks:**" in rendered
+    assert "Coverage gap" in rendered
+
+
+def test_target_validation_plan_with_coverage_contract_has_no_warnings():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Evaluate TP53 as a therapeutic target in glioblastoma",
+        "success_criteria": ["Summarize target-validity evidence with citations"],
+        "coverage": {
+            "archetype": "target_validation",
+            "selected_skills": ["oncology-target-validation-planning"],
+            "covered_dimensions": [
+                "human_disease_association",
+                "tumor_context",
+                "dependency_selectivity",
+                "tractability_pharmacology",
+                "clinical_translation",
+                "literature_corroboration",
+            ],
+            "omitted_dimensions": [],
+            "notes": "Broad target-validation coverage.",
+        },
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Get Open Targets target-disease association scores for TP53",
+                "tool_hint": "get_open_targets_association",
+                "domains": ["genomics"],
+                "completion_condition": "Association scores for TP53 are retrieved",
+            },
+            {
+                "id": "S2",
+                "goal": "Summarize cBioPortal cancer mutation profiles for TP53",
+                "tool_hint": "get_cancer_mutation_profile",
+                "domains": ["genomics"],
+                "completion_condition": "Cancer mutation profiles are summarized",
+            },
+            {
+                "id": "S3",
+                "goal": "Summarize DepMap and BioGRID ORCS CRISPR screen evidence for TP53",
+                "tool_hint": "get_depmap_gene_dependency",
+                "domains": ["genomics"],
+                "completion_condition": "Dependency and CRISPR screen evidence are summarized",
+            },
+            {
+                "id": "S4",
+                "goal": "Identify DGIdb and Guide to Pharmacology target evidence for TP53",
+                "tool_hint": "search_drug_gene_interactions",
+                "domains": ["chemistry"],
+                "completion_condition": "Drug-gene interactions and curated pharmacology targets are identified",
+            },
+            {
+                "id": "S5",
+                "goal": "Search clinical trials and FAERS evidence for TP53-related translation",
+                "tool_hint": "search_clinical_trials",
+                "domains": ["clinical"],
+                "completion_condition": "Relevant NCT IDs and safety signals are recorded",
+            },
+            {
+                "id": "S6",
+                "goal": "Search PubMed for literature corroborating the preceding findings",
+                "tool_hint": "search_pubmed",
+                "domains": ["literature"],
+                "completion_condition": "At least three PMIDs are recorded",
+            },
+        ],
+    }
+
+    task_state = workflow._initialize_task_state_from_plan(
+        plan,
+        objective_text="Evaluate TP53 as a therapeutic target in glioblastoma",
+    )
+
+    assert task_state["planning_coverage"]["archetype"] == "target_validation"
+    assert task_state["planning_warnings"] == []
+
+
 def test_resolve_active_step_tool_allowlist_scopes_to_current_step():
     task_state = {
         "plan_status": "ready",
@@ -818,6 +1036,84 @@ def test_resolve_active_step_tool_allowlist_scopes_to_current_step():
     assert "get_clinical_trial" in scoped_tools
     assert "search_pubmed" in scoped_tools
     assert "get_intact_interactions" not in scoped_tools
+
+
+def test_variant_step_tool_allowlist_suppresses_bigquery_detours():
+    task_state = {
+        "plan_status": "ready",
+        "current_step_id": "S2",
+        "steps": [
+            {
+                "id": "S2",
+                "tool_hint": "get_variant_annotations",
+                "domains": ["genomics"],
+                "status": "pending",
+                "goal": "Annotate an SCN2A missense variant with VEP, gnomAD, and dbSNP evidence",
+                "completion_condition": "Functional predictions and available allele frequencies are summarized",
+            },
+        ],
+    }
+
+    scoped_tools = workflow._resolve_active_step_tool_allowlist(
+        task_state,
+        available_tools=workflow.KNOWN_MCP_TOOLS,
+    )
+
+    assert scoped_tools is not None
+    assert "get_variant_annotations" in scoped_tools
+    assert "annotate_variants_vep" in scoped_tools
+    assert "search_variants_by_gene" in scoped_tools
+    assert "get_dbsnp_population_frequency" in scoped_tools
+    assert "list_bigquery_tables" not in scoped_tools
+    assert "run_bigquery_select_query" not in scoped_tools
+
+
+def test_explicit_bigquery_variant_dataset_step_keeps_bigquery_tools():
+    task_state = {
+        "plan_status": "ready",
+        "current_step_id": "S1",
+        "steps": [
+            {
+                "id": "S1",
+                "tool_hint": "gnomad",
+                "domains": ["data", "genomics"],
+                "status": "pending",
+                "goal": "Inspect the gnomAD BigQuery dataset schema for SCN2A variant-frequency tables",
+                "completion_condition": "Relevant BigQuery table names are identified",
+            },
+        ],
+    }
+
+    scoped_tools = workflow._resolve_active_step_tool_allowlist(
+        task_state,
+        available_tools=workflow.KNOWN_MCP_TOOLS,
+    )
+
+    assert scoped_tools is not None
+    assert "list_bigquery_tables" in scoped_tools
+    assert "run_bigquery_select_query" in scoped_tools
+
+
+def test_variant_step_context_warns_against_gnomad_bigquery_detour():
+    task_state = {
+        "objective": "Assess an SCN2A missense variant",
+        "steps": [
+            {
+                "id": "S2",
+                "status": "pending",
+                "goal": "Retrieve annotations, gnomAD allele frequency, and dbSNP context for the SCN2A variant",
+                "tool_hint": "get_variant_annotations",
+                "domains": ["genomics"],
+                "completion_condition": "Variant annotations and available frequencies are summarized",
+            },
+        ],
+    }
+
+    instructions = workflow._react_step_context_instructions(task_state, task_state["steps"][0])
+    text = "\n".join(instructions)
+
+    assert "Routing guidance for this step's tool_hint `get_variant_annotations`" in text
+    assert "Do not query `gnomad_public`" in text
 
 
 def test_coverage_status_complete_vs_partial():
@@ -1113,6 +1409,30 @@ def test_build_deterministic_step_result_falls_back_when_summary_is_only_process
     assert "ClinicalTrials.gov" in result["result_summary"]
 
 
+def test_build_deterministic_step_result_blocks_missing_required_input_responses():
+    result = workflow._build_deterministic_step_result(
+        step={
+            "id": "S1",
+            "goal": "Get Open Targets association scores for the target gene",
+            "tool_hint": "get_open_targets_association",
+        },
+        step_id="S1",
+        final_text=(
+            "I need the target gene symbol and disease name to retrieve Open Targets association scores. "
+            "Please provide the gene symbol."
+        ),
+        tool_log=[],
+        base_result={
+            "status": "completed",
+            "result_summary": "I need the target gene symbol to retrieve Open Targets association scores.",
+        },
+    )
+
+    assert result["status"] == "blocked"
+    assert "remained blocked" in result["result_summary"]
+    assert not result["result_summary"].startswith("Completed")
+
+
 def test_describe_tool_call_bigquery():
     desc = workflow._describe_tool_call(
         "run_bigquery_select_query",
@@ -1189,6 +1509,23 @@ def test_describe_tool_result_error():
     desc = workflow._describe_tool_result("run_bigquery_select_query", {"error": "syntax error near FROM"})
     assert "error" in desc.lower()
     assert "syntax" in desc
+
+
+def test_describe_tool_result_sanitizes_bigquery_project_ids():
+    desc = workflow._describe_tool_result(
+        "list_bigquery_tables",
+        {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Dataset gen-lang-client-0943167408.gnomad_public is not in the BQ_DATASET_ALLOWLIST.",
+                }
+            ]
+        },
+    )
+
+    assert "gen-lang-client" not in desc
+    assert "gnomad_public is not in the BQ_DATASET_ALLOWLIST" in desc
 
 
 def test_describe_tool_result_gene():
@@ -1627,6 +1964,25 @@ def test_step_executor_instruction_limits_bigquery_fallbacks_to_explicit_structu
     assert "fall back to run_bigquery_select_query" not in text
 
 
+def test_bigquery_executor_policy_is_a_pointer_to_skill_playbook():
+    policy = workflow.BQ_EXECUTOR_POLICY
+    playbook = Path(
+        "adk-agent/co_scientist/skills/structured-data-execution/references/bigquery-execution-playbook.md"
+    ).read_text(encoding="utf-8")
+
+    assert "structured-data-execution" in policy
+    assert "references/bigquery-execution-playbook.md" in policy
+    assert len(policy) < 500
+    assert "open_targets_platform.target" not in policy
+    assert "Alzheimer''s disease" not in policy
+    assert "readout table" not in policy
+
+    assert "open_targets_platform.target" in playbook
+    assert "Alzheimer''s disease" in playbook
+    assert "`readout` table" in playbook
+    assert "Dedicated-Source Fallbacks" in playbook
+
+
 def test_react_step_context_instructions_warn_against_bigquery_detours_for_target_vulnerability():
     task_state = {
         "objective": "Identify selective KRAS co-dependencies in lung cancer",
@@ -1647,6 +2003,31 @@ def test_react_step_context_instructions_warn_against_bigquery_detours_for_targe
     assert "Routing guidance for this step's tool_hint `get_depmap_gene_dependency`" in text
     assert "Keep target-vulnerability work inside specialized screening and dependency tools" in text
     assert "`get_biogrid_orcs_gene_summary` (BioGRID ORCS)" in text
+
+
+def test_react_step_context_binds_placeholder_step_to_original_objective():
+    task_state = {
+        "objective": "Evaluate TP53 as a therapeutic target in glioblastoma",
+        "original_objective": "Evaluate TP53 as a therapeutic target in glioblastoma",
+        "steps": [
+            {
+                "id": "S1",
+                "status": "pending",
+                "goal": "Get Open Targets target-disease association scores for the target gene",
+                "tool_hint": "get_open_targets_association",
+                "domains": ["genomics"],
+                "completion_condition": "Association scores for the target gene are retrieved",
+            }
+        ],
+    }
+    active_step = task_state["steps"][0]
+    instructions = workflow._react_step_context_instructions(task_state, active_step)
+    text = "\n".join(instructions)
+
+    assert '"objective": "Evaluate TP53 as a therapeutic target in glioblastoma"' in text
+    assert '"original_objective": "Evaluate TP53 as a therapeutic target in glioblastoma"' in text
+    assert "Entity binding guardrails" in text
+    assert "Do not ask the user for an entity that is already present" in text
 
 
 def test_react_step_context_instructions_include_translational_routing_guidance():

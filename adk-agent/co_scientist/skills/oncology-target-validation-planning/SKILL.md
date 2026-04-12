@@ -11,4 +11,6 @@ Instructions:
 3. Add a compound or pharmacology step when the user asks about tractability, existing programs, or druggability rather than dependency alone.
 4. Add a later literature or trial step when the earlier evidence is mostly aggregate or screening-based.
 5. Do not plan subtype-specific dependency or co-dependency steps unless the named tool can actually provide that slice. `get_depmap_gene_dependency` is release-level and gene-level; it does not directly provide lineage- or mutation-filtered co-dependency discovery.
-6. Load `references/oncology-target-validation-playbook.md` before finalizing plans that depend on cross-tool oncology reasoning.
+6. Populate the plan `coverage` object with archetype `target_validation`, this skill in `selected_skills`, and the evidence dimensions represented by the steps.
+7. For broad oncology target-validation, cover or explicitly omit: `human_disease_association`, `tumor_context`, `dependency_selectivity`, `tractability_pharmacology`, `clinical_translation`, and `literature_corroboration`.
+8. Load `references/oncology-target-validation-playbook.md` before finalizing plans that depend on cross-tool oncology reasoning.

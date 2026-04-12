@@ -1847,7 +1847,7 @@ ${limitationLines}`;
 
 function buildBigQuerySummary(rows, referencedDatasets, rowCount) {
   if (!rowCount || !rows || rows.length === 0) {
-    return `Query returned 0 rows from ${referencedDatasets.join(", ")}.`;
+    return `Query returned 0 rows from ${displayBigQueryDatasetKeys(referencedDatasets)}.`;
   }
   const first = rows[0];
   const keys = Object.keys(first || {});
@@ -1942,6 +1942,35 @@ function parseBigQueryDatasetAllowlist(rawValue, defaultProjectId = "") {
 
 const BQ_ALLOWED_DATASETS = parseBigQueryDatasetAllowlist(BQ_DATASET_ALLOWLIST, BQ_PROJECT_ID);
 const BQ_ALLOWED_DATASET_SET = new Set(BQ_ALLOWED_DATASETS.map((value) => value.toLowerCase()));
+
+function displayBigQueryDatasetKey(datasetKey) {
+  const parts = normalizeWhitespace(datasetKey || "")
+    .replace(/`/g, "")
+    .split(".")
+    .map((part) => normalizeWhitespace(part))
+    .filter(Boolean);
+  if (parts.length >= 2) return parts[parts.length - 1];
+  return parts[0] || "requested dataset";
+}
+
+function displayBigQueryDatasetKeys(datasetKeys) {
+  return dedupeArray((datasetKeys || []).map(displayBigQueryDatasetKey).filter(Boolean)).join(", ");
+}
+
+function displayBigQueryTableRef(datasetKey, tableName = "") {
+  const dataset = displayBigQueryDatasetKey(datasetKey);
+  const table = normalizeWhitespace(tableName || "");
+  return table ? `${dataset}.${table}` : dataset;
+}
+
+function sanitizeBigQueryErrorMessage(message) {
+  let cleaned = normalizeWhitespace(message || "unknown BigQuery error");
+  if (BQ_PROJECT_ID) {
+    const escapedProject = BQ_PROJECT_ID.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    cleaned = cleaned.replace(new RegExp(`\\b${escapedProject}\\.([A-Za-z0-9_]+)`, "g"), "$1");
+  }
+  return cleaned.replace(/\b[A-Za-z][A-Za-z0-9_-]*-[A-Za-z0-9_-]+\d+\.(\w+)\b/g, "$1");
+}
 
 function getBigQueryClient() {
   if (bigQueryClient) return bigQueryClient;
@@ -5706,7 +5735,7 @@ server.registerTool(
         content: [
           {
             type: "text",
-            text: `Dataset ${selectedDataset} is not in the BQ_DATASET_ALLOWLIST.`,
+            text: `Dataset ${displayBigQueryDatasetKey(selectedDataset)} is not in the BQ_DATASET_ALLOWLIST.`,
           },
         ],
       };
@@ -5734,9 +5763,9 @@ server.registerTool(
               {
                 type: "text",
                 text: renderStructuredResponse({
-                  summary: `Table \`${selectedDataset}.${requestedTable}\` exists but has no schema fields.`,
-                  keyFields: [`Dataset: ${selectedDataset}`, `Table: ${requestedTable}`],
-                  sources: [`bigquery://${selectedDataset}.${requestedTable}`],
+                  summary: `Table \`${displayBigQueryTableRef(selectedDataset, requestedTable)}\` exists but has no schema fields.`,
+                  keyFields: [`Dataset: ${displayBigQueryDatasetKey(selectedDataset)}`, `Table: ${requestedTable}`],
+                  sources: [`bigquery://${displayBigQueryTableRef(selectedDataset, requestedTable)}`],
                   limitations: ["The table may be empty or use a non-standard schema."],
                 }),
               },
@@ -5764,7 +5793,7 @@ server.registerTool(
         const numRows = tableMetadata?.numRows ? `Rows: ~${Number(tableMetadata.numRows).toLocaleString()}` : null;
         const numBytes = tableMetadata?.numBytes ? `Size: ${formatBigQueryBytes(Number(tableMetadata.numBytes))}` : null;
         const keyFields = [
-          `Dataset: ${selectedDataset}`,
+          `Dataset: ${displayBigQueryDatasetKey(selectedDataset)}`,
           `Table: ${requestedTable}`,
           `Columns: ${schemaFields.length}`,
         ];
@@ -5776,9 +5805,9 @@ server.registerTool(
             {
               type: "text",
               text: `${renderStructuredResponse({
-                summary: `Schema for \`${selectedDataset}.${requestedTable}\` (${schemaFields.length} columns).`,
+                summary: `Schema for \`${displayBigQueryTableRef(selectedDataset, requestedTable)}\` (${schemaFields.length} columns).`,
                 keyFields,
-                sources: [`bigquery://${selectedDataset}.${requestedTable}`],
+                sources: [`bigquery://${displayBigQueryTableRef(selectedDataset, requestedTable)}`],
                 limitations: [
                   "Use these column names in your SQL queries. Wrap table references in backticks.",
                 ],
@@ -5788,7 +5817,7 @@ server.registerTool(
         };
       } catch (error) {
         return {
-          content: [{ type: "text", text: `Error fetching schema for ${selectedDataset}.${requestedTable}: ${error.message}` }],
+          content: [{ type: "text", text: `Error fetching schema for ${displayBigQueryTableRef(selectedDataset, requestedTable)}: ${sanitizeBigQueryErrorMessage(error.message)}` }],
         };
       }
     }
@@ -5801,9 +5830,9 @@ server.registerTool(
             {
               type: "text",
               text: renderStructuredResponse({
-                summary: `No tables found for ${selectedDataset}.`,
-                keyFields: [`Dataset: ${selectedDataset}`],
-                sources: [`bigquery://${selectedDataset}`],
+                summary: `No tables found for ${displayBigQueryDatasetKey(selectedDataset)}.`,
+                keyFields: [`Dataset: ${displayBigQueryDatasetKey(selectedDataset)}`],
+                sources: [`bigquery://${displayBigQueryDatasetKey(selectedDataset)}`],
                 limitations: [
                   "Dataset may be empty, inaccessible, or filtered by IAM.",
                 ],
@@ -5822,13 +5851,13 @@ server.registerTool(
           {
             type: "text",
             text: `${renderStructuredResponse({
-              summary: `Retrieved ${Math.min(tables.length, boundedLimit)} table(s) from ${selectedDataset}.`,
+              summary: `Retrieved ${Math.min(tables.length, boundedLimit)} table(s) from ${displayBigQueryDatasetKey(selectedDataset)}.`,
               keyFields: [
-                `Dataset: ${selectedDataset}`,
+                `Dataset: ${displayBigQueryDatasetKey(selectedDataset)}`,
                 `Requested limit: ${boundedLimit}`,
                 `Allowlist enforced: ${BQ_ALLOWED_DATASET_SET.size > 0 ? "yes" : "no"}`,
               ],
-              sources: [`bigquery://${selectedDataset}`],
+              sources: [`bigquery://${displayBigQueryDatasetKey(selectedDataset)}`],
               limitations: [
                 "To see column names for a table, call this tool again with the `table` parameter.",
               ],
@@ -5838,7 +5867,7 @@ server.registerTool(
       };
     } catch (error) {
       return {
-        content: [{ type: "text", text: `Error in list_bigquery_tables: ${error.message}` }],
+        content: [{ type: "text", text: `Error in list_bigquery_tables: ${sanitizeBigQueryErrorMessage(error.message)}` }],
       };
     }
   }
@@ -5888,7 +5917,7 @@ server.registerTool(
         content: [
           {
             type: "text",
-            text: `Query references dataset(s) outside BQ_DATASET_ALLOWLIST: ${disallowedDatasets.join(", ")}`,
+            text: `Query references dataset(s) outside BQ_DATASET_ALLOWLIST: ${displayBigQueryDatasetKeys(disallowedDatasets)}`,
           },
         ],
       };
@@ -5919,12 +5948,12 @@ server.registerTool(
               text: renderStructuredResponse({
                 summary: "BigQuery dry run completed successfully.",
                 keyFields: [
-                  `Datasets referenced: ${referencedDatasets.join(", ")}`,
+                  `Datasets referenced: ${displayBigQueryDatasetKeys(referencedDatasets)}`,
                   `Bytes processed estimate: ${formatBigQueryBytes(totalBytesProcessed)} (${totalBytesProcessed})`,
                   `Max bytes billed guardrail: ${formatBigQueryBytes(maximumBytesBilled)} (${maximumBytesBilled})`,
                   `Location: ${BQ_LOCATION}`,
                 ],
-                sources: referencedDatasets.map((datasetKey) => `bigquery://${datasetKey}`),
+                sources: referencedDatasets.map((datasetKey) => `bigquery://${displayBigQueryDatasetKey(datasetKey)}`),
                 limitations: [
                   "Dry run validates syntax and estimates bytes, but does not return rows.",
                 ],
@@ -5957,7 +5986,7 @@ server.registerTool(
             text: `${renderStructuredResponse({
               summary: bqSummary,
               keyFields: [
-                `Datasets referenced: ${referencedDatasets.join(", ")}`,
+                `Datasets referenced: ${displayBigQueryDatasetKeys(referencedDatasets)}`,
                 `Rows returned: ${rowCount}`,
                 `Row cap: ${boundedRows}`,
                 `Bytes processed: ${formatBigQueryBytes(totalBytesProcessed)} (${totalBytesProcessed})`,
@@ -5966,7 +5995,7 @@ server.registerTool(
                 `Location: ${BQ_LOCATION}`,
                 `Job ID: ${job?.id || "unknown"}`,
               ],
-              sources: referencedDatasets.map((datasetKey) => `bigquery://${datasetKey}`),
+              sources: referencedDatasets.map((datasetKey) => `bigquery://${displayBigQueryDatasetKey(datasetKey)}`),
               limitations: [
                 "Only the first page of results is returned.",
                 `Rows are capped at ${boundedRows} to control costs and context size.`,
@@ -5976,7 +6005,7 @@ server.registerTool(
         ],
       };
     } catch (error) {
-      const message = normalizeWhitespace(error?.message || "unknown BigQuery error");
+      const message = sanitizeBigQueryErrorMessage(error?.message || "unknown BigQuery error");
       const hint = buildBigQueryErrorHint(normalizedSql, message);
       return {
         content: [{

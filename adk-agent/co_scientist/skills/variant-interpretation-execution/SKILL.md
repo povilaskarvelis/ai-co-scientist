@@ -10,4 +10,5 @@ Instructions:
 2. Separate functional prediction, aggregate annotation, oncology interpretation, and gene-level curation; they are related but not interchangeable.
 3. Treat conflicting interpretations explicitly. Do not collapse VUS, benign, pathogenic, and oncology-specific assertions into one label.
 4. Prefer the smallest variant set needed to answer the step rather than broad variant enumeration.
-5. Load `references/variant-interpretation-playbook.md` before concluding variant-heavy steps.
+5. Use MyVariant.info / VEP / dbSNP / gnomAD API tools for variant-level annotations. Do not fall back to BigQuery gnomAD tables unless the step explicitly asks for BigQuery.
+6. Load `references/variant-interpretation-playbook.md` before concluding variant-heavy steps.

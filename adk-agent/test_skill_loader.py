@@ -9,8 +9,10 @@ from co_scientist.skill_loader import (
     create_planner_skill_toolset,
     create_report_assistant_skill_toolset,
     load_execution_skills,
+    load_planner_skill_frontmatters,
     load_planner_skills,
     load_report_assistant_skills,
+    load_skill_frontmatters,
     load_skills,
 )
 
@@ -33,6 +35,12 @@ def _write_skill(root, name, *, frontmatter_name=None):
 def test_load_planner_skills_from_repo():
     skills = load_planner_skills()
     assert [skill.name for skill in skills] == list(PLANNER_SKILL_DIR_NAMES)
+
+
+def test_load_planner_skill_frontmatters_from_repo():
+    frontmatters = load_planner_skill_frontmatters()
+    assert [frontmatter.name for frontmatter in frontmatters] == list(PLANNER_SKILL_DIR_NAMES)
+    assert all(frontmatter.description for frontmatter in frontmatters)
 
 
 def test_create_planner_skill_toolset_from_repo():
@@ -102,6 +110,19 @@ def test_load_skills_loads_references_assets_and_scripts(tmp_path):
     assert skill.resources.references["playbook.md"] == "reference body"
     assert skill.resources.assets["template.txt"] == "asset body"
     assert str(skill.resources.scripts["tool.py"]) == "print('ok')\n"
+
+
+def test_load_skill_frontmatters_loads_only_frontmatter(tmp_path):
+    skill_dir = _write_skill(tmp_path, "structured-data-execution")
+    references_dir = skill_dir / "references"
+    references_dir.mkdir()
+    (references_dir / "playbook.md").write_text("reference body", encoding="utf-8")
+
+    frontmatters = load_skill_frontmatters(("structured-data-execution",), skills_dir=tmp_path)
+
+    assert len(frontmatters) == 1
+    assert frontmatters[0].name == "structured-data-execution"
+    assert frontmatters[0].description == "test skill"
 
 
 def test_load_skills_fails_when_frontmatter_missing(tmp_path):

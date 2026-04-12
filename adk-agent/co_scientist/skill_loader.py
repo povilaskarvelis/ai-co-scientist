@@ -127,6 +127,21 @@ def _load_skill_from_directory(skill_dir: Path) -> Skill:
     )
 
 
+def _load_skill_frontmatter_from_directory(skill_dir: Path) -> Frontmatter:
+    """Load only a skill's frontmatter without reference/assets/script resources."""
+    skill_md_path = skill_dir / "SKILL.md"
+    if not skill_md_path.exists():
+        raise FileNotFoundError(f"SKILL.md not found in {skill_dir}")
+
+    frontmatter, _ = _parse_skill_markdown(skill_md_path)
+    if frontmatter.name != skill_dir.name:
+        raise ValueError(
+            f"Skill frontmatter name '{frontmatter.name}' does not match directory name "
+            f"'{skill_dir.name}'"
+        )
+    return frontmatter
+
+
 def load_skills(
     skill_dir_names: tuple[str, ...],
     *,
@@ -135,6 +150,16 @@ def load_skills(
     """Load a fixed set of repo-local skills in order."""
     root = Path(skills_dir) if skills_dir is not None else SKILLS_DIR
     return [_load_skill_from_directory(root / name) for name in skill_dir_names]
+
+
+def load_skill_frontmatters(
+    skill_dir_names: tuple[str, ...],
+    *,
+    skills_dir: Path | None = None,
+) -> list[Frontmatter]:
+    """Load a fixed set of repo-local skill frontmatters in order."""
+    root = Path(skills_dir) if skills_dir is not None else SKILLS_DIR
+    return [_load_skill_frontmatter_from_directory(root / name) for name in skill_dir_names]
 
 
 def create_skill_toolset(
@@ -150,6 +175,11 @@ def create_skill_toolset(
 def load_planner_skills(*, skills_dir: Path | None = None) -> list[Skill]:
     """Load the planner's repo-local skills in a fixed order."""
     return load_skills(PLANNER_SKILL_DIR_NAMES, skills_dir=skills_dir)
+
+
+def load_planner_skill_frontmatters(*, skills_dir: Path | None = None) -> list[Frontmatter]:
+    """Load the planner's repo-local skill frontmatters in a fixed order."""
+    return load_skill_frontmatters(PLANNER_SKILL_DIR_NAMES, skills_dir=skills_dir)
 
 
 def create_planner_skill_toolset(*, skills_dir: Path | None = None) -> tuple[list[Skill], SkillToolset]:
@@ -190,7 +220,9 @@ __all__ = [
     "create_report_assistant_skill_toolset",
     "create_skill_toolset",
     "load_execution_skills",
+    "load_planner_skill_frontmatters",
     "load_planner_skills",
     "load_report_assistant_skills",
+    "load_skill_frontmatters",
     "load_skills",
 ]

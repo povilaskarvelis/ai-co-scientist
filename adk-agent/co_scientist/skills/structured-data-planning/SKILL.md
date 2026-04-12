@@ -13,4 +13,5 @@ Instructions:
 5. If the main evidence source is aggregate or structured and does not directly return PMIDs, DOIs, or NCT IDs, add a later literature corroboration step.
 6. Load `references/bigquery-playbook.md` for structured-data planning heuristics, including when not to start with BigQuery.
 7. Load `references/grounding-and-identifiers.md` when identifier normalization, ontology mapping, or citation grounding will matter.
-8. After using the relevant references, return the final plan as JSON only.
+8. Populate the plan `coverage` object with archetype `structured_data` unless a more specific archetype applies, and record any structured source family that is intentionally skipped in `coverage.omitted_dimensions`.
+9. After using the relevant references, return the final plan as JSON only.
