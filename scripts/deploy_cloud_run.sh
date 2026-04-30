@@ -5,7 +5,8 @@ set -euo pipefail
 # PROJECT_ID  – GCP project (pass via env or edit default below)
 # GOOGLE_API_KEY – Google AI Studio key (required only when USE_VERTEX_AI=false; stored in Secret Manager)
 # ── Optional overrides ───────────────────────────────────────────────────────
-# REGION, SERVICE_NAME, REPO_NAME, IMAGE_NAME, USE_VERTEX_AI, GA4_MEASUREMENT_ID, CONCURRENCY, CPU
+# REGION, SERVICE_NAME, REPO_NAME, IMAGE_NAME, USE_VERTEX_AI, GA4_MEASUREMENT_ID, CONCURRENCY, CPU,
+# MIN_INSTANCES, MAX_INSTANCES
 # ─────────────────────────────────────────────────────────────────────────────
 
 PROJECT_ID="gen-lang-client-0943167408"
@@ -18,8 +19,10 @@ GOOGLE_API_KEY="${GOOGLE_API_KEY:-}"
 BIOGRID_ACCESS_KEY="${BIOGRID_ACCESS_KEY:-}"
 BIOGRID_ORCS_ACCESS_KEY="${BIOGRID_ORCS_ACCESS_KEY:-}"
 GA4_MEASUREMENT_ID="${GA4_MEASUREMENT_ID:-G-NTCXHW3B2G}"
-CONCURRENCY="${CONCURRENCY:-16}"
+CONCURRENCY="${CONCURRENCY:-8}"
 CPU="${CPU:-2}"
+MIN_INSTANCES="${MIN_INSTANCES:-0}"
+MAX_INSTANCES="${MAX_INSTANCES:-2}"
 
 ENV_FILE="adk-agent/.env"
 
@@ -83,6 +86,9 @@ echo "Using project=${PROJECT_ID} region=${REGION} service=${SERVICE_NAME}"
 echo "LLM backend: $([ "${USE_VERTEX_AI}" = "true" ] && echo "Vertex AI" || echo "AI Studio API key")"
 echo "Cloud Run concurrency: ${CONCURRENCY}"
 echo "Cloud Run CPU: ${CPU}"
+echo "Cloud Run min instances: ${MIN_INSTANCES}"
+echo "Cloud Run max instances: ${MAX_INSTANCES}"
+echo "Cloud Run CPU allocation: request-based"
 
 # ── Artifact Registry ────────────────────────────────────────────────────────
 
@@ -169,10 +175,10 @@ DEPLOY_FLAGS=(
   --port 8080
   --cpu "${CPU}"
   --memory 4Gi
-  --min-instances 1
-  --max-instances 3
+  --min-instances "${MIN_INSTANCES}"
+  --max-instances "${MAX_INSTANCES}"
   --concurrency "${CONCURRENCY}"
-  --no-cpu-throttling
+  --cpu-throttling
   --timeout 900
   --set-env-vars "GOOGLE_CLOUD_PROJECT=${PROJECT_ID}"
   --set-env-vars "GOOGLE_CLOUD_LOCATION=${REGION}"

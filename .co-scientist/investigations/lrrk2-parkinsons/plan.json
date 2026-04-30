@@ -1,0 +1,63 @@
+{
+  "schema": "co_scientist.plan.v1",
+  "objective": "Evaluate whether LRRK2 is a viable therapeutic target in Parkinson disease, integrating human genetics, disease biology, clinical intervention evidence, and druggability/chemistry constraints.",
+  "created_at": "2026-04-20",
+  "status": "synthesized",
+  "success_criteria": [
+    "At least one evidence record captures human genetic support for LRRK2 in PD with source identifiers (for example rsID and PMID/DOI).",
+    "At least one evidence record captures target biology and/or tissue expression with source identifiers (for example UniProt accession).",
+    "At least one evidence record captures intervention-stage evidence from registered clinical trials or published trial results with NCT/PMID/DOI identifiers.",
+    "At least one evidence record captures tractability/druggability evidence with compound or target identifiers (for example CHEMBL or PubChem).",
+    "Final claims distinguish supported findings from uncertain areas and include explicit limitations."
+  ],
+  "steps": [
+    {
+      "id": "S1",
+      "goal": "Establish human genetic and epidemiologic evidence linking LRRK2 to Parkinson disease risk or penetrance.",
+      "tool_hint": "search_pubmed",
+      "source_notes": "Variant-focused Parkinson disease genetics and penetrance literature with rsID-grounded evidence.",
+      "domains": [
+        "human genetics",
+        "neurology"
+      ],
+      "completion_condition": "At least two identifier-backed records describe pathogenic or risk-associated LRRK2 variants and effect context.",
+      "status": "completed"
+    },
+    {
+      "id": "S2",
+      "goal": "Summarize LRRK2 molecular function, expression relevance, and mechanistic rationale in PD biology.",
+      "tool_hint": "get_gene_tissue_expression",
+      "source_notes": "Combine GTEx tissue expression, Human Protein Atlas atlas summaries, and UniProt target identity for mechanistic context.",
+      "domains": [
+        "molecular biology",
+        "neurodegeneration"
+      ],
+      "completion_condition": "At least two identifier-backed records summarize kinase function/pathway biology and disease-relevant context.",
+      "status": "completed"
+    },
+    {
+      "id": "S3",
+      "goal": "Assess intervention-stage clinical evidence for LRRK2-targeted therapies in PD.",
+      "tool_hint": "get_clinical_trial",
+      "source_notes": "ClinicalTrials.gov registration records for BIIB122 development programs, with publications as follow-up when available.",
+      "domains": [
+        "clinical trials",
+        "therapeutics"
+      ],
+      "completion_condition": "At least two records capture trial registration or published outcomes with NCT and publication identifiers where available.",
+      "status": "completed"
+    },
+    {
+      "id": "S4",
+      "goal": "Assess target tractability and chemistry landscape for LRRK2 modulation.",
+      "tool_hint": "get_chembl_bioactivities",
+      "source_notes": "Use ChEMBL target/activity records plus PubChem compound identity and linked medicinal chemistry publications.",
+      "domains": [
+        "medicinal chemistry",
+        "drug discovery"
+      ],
+      "completion_condition": "At least one record includes target accession plus compound-class identifiers (CHEMBL/PubChem) and translational caveats.",
+      "status": "completed"
+    }
+  ]
+}

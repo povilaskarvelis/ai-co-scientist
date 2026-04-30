@@ -18,6 +18,7 @@ outputs/
 
 # Node.js
 node_modules/
+packages/*/dist/
 
 # OS files
 .DS_Store

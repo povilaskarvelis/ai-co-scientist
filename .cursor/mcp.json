@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ai-co-scientist-research": {
+      "args": [
+        "${workspaceFolder}/research-mcp/server.js"
+      ],
+      "command": "node",
+      "envFile": "${workspaceFolder}/.env",
+      "type": "stdio"
+    }
+  }
+}

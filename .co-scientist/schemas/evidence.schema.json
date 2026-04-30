@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:ai-co-scientist:schemas:evidence:v1",
+  "title": "AI Co-Scientist Evidence Record",
+  "type": "object",
+  "required": [
+    "schema",
+    "id",
+    "step_id",
+    "source",
+    "tool",
+    "claim",
+    "summary",
+    "identifiers",
+    "evidence_type",
+    "confidence"
+  ],
+  "properties": {
+    "schema": {
+      "const": "co_scientist.evidence.v1"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^E[0-9]+$"
+    },
+    "step_id": {
+      "type": "string",
+      "pattern": "^S[0-9]+$"
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tool": {
+      "type": "string",
+      "minLength": 1
+    },
+    "query": {
+      "type": "string"
+    },
+    "claim": {
+      "type": "string",
+      "minLength": 1
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "identifiers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "evidence_type": {
+      "type": "string",
+      "enum": [
+        "literature",
+        "clinical_trial",
+        "structured_data",
+        "database_record",
+        "regulatory",
+        "experimental",
+        "metadata",
+        "other"
+      ]
+    },
+    "confidence": {
+      "type": "string",
+      "enum": [
+        "high",
+        "moderate",
+        "low",
+        "mixed",
+        "unknown"
+      ]
+    },
+    "limitations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "metadata": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}

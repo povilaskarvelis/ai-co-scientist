@@ -1,0 +1,25 @@
+{
+  "name": "@ai-co-scientist/cosci-cursor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "cosci-cursor": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.10"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
