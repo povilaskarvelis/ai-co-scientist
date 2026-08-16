@@ -32,6 +32,14 @@ class DummyRunner:
         self.kwargs = kwargs
 
 
+class DummyMcpResources:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
 @pytest.fixture
 def runtime(tmp_path, monkeypatch):
     for env_name in ("AI_CO_SCIENTIST_POSTGRES_DSN", "POSTGRES_DSN", "DATABASE_URL"):
@@ -372,6 +380,123 @@ async def test_get_or_create_session_rehydrates_persisted_state(runtime):
 
 
 @pytest.mark.asyncio
+async def test_conversation_retention_evicts_lru_resources(runtime, monkeypatch):
+    resources: list[DummyMcpResources] = []
+
+    def create_agent(require_plan_approval=True):
+        managed = DummyMcpResources()
+        resources.append(managed)
+        return object(), managed
+
+    monkeypatch.setattr(ui_server, "create_workflow_agent", create_agent)
+    runtime.max_retained_conversations = 2
+
+    oldest = await runtime._acquire_conversation_session("conv_oldest")
+    await runtime._release_conversation_session("conv_oldest")
+    newer = await runtime._acquire_conversation_session("conv_newer")
+    await runtime._release_conversation_session("conv_newer")
+    oldest.last_used_at = 1.0
+    newer.last_used_at = 2.0
+    runtime._get_conv_thread_lock("conv_oldest")
+
+    await runtime._acquire_conversation_session("conv_newest")
+    await runtime._release_conversation_session("conv_newest")
+
+    assert set(runtime.conv_sessions) == {"conv_newer", "conv_newest"}
+    assert "conv_oldest" not in runtime.conv_thread_locks
+    assert resources[0].close_calls == 1
+    assert resources[1].close_calls == 0
+    assert resources[2].close_calls == 0
+    assert await runtime.session_service.get_session(
+        app_name=oldest.app_name,
+        user_id=runtime.user_id,
+        session_id=oldest.session_id,
+    ) is None
+    assert oldest.app_name not in runtime.session_service.sessions
+
+
+@pytest.mark.asyncio
+async def test_active_conversation_is_not_evicted(runtime, monkeypatch):
+    resources: list[DummyMcpResources] = []
+
+    def create_agent(require_plan_approval=True):
+        managed = DummyMcpResources()
+        resources.append(managed)
+        return object(), managed
+
+    monkeypatch.setattr(ui_server, "create_workflow_agent", create_agent)
+    runtime.max_retained_conversations = 1
+
+    active = await runtime._acquire_conversation_session("conv_active")
+    other = await runtime._acquire_conversation_session("conv_other")
+
+    assert set(runtime.conv_sessions) == {"conv_active", "conv_other"}
+    assert active.active_operations == 1
+    assert other.active_operations == 1
+
+    await runtime._release_conversation_session("conv_other")
+
+    assert set(runtime.conv_sessions) == {"conv_active"}
+    assert resources[0].close_calls == 0
+    assert resources[1].close_calls == 1
+
+    runtime.max_retained_conversations = 0
+    await runtime._release_conversation_session("conv_active")
+    assert runtime.conv_sessions == {}
+    assert resources[0].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_evicted_conversation_rehydrates_persisted_state(runtime, monkeypatch):
+    resources: list[DummyMcpResources] = []
+
+    def create_agent(require_plan_approval=True):
+        managed = DummyMcpResources()
+        resources.append(managed)
+        return object(), managed
+
+    monkeypatch.setattr(ui_server, "create_workflow_agent", create_agent)
+    runtime.max_retained_conversations = 0
+
+    first = await runtime._acquire_conversation_session("conv_reopen")
+    first_session = await runtime.session_service.get_session(
+        app_name=first.app_name,
+        user_id=runtime.user_id,
+        session_id=first.session_id,
+    )
+    assert first_session is not None
+    live_state = runtime.session_service.sessions[first.app_name][runtime.user_id][first.session_id].state
+    live_state[STATE_WORKFLOW_TASK] = {
+        "objective": "Resume after eviction",
+        "steps": [],
+    }
+    live_state[STATE_PLAN_PENDING_APPROVAL] = True
+    live_state["temp:discard_me"] = "transient"
+
+    await runtime._persist_conversation_state("conv_reopen", task_id="task_reopen")
+    await runtime._release_conversation_session("conv_reopen")
+
+    assert runtime.conv_sessions == {}
+    assert resources[0].close_calls == 1
+
+    reopened = await runtime._acquire_conversation_session("conv_reopen")
+    reopened_session = await runtime.session_service.get_session(
+        app_name=reopened.app_name,
+        user_id=runtime.user_id,
+        session_id=reopened.session_id,
+    )
+
+    assert reopened_session is not None
+    assert reopened.session_id != first.session_id
+    assert reopened_session.state[STATE_WORKFLOW_TASK]["objective"] == "Resume after eviction"
+    assert reopened_session.state[STATE_PLAN_PENDING_APPROVAL] is True
+    assert "temp:discard_me" not in reopened_session.state
+
+    await runtime._release_conversation_session("conv_reopen")
+    assert resources[1].close_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_save_task_with_progress_persists_live_session_snapshot(runtime):
     async def fake_persistable_state(conversation_id: str) -> dict:
         assert conversation_id == "conv_persist"
@@ -587,7 +712,7 @@ async def test_run_new_query_marks_terminal_rate_limit_response_as_failed(runtim
         "`429 RESOURCE_EXHAUSTED`"
     )
 
-    async def fake_get_or_create_session(conversation_id: str):
+    async def fake_acquire_conversation_session(conversation_id: str):
         return SimpleNamespace(app_name="test-app", session_id=conversation_id)
 
     async def fake_turn(conversation_id: str, prompt: str, *, run_id: str):
@@ -599,7 +724,7 @@ async def test_run_new_query_marks_terminal_rate_limit_response_as_failed(runtim
     async def fake_plan_pending(conversation_id: str) -> bool:
         return False
 
-    runtime._get_or_create_session = fake_get_or_create_session  # type: ignore[method-assign]
+    runtime._acquire_conversation_session = fake_acquire_conversation_session  # type: ignore[method-assign]
     runtime._run_workflow_turn_filtered = fake_turn  # type: ignore[method-assign]
     runtime._read_workflow_state = fake_read_state  # type: ignore[method-assign]
     runtime._is_plan_pending_approval = fake_plan_pending  # type: ignore[method-assign]
@@ -648,6 +773,51 @@ async def test_run_start_task_stops_immediately_on_terminal_rate_limit(runtime):
     assert stored_task is not None
     assert stored_task["status"] == "failed"
     assert stored_task["report_markdown"] == rate_limit_text
+
+
+@pytest.mark.asyncio
+async def test_run_start_task_rehydrates_released_conversation_before_saving(runtime):
+    conversation_id = "conv_resume_checkpoint"
+    task = ui_server._make_task(
+        "task_resume_checkpoint",
+        "Resume persisted workflow",
+        conversation_id,
+    )
+    task["awaiting_hitl"] = True
+    runtime.store.save_task(task)
+    runtime.store.save_workflow_session(
+        conversation_id,
+        task_id=task["task_id"],
+        state={
+            STATE_WORKFLOW_TASK: {
+                "objective": "Persisted checkpoint objective",
+                "steps": [],
+            },
+            STATE_PLAN_PENDING_APPROVAL: True,
+        },
+    )
+    runtime.max_retained_conversations = 0
+    observed_objectives: list[str] = []
+
+    async def fake_turn(conversation_id: str, prompt: str, *, run_id: str):
+        workflow_state = await runtime._read_workflow_state(conversation_id)
+        observed_objectives.append(workflow_state["objective"])
+        return (
+            "## Rate Limited\n\nGoogle AI Studio rate limits have been hit.\n\n"
+            "`429 RESOURCE_EXHAUSTED`",
+            "research_workflow",
+        )
+
+    runtime._run_workflow_turn_filtered = fake_turn  # type: ignore[method-assign]
+
+    run = await runtime._create_run("start_task", task_id=task["task_id"])
+    await runtime._run_start_task(run.run_id, task["task_id"])
+
+    assert observed_objectives == ["Persisted checkpoint objective"]
+    assert conversation_id not in runtime.conv_sessions
+    persisted = runtime.store.get_workflow_session(conversation_id)
+    assert persisted is not None
+    assert persisted["state"][STATE_WORKFLOW_TASK]["objective"] == "Persisted checkpoint objective"
 
 
 @pytest.mark.asyncio

@@ -60,6 +60,10 @@ logger = logging.getLogger(__name__)
 RATE_LIMIT_QUERIES = int(os.environ.get("RATE_LIMIT_QUERIES", "20"))
 RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "3600"))
 MAX_CONCURRENT_TURNS = int(os.environ.get("ADK_MAX_CONCURRENT_TURNS", "6"))
+MAX_RETAINED_CONVERSATIONS = max(
+    0,
+    int(os.environ.get("ADK_MAX_RETAINED_CONVERSATIONS", str(MAX_CONCURRENT_TURNS))),
+)
 _global_turn_semaphore = threading.Semaphore(MAX_CONCURRENT_TURNS)
 GA4_MEASUREMENT_ID = os.environ.get("GA4_MEASUREMENT_ID", "").strip()
 _GA4_ID_PATTERN = re.compile(r"^G-[A-Z0-9]+$")
@@ -399,6 +403,8 @@ class ConversationSession:
     session_id: str
     app_name: str
     mcp_tools: object | None
+    active_operations: int = 0
+    last_used_at: float = field(default_factory=time.monotonic)
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +670,8 @@ class UiRuntime:
         self.session_service: InMemorySessionService | None = None
         self.conv_sessions: dict[str, ConversationSession] = {}
         self.conv_thread_locks: dict[str, threading.Lock] = {}
+        self.max_retained_conversations = MAX_RETAINED_CONVERSATIONS
+        self._conv_sessions_lock = asyncio.Lock()
         self.runs_lock = asyncio.Lock()
         self.runs: dict[str, RunRecord] = {}
         self.background_tasks: set[asyncio.Task] = set()
@@ -691,23 +699,87 @@ class UiRuntime:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         self._thread_pool.shutdown(wait=False)
-        for cs in self.conv_sessions.values():
-            if cs.mcp_tools is not None:
-                try:
-                    await cs.mcp_tools.close()
-                except Exception:
-                    pass
+        async with self._conv_sessions_lock:
+            retained = list(self.conv_sessions.items())
+            self.conv_sessions.clear()
+            self.conv_thread_locks.clear()
+            for conversation_id, cs in retained:
+                await self._close_conversation_resources(conversation_id, cs)
 
     def _get_conv_thread_lock(self, conversation_id: str) -> threading.Lock:
         if conversation_id not in self.conv_thread_locks:
             self.conv_thread_locks[conversation_id] = threading.Lock()
         return self.conv_thread_locks[conversation_id]
 
-    async def _get_or_create_session(self, conversation_id: str) -> ConversationSession:
+    async def _close_conversation_resources(
+        self,
+        conversation_id: str,
+        cs: ConversationSession,
+    ) -> None:
+        if cs.mcp_tools is not None:
+            try:
+                await cs.mcp_tools.close()
+            except Exception:
+                logger.exception(
+                    "Failed to close MCP resources for conversation %s.",
+                    conversation_id,
+                )
+        if self.session_service is not None:
+            try:
+                await self.session_service.delete_session(
+                    app_name=cs.app_name,
+                    user_id=self.user_id,
+                    session_id=cs.session_id,
+                )
+                # ADK leaves empty app/user maps behind after deleting the last
+                # in-memory session; each conversation has its own app namespace.
+                session_apps = getattr(self.session_service, "sessions", None)
+                if isinstance(session_apps, dict):
+                    app_sessions = session_apps.get(cs.app_name)
+                    if isinstance(app_sessions, dict):
+                        user_sessions = app_sessions.get(self.user_id)
+                        if isinstance(user_sessions, dict) and not user_sessions:
+                            app_sessions.pop(self.user_id, None)
+                        if not app_sessions:
+                            session_apps.pop(cs.app_name, None)
+                            for state_attr in ("app_state", "user_state"):
+                                scoped_state = getattr(self.session_service, state_attr, None)
+                                if isinstance(scoped_state, dict):
+                                    scoped_state.pop(cs.app_name, None)
+            except Exception:
+                logger.exception(
+                    "Failed to delete ADK session for conversation %s.",
+                    conversation_id,
+                )
+
+    async def _trim_conversation_sessions_locked(self, target: int) -> None:
+        target = max(0, target)
+        idle = sorted(
+            (
+                (cs.last_used_at, conversation_id, cs)
+                for conversation_id, cs in self.conv_sessions.items()
+                if cs.active_operations == 0
+            ),
+            key=lambda item: (item[0], item[1]),
+        )
+        while len(self.conv_sessions) > target and idle:
+            _, conversation_id, cs = idle.pop(0)
+            if self.conv_sessions.get(conversation_id) is not cs or cs.active_operations:
+                continue
+            self.conv_sessions.pop(conversation_id, None)
+            self.conv_thread_locks.pop(conversation_id, None)
+            await self._close_conversation_resources(conversation_id, cs)
+
+    async def _get_or_create_session_locked(self, conversation_id: str) -> ConversationSession:
         if conversation_id in self.conv_sessions:
-            return self.conv_sessions[conversation_id]
+            cs = self.conv_sessions[conversation_id]
+            cs.last_used_at = time.monotonic()
+            return cs
         if not self.session_service:
             raise RuntimeError("Session service is not initialized.")
+        await self._trim_conversation_sessions_locked(
+            max(0, self.max_retained_conversations - 1)
+        )
         workflow_agent, mcp_tools = create_workflow_agent(require_plan_approval=True)
         app_name = f"co_scientist_ui_{conversation_id}"
         runner = Runner(
@@ -721,11 +793,22 @@ class UiRuntime:
             payload = restored_session.get("state")
             if isinstance(payload, dict):
                 restored_state = _extract_persistable_session_state(payload) or None
-        session = await self.session_service.create_session(
-            app_name=app_name,
-            user_id=self.user_id,
-            state=restored_state,
-        )
+        try:
+            session = await self.session_service.create_session(
+                app_name=app_name,
+                user_id=self.user_id,
+                state=restored_state,
+            )
+        except Exception:
+            if mcp_tools is not None:
+                try:
+                    await mcp_tools.close()
+                except Exception:
+                    logger.exception(
+                        "Failed to close MCP resources after session setup failed for %s.",
+                        conversation_id,
+                    )
+            raise
         cs = ConversationSession(
             runner=runner,
             session_id=session.id,
@@ -734,6 +817,45 @@ class UiRuntime:
         )
         self.conv_sessions[conversation_id] = cs
         return cs
+
+    async def _get_or_create_session(self, conversation_id: str) -> ConversationSession:
+        async with self._conv_sessions_lock:
+            return await self._get_or_create_session_locked(conversation_id)
+
+    async def _acquire_conversation_session(self, conversation_id: str) -> ConversationSession:
+        async with self._conv_sessions_lock:
+            cs = await self._get_or_create_session_locked(conversation_id)
+            cs.active_operations += 1
+            cs.last_used_at = time.monotonic()
+            return cs
+
+    async def _release_conversation_session(self, conversation_id: str) -> None:
+        async with self._conv_sessions_lock:
+            cs = self.conv_sessions.get(conversation_id)
+            if cs is None:
+                return
+            if cs.active_operations > 0:
+                cs.active_operations -= 1
+            cs.last_used_at = time.monotonic()
+            await self._trim_conversation_sessions_locked(
+                self.max_retained_conversations
+            )
+
+    async def _finish_conversation_operation(
+        self,
+        conversation_id: str,
+        *,
+        task_id: str = "",
+    ) -> None:
+        try:
+            await self._persist_conversation_state(conversation_id, task_id=task_id)
+        except Exception:
+            logger.exception(
+                "Failed to persist conversation %s before releasing its resources.",
+                conversation_id,
+            )
+        finally:
+            await self._release_conversation_session(conversation_id)
 
     async def _read_session_state(self, conversation_id: str) -> dict | None:
         cs = self.conv_sessions.get(conversation_id)
@@ -780,7 +902,7 @@ class UiRuntime:
 
         Returns (response_text, responding_author).
         """
-        cs = await self._get_or_create_session(conversation_id)
+        cs = await self._acquire_conversation_session(conversation_id)
         main_loop = asyncio.get_running_loop()
         thread_lock = self._get_conv_thread_lock(conversation_id)
 
@@ -804,7 +926,10 @@ class UiRuntime:
             finally:
                 _global_turn_semaphore.release()
 
-        return await main_loop.run_in_executor(self._thread_pool, _thread_target)
+        try:
+            return await main_loop.run_in_executor(self._thread_pool, _thread_target)
+        finally:
+            await self._release_conversation_session(conversation_id)
 
     async def _run_workflow_turn_filtered(
         self,
@@ -1401,10 +1526,14 @@ class UiRuntime:
             await self._update_run(run_id, status="failed", error=self.ready_error or "Not ready.")
             return
 
+        task_id = ""
+        conv_id = ""
+        conversation_acquired = False
         try:
             task_id = f"task_{uuid.uuid4().hex[:10]}"
             conv_id = conversation_id or f"conv_{task_id}"
-            await self._get_or_create_session(conv_id)
+            await self._acquire_conversation_session(conv_id)
+            conversation_acquired = True
 
             title = _generate_chat_title(query)
             parent = parent_task_id.strip() if parent_task_id else None
@@ -1600,6 +1729,12 @@ class UiRuntime:
             )
             await self._update_run(run_id, status="failed", error=error)
             traceback.print_exc()
+        finally:
+            if conversation_acquired:
+                await self._finish_conversation_operation(
+                    conv_id,
+                    task_id=task_id,
+                )
 
     async def _run_start_task(self, run_id: str, task_id: str) -> None:
         await self._update_run(run_id, status="running")
@@ -1607,6 +1742,8 @@ class UiRuntime:
             await self._update_run(run_id, status="failed", error=self.ready_error or "Not ready.")
             return
 
+        conv_id = ""
+        conversation_acquired = False
         try:
             task = self.store.get_task(task_id)
             if not task:
@@ -1617,6 +1754,8 @@ class UiRuntime:
                 return
 
             conv_id = task["conversation_id"]
+            await self._acquire_conversation_session(conv_id)
+            conversation_acquired = True
             await self._update_run(run_id, task_id=task_id, title=task.get("title", ""))
             task["hitl_history"].append("approve")
             task["awaiting_hitl"] = False
@@ -1775,6 +1914,12 @@ class UiRuntime:
             )
             await self._update_run(run_id, status="failed", error=error)
             traceback.print_exc()
+        finally:
+            if conversation_acquired:
+                await self._finish_conversation_operation(
+                    conv_id,
+                    task_id=task_id,
+                )
 
     async def _run_feedback_task(self, run_id: str, task_id: str, message: str) -> None:
         await self._update_run(run_id, status="running")
@@ -1782,6 +1927,8 @@ class UiRuntime:
             await self._update_run(run_id, status="failed", error=self.ready_error or "Not ready.")
             return
 
+        conv_id = ""
+        conversation_acquired = False
         try:
             task = self.store.get_task(task_id)
             if not task:
@@ -1789,6 +1936,8 @@ class UiRuntime:
                 return
 
             conv_id = task["conversation_id"]
+            await self._acquire_conversation_session(conv_id)
+            conversation_acquired = True
             await self._update_run(run_id, task_id=task_id, title=task.get("title", ""))
 
             prompt = f"revise: {message}"
@@ -1871,6 +2020,12 @@ class UiRuntime:
             )
             await self._update_run(run_id, status="failed", error=error)
             traceback.print_exc()
+        finally:
+            if conversation_acquired:
+                await self._finish_conversation_operation(
+                    conv_id,
+                    task_id=task_id,
+                )
 
     # -- Reports ---------------------------------------------------------------
 
