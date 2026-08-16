@@ -12,12 +12,17 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@cursor/sdk": "^1.0.10"
+    "@cursor/sdk": "^1.0.28"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
-    "tsx": "^4.20.6",
+    "tsx": "^4.23.12",
     "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "@connectrpc/connect-node": {
+      "undici": "6.28.0"
+    }
   },
   "engines": {
     "node": ">=22"

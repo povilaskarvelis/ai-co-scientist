@@ -394,6 +394,57 @@ async function api(path, options = {}) {
   return parsed;
 }
 
+async function streamRunApi(path, options = {}, onUpdate = null) {
+  const config = {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/x-ndjson",
+      ...(options.headers || {}),
+    },
+  };
+  const res = await fetch(path, config);
+  if (!res.ok) {
+    const raw = await res.text();
+    let parsed = null;
+    try {
+      parsed = raw ? JSON.parse(raw) : null;
+    } catch {
+      parsed = raw;
+    }
+    const detail = (parsed && parsed.detail) || (typeof parsed === "string" ? parsed : `HTTP ${res.status}`);
+    throw new Error(detail);
+  }
+  if (!res.body) throw new Error("Streaming response body is unavailable.");
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let latest = null;
+
+  const consumeLine = (line) => {
+    const trimmed = String(line || "").trim();
+    if (!trimmed) return;
+    const payload = JSON.parse(trimmed);
+    if (!payload?.run_id) return;
+    latest = payload;
+    if (typeof onUpdate === "function") onUpdate(payload);
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) consumeLine(line);
+    if (done) break;
+  }
+  consumeLine(buffer);
+
+  if (!latest) throw new Error("The workflow ended without returning a run result.");
+  return latest;
+}
+
 function setNotice(message = "", isError = false) {
   if (!message) {
     el.notice.classList.add("hidden");
@@ -2644,9 +2695,11 @@ async function handleTerminalRunState(run) {
 
     state.activeRunIds.delete(run.run_id);
     if (state.pendingRunId === run.run_id) state.pendingRunId = null;
-    if (state.activeRunIds.size === 0 && state.pollTimer) {
-      clearInterval(state.pollTimer);
-      state.pollTimer = null;
+    if (state.activeRunIds.size === 0) {
+      if (state.pollTimer) {
+        clearInterval(state.pollTimer);
+        state.pollTimer = null;
+      }
       setLoading(false);
     }
 
@@ -2710,15 +2763,28 @@ async function submitNewQuery(query, { conversationId = null, parentTaskId = nul
   if (conversationId) requestBody.conversation_id = conversationId;
   if (parentTaskId) requestBody.parent_task_id = parentTaskId;
 
-  const payload = await api("/api/query", {
-    method: "POST",
-    body: JSON.stringify(requestBody),
-  });
-
-  state.pendingRunId = payload.run_id;
-  storeRunData(payload);
-  renderMessages();
-  startRunPolling(payload.run_id);
+  setLoading(true);
+  try {
+    const payload = await streamRunApi(
+      "/api/query",
+      {
+        method: "POST",
+        body: JSON.stringify(requestBody),
+      },
+      (run) => {
+        state.pendingRunId = run.run_id;
+        state.activeRunIds.add(run.run_id);
+        storeRunData(run);
+        updateInlineActivityCard(run);
+        updateLoadingSpinnerLabel();
+        renderMessages();
+      },
+    );
+    await handleTerminalRunState(payload);
+  } catch (err) {
+    setLoading(false);
+    throw err;
+  }
 }
 
 async function submitContinue(taskId) {
@@ -2730,50 +2796,98 @@ async function submitContinue(taskId) {
   const planVersionId = iteration?.active_plan_version?.version_id || null;
   state.startingTaskIds.add(normalizedTaskId);
   if (task) task.awaiting_hitl = false;
+  setLoading(true);
   renderMessages();
   let payload;
   try {
     try {
-      payload = await api(`/api/tasks/${encodeURIComponent(normalizedTaskId)}/start`, {
-        method: "POST",
-        body: JSON.stringify({ plan_version_id: planVersionId }),
-      });
+      payload = await streamRunApi(
+        `/api/tasks/${encodeURIComponent(normalizedTaskId)}/start`,
+        {
+          method: "POST",
+          body: JSON.stringify({ plan_version_id: planVersionId }),
+        },
+        (run) => {
+          state.activeRunIds.add(run.run_id);
+          storeRunData(run);
+          updateInlineActivityCard(run);
+          updateLoadingSpinnerLabel();
+          renderMessages();
+        },
+      );
     } catch (err) {
       if (String(err?.message || "").trim() !== "Not Found") {
         throw err;
       }
-      payload = await api(`/api/tasks/${encodeURIComponent(normalizedTaskId)}/continue`, {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
+      payload = await streamRunApi(
+        `/api/tasks/${encodeURIComponent(normalizedTaskId)}/continue`,
+        {
+          method: "POST",
+          body: JSON.stringify({}),
+        },
+        (run) => {
+          state.activeRunIds.add(run.run_id);
+          storeRunData(run);
+          updateInlineActivityCard(run);
+          updateLoadingSpinnerLabel();
+          renderMessages();
+        },
+      );
     }
   } catch (err) {
     state.startingTaskIds.delete(normalizedTaskId);
+    setLoading(false);
     renderMessages();
     throw err;
   }
   storeRunData(payload);
   renderMessages();
-  startRunPolling(payload.run_id);
+  await handleTerminalRunState(payload);
 }
 
 async function submitFeedback(taskId, message) {
+  setLoading(true);
   let payload;
   try {
-    payload = await api(`/api/tasks/${encodeURIComponent(taskId)}/feedback`, {
-      method: "POST",
-      body: JSON.stringify({ message }),
-    });
+    try {
+      payload = await streamRunApi(
+        `/api/tasks/${encodeURIComponent(taskId)}/feedback`,
+        {
+          method: "POST",
+          body: JSON.stringify({ message }),
+        },
+        (run) => {
+          state.activeRunIds.add(run.run_id);
+          storeRunData(run);
+          updateInlineActivityCard(run);
+          updateLoadingSpinnerLabel();
+          renderMessages();
+        },
+      );
+    } catch (err) {
+      if (String(err?.message || "").trim() !== "Not Found") throw err;
+      payload = await streamRunApi(
+        `/api/tasks/${encodeURIComponent(taskId)}/revise`,
+        {
+          method: "POST",
+          body: JSON.stringify({ scope: message }),
+        },
+        (run) => {
+          state.activeRunIds.add(run.run_id);
+          storeRunData(run);
+          updateInlineActivityCard(run);
+          updateLoadingSpinnerLabel();
+          renderMessages();
+        },
+      );
+    }
+    storeRunData(payload);
+    renderMessages();
+    await handleTerminalRunState(payload);
   } catch (err) {
-    if (String(err?.message || "").trim() !== "Not Found") throw err;
-    payload = await api(`/api/tasks/${encodeURIComponent(taskId)}/revise`, {
-      method: "POST",
-      body: JSON.stringify({ scope: message }),
-    });
+    setLoading(false);
+    throw err;
   }
-  storeRunData(payload);
-  renderMessages();
-  startRunPolling(payload.run_id);
 }
 
 function clearDraft() {

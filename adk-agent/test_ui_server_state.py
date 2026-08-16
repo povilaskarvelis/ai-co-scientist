@@ -1,8 +1,13 @@
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import json
 import os
+import threading
 from types import SimpleNamespace
 
 import pytest
 
+from fastapi.testclient import TestClient
 from google.adk.sessions import InMemorySessionService
 
 for _env_name in ("AI_CO_SCIENTIST_POSTGRES_DSN", "POSTGRES_DSN", "DATABASE_URL"):
@@ -108,6 +113,97 @@ def test_extract_persistable_session_state_filters_transient_keys():
         STATE_PRIOR_RESEARCH: [{"objective": "Earlier"}],
         STATE_PLAN_PENDING_APPROVAL: True,
     }
+
+
+def _request_for_owner(owner_id: str, *, accept: str = ""):
+    headers = [(b"accept", accept.encode("ascii"))] if accept else []
+    request = ui_server.Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/",
+            "raw_path": b"/",
+            "query_string": b"",
+            "headers": headers,
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 80),
+        }
+    )
+    request.state.owner_id = owner_id
+    return request
+
+
+def test_signed_browser_owner_cookie_rejects_tampering():
+    owner_id = ui_server._new_owner_id()
+    signed = ui_server._sign_owner_id(owner_id)
+
+    assert ui_server._verify_owner_cookie(signed) == owner_id
+    assert ui_server._verify_owner_cookie(f"{owner_id}.invalid") is None
+    assert ui_server._verify_owner_cookie("not-a-session") is None
+
+
+def test_browser_session_middleware_sets_signed_http_only_cookie():
+    client = TestClient(ui_server.app)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    cookie_value = client.cookies.get(ui_server.SESSION_COOKIE_NAME)
+    assert ui_server._verify_owner_cookie(cookie_value or "") is not None
+    assert "HttpOnly" in response.headers["set-cookie"]
+    assert "SameSite=lax" in response.headers["set-cookie"]
+
+
+def test_query_stream_keeps_request_open_until_run_completes(tmp_path, monkeypatch):
+    test_runtime = ui_server.UiRuntime(tmp_path / "workflow_tasks.json")
+    test_runtime.ready = True
+    test_runtime.ready_error = None
+
+    async def fake_run_new_query(
+        run_id: str,
+        query: str,
+        *,
+        conversation_id: str | None = None,
+        parent_task_id: str | None = None,
+        owner_ip: str = "",
+    ) -> None:
+        await test_runtime._update_run(run_id, status="running")
+        await asyncio.sleep(0)
+        await test_runtime._update_run(run_id, status="completed", final_report="Done")
+
+    test_runtime._run_new_query = fake_run_new_query  # type: ignore[method-assign]
+    monkeypatch.setattr(ui_server, "runtime", test_runtime)
+    client = TestClient(ui_server.app)
+
+    response = client.post(
+        "/api/query",
+        headers={"Accept": "application/x-ndjson"},
+        json={"query": "Test streaming"},
+    )
+
+    assert response.status_code == 200
+    snapshots = [json.loads(line) for line in response.text.splitlines() if line.strip()]
+    assert snapshots[-1]["status"] == "completed"
+    assert snapshots[-1]["final_report"] == "Done"
+    assert "owner_id" not in snapshots[-1]
+
+    json_response = client.post("/api/query", json={"query": "Test JSON client"})
+    assert json_response.status_code == 200
+    assert json_response.json()["status"] == "completed"
+
+
+def test_json_store_does_not_transfer_existing_conversation_owner(tmp_path):
+    store = JsonTaskStore(tmp_path / "workflow_tasks.json")
+    first = ui_server._make_task("task_first", "First", "conv_shared")
+    second = ui_server._make_task("task_second", "Second", "conv_shared")
+
+    store.save_task(first, owner_ip="session_original_owner_1234567890")
+    store.save_task(second, owner_ip="session_attacker_owner_1234567890")
+
+    assert store.conversation_owned_by("conv_shared", "session_original_owner_1234567890")
+    assert not store.conversation_owned_by("conv_shared", "session_attacker_owner_1234567890")
 
 
 def test_parse_step_event_text_uses_latest_step_block():
@@ -386,6 +482,102 @@ def test_json_store_persists_runs_and_interrupts_incomplete_runs(tmp_path):
     assert any(event.get("type") == "run.interrupted" for event in restored["progress_events"])
 
 
+def test_json_store_serializes_concurrent_writes_without_losing_tasks(tmp_path):
+    state_path = tmp_path / "workflow_tasks.json"
+    store = JsonTaskStore(state_path)
+    conversation_id = "conv_concurrent"
+    task_count = 40
+
+    def save_task(index: int) -> None:
+        store.save_task(
+            ui_server._make_task(
+                f"task_{index}",
+                f"Concurrent task {index}",
+                conversation_id,
+            ),
+            owner_ip="session-owner",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(save_task, range(task_count)))
+
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert len(persisted["tasks"]) == task_count
+    assert len(persisted["conversations"][conversation_id]["task_ids"]) == task_count
+
+    restored = JsonTaskStore(state_path)
+    assert len(restored.get_conversation_tasks(conversation_id)) == task_count
+
+
+def test_json_store_atomic_save_preserves_existing_file_when_replace_fails(tmp_path, monkeypatch):
+    state_path = tmp_path / "workflow_tasks.json"
+    store = JsonTaskStore(state_path)
+    store.save_task(ui_server._make_task("task_original", "Original", "conv_atomic"))
+    original_contents = state_path.read_text(encoding="utf-8")
+
+    def fail_replace(source, destination) -> None:
+        raise OSError("simulated atomic replacement failure")
+
+    monkeypatch.setattr("state_store.os.replace", fail_replace)
+
+    with pytest.raises(OSError, match="simulated atomic replacement failure"):
+        store.save_task(ui_server._make_task("task_new", "New", "conv_atomic"))
+
+    assert state_path.read_text(encoding="utf-8") == original_contents
+    assert not list(tmp_path.glob(f".{state_path.name}.*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_export_report_pdf_runs_renderer_off_the_request_loop(runtime, monkeypatch):
+    owner_id = ui_server._new_owner_id()
+    task = ui_server._make_task("task_pdf", "PDF report", "conv_pdf")
+    task["report_markdown"] = "# Completed report"
+    runtime.store.save_task(task, owner_ip=owner_id)
+    monkeypatch.setattr(ui_server, "runtime", runtime)
+    request_thread_id = threading.get_ident()
+    renderer_thread_ids: list[int] = []
+
+    def fake_write_pdf(markdown, output_path, *, title):
+        renderer_thread_ids.append(threading.get_ident())
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"%PDF-1.4\ncomplete\n%%EOF\n")
+        return None
+
+    monkeypatch.setattr(ui_server, "write_markdown_pdf", fake_write_pdf)
+
+    response = await ui_server.export_report_pdf(
+        task["task_id"],
+        _request_for_owner(owner_id),
+    )
+
+    assert response.media_type == "application/pdf"
+    assert renderer_thread_ids
+    assert renderer_thread_ids[0] != request_thread_id
+
+
+@pytest.mark.asyncio
+async def test_export_report_pdf_does_not_expose_renderer_details(runtime, monkeypatch):
+    owner_id = ui_server._new_owner_id()
+    task = ui_server._make_task("task_pdf_error", "PDF report", "conv_pdf_error")
+    task["report_markdown"] = "# Completed report"
+    runtime.store.save_task(task, owner_ip=owner_id)
+    monkeypatch.setattr(ui_server, "runtime", runtime)
+    monkeypatch.setattr(
+        ui_server,
+        "write_markdown_pdf",
+        lambda *args, **kwargs: "private renderer path: /tmp/sensitive",
+    )
+
+    with pytest.raises(ui_server.HTTPException) as exc_info:
+        await ui_server.export_report_pdf(
+            task["task_id"],
+            _request_for_owner(owner_id),
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "PDF export failed. Please try again."
+
+
 @pytest.mark.asyncio
 async def test_run_new_query_marks_terminal_rate_limit_response_as_failed(runtime):
     rate_limit_text = (
@@ -456,6 +648,104 @@ async def test_run_start_task_stops_immediately_on_terminal_rate_limit(runtime):
     assert stored_task is not None
     assert stored_task["status"] == "failed"
     assert stored_task["report_markdown"] == rate_limit_text
+
+
+@pytest.mark.asyncio
+async def test_run_start_task_marks_loop_exhaustion_failed(runtime):
+    calls = 0
+
+    async def fake_turn(conversation_id: str, prompt: str, *, run_id: str):
+        nonlocal calls
+        calls += 1
+        return "Still working", "research_workflow"
+
+    async def fake_read_state(conversation_id: str):
+        return {"plan_status": "ready", "steps": []}
+
+    async def fake_plan_pending(conversation_id: str) -> bool:
+        return False
+
+    runtime._run_workflow_turn_filtered = fake_turn  # type: ignore[method-assign]
+    runtime._read_workflow_state = fake_read_state  # type: ignore[method-assign]
+    runtime._is_plan_pending_approval = fake_plan_pending  # type: ignore[method-assign]
+
+    task = ui_server._make_task("task_loop_exhausted", "Assess evidence", "conv_loop")
+    task["awaiting_hitl"] = True
+    runtime.store.save_task(task)
+
+    run = await runtime._create_run("start_task", task_id=task["task_id"])
+    await runtime._run_start_task(run.run_id, task["task_id"])
+
+    payload = await runtime.get_run(run.run_id)
+    stored_task = runtime.store.get_task(task["task_id"])
+    assert calls == 100
+    assert payload is not None
+    assert payload["status"] == "failed"
+    assert "did not reach a terminal state" in payload["error"]
+    assert stored_task is not None
+    assert stored_task["status"] == "failed"
+    assert stored_task["awaiting_hitl"] is False
+
+
+@pytest.mark.asyncio
+async def test_stream_run_keeps_updates_public_and_waits_for_completion(runtime):
+    owner_id = ui_server._new_owner_id()
+    run = await runtime._create_run("new_query", query="Test", owner_id=owner_id)
+
+    async def finish_run():
+        await runtime._update_run(run.run_id, status="running")
+        await asyncio.sleep(0)
+        await runtime._update_run(run.run_id, status="completed", final_report="Done")
+
+    job = asyncio.create_task(finish_run())
+    runtime._track_background_task(run.run_id, job)
+    snapshots = [json.loads(chunk) async for chunk in runtime.stream_run(run.run_id) if chunk.strip()]
+
+    assert snapshots
+    assert snapshots[-1]["status"] == "completed"
+    assert snapshots[-1]["final_report"] == "Done"
+    assert all("owner_id" not in snapshot for snapshot in snapshots)
+
+
+@pytest.mark.asyncio
+async def test_run_polling_requires_matching_browser_owner(runtime, monkeypatch):
+    owner_id = ui_server._new_owner_id()
+    run = await runtime._create_run("new_query", query="Test", owner_id=owner_id)
+    monkeypatch.setattr(ui_server, "runtime", runtime)
+
+    allowed = await ui_server._check_run_ownership(
+        run.run_id,
+        _request_for_owner(owner_id),
+    )
+    assert allowed["run_id"] == run.run_id
+
+    with pytest.raises(ui_server.HTTPException) as exc_info:
+        await ui_server._check_run_ownership(
+            run.run_id,
+            _request_for_owner(ui_server._new_owner_id()),
+        )
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_start_query_rejects_foreign_conversation_before_starting(runtime, monkeypatch):
+    owner_id = ui_server._new_owner_id()
+    foreign_owner_id = ui_server._new_owner_id()
+    task = ui_server._make_task("task_owned", "Owned question", "conv_owned")
+    runtime.store.save_task(task, owner_ip=owner_id)
+    monkeypatch.setattr(ui_server, "runtime", runtime)
+
+    with pytest.raises(ui_server.HTTPException) as exc_info:
+        await ui_server.start_query(
+            ui_server.QueryRequest(
+                query="Attempted branch",
+                conversation_id="conv_owned",
+            ),
+            _request_for_owner(foreign_owner_id),
+        )
+
+    assert exc_info.value.status_code == 404
+    assert runtime.runs == {}
 
 
 @pytest.mark.asyncio

@@ -46,6 +46,7 @@ CHROME_CANDIDATES = (
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
 )
+CHROME_RENDER_TIMEOUT_SECONDS = 5
 
 HIGH_FIDELITY_CSS = """
 @page {
@@ -70,6 +71,11 @@ article.report {
   max-width: 100%;
 }
 
+p, li, blockquote, th, td, h1, h2, h3 {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 /* ── Title / H1 ── */
 h1 {
   font-size: 26pt;
@@ -81,6 +87,7 @@ h1 {
   margin-bottom: 0.6em;
   line-height: 1.2;
   letter-spacing: -0.01em;
+  break-after: avoid-page;
 }
 
 /* ── Section headings ── */
@@ -93,6 +100,7 @@ h2 {
   padding-bottom: 0.2em;
   border-bottom: 1.5px solid #cccccc;
   line-height: 1.25;
+  break-after: avoid-page;
 }
 h3 {
   font-size: 11.5pt;
@@ -100,6 +108,7 @@ h3 {
   color: #333333;
   margin-top: 1.1em;
   margin-bottom: 0.3em;
+  break-after: avoid-page;
 }
 
 /* ── Research question callout block ── */
@@ -152,7 +161,9 @@ pre {
   border: 1px solid #dddddd;
   border-radius: 8px;
   font-size: 9pt;
-  overflow: auto;
+  overflow: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 code {
   font-family: "SFMono-Regular", Menlo, Consolas, monospace;
@@ -171,9 +182,13 @@ pre code {
 /* ── Tables ── */
 table {
   width: 100%;
+  table-layout: fixed;
   border-collapse: collapse;
   margin: 1em 0;
   font-size: 9.5pt;
+}
+thead {
+  display: table-header-group;
 }
 th {
   background: #f0f0f0;
@@ -216,6 +231,17 @@ a {
   word-break: break-all;
 }
 """
+
+
+_RAW_HTML_TAG_RE = re.compile(
+    r"<!--.*?-->|<![A-Za-z][^>]*>|</?[A-Za-z][^>]*>",
+    flags=re.DOTALL,
+)
+_ESCAPED_REFERENCE_ANCHOR_RE = re.compile(
+    r'&lt;a\s+id=(["\'])ref-(\d+)\1\s*&gt;\s*&lt;/a&gt;',
+    flags=re.IGNORECASE,
+)
+_RENDERED_IMAGE_RE = re.compile(r"<img\b[^>]*>", flags=re.IGNORECASE)
 
 
 def _normalize_list_markers(text: str) -> str:
@@ -302,6 +328,20 @@ def _heading_level(line: str) -> int:
 
 def _escape_attr(text: str) -> str:
     return escape(text, {'"': "&quot;"})
+
+
+def _sanitize_markdown_html(text: str) -> str:
+    """
+    Neutralize raw HTML while preserving generated reference anchors.
+
+    Reports are model-produced Markdown, so allowing arbitrary HTML would let
+    scripts or resource-loading tags run inside the headless browser.
+    """
+    escaped_html = _RAW_HTML_TAG_RE.sub(lambda match: escape(match.group(0)), text or "")
+    return _ESCAPED_REFERENCE_ANCHOR_RE.sub(
+        lambda match: f'<a id="ref-{match.group(2)}"></a>',
+        escaped_html,
+    )
 
 
 def _format_inline_markdown(text: str) -> str:
@@ -424,8 +464,8 @@ def _find_chrome_binary() -> str | None:
 
 
 def _build_html_document(markdown_text: str, *, title: str) -> str:
-    safe_title = escape(title or "AI Co-Scientist Report")
-    normalized_markdown = _prepare_markdown_for_pdf(markdown_text)
+    safe_title = escape(str(title or "AI Co-Scientist Report"))
+    normalized_markdown = _sanitize_markdown_html(_prepare_markdown_for_pdf(markdown_text))
     if MARKDOWN_AVAILABLE:
         body_html = markdown_lib.markdown(
             normalized_markdown,
@@ -439,6 +479,7 @@ def _build_html_document(markdown_text: str, *, title: str) -> str:
         )
     else:
         body_html = f"<pre>{escape(normalized_markdown)}</pre>"
+    body_html = _RENDERED_IMAGE_RE.sub('<span class="omitted-image">[Image omitted]</span>', body_html)
     return (
         "<!DOCTYPE html>\n"
         "<html lang=\"en\">\n"
@@ -446,6 +487,10 @@ def _build_html_document(markdown_text: str, *, title: str) -> str:
         "  <meta charset=\"utf-8\" />\n"
         "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n"
         "  <meta name=\"color-scheme\" content=\"light\" />\n"
+        "  <meta http-equiv=\"Content-Security-Policy\" "
+        "content=\"default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; "
+        "font-src 'none'; script-src 'none'; connect-src 'none'; object-src 'none'; "
+        "frame-src 'none'; base-uri 'none'; form-action 'none'\" />\n"
         f"  <title>{safe_title}</title>\n"
         f"  <style>{HIGH_FIDELITY_CSS}</style>\n"
         "</head>\n"
@@ -477,7 +522,16 @@ def _write_markdown_pdf_chrome(markdown: str, output_path: Path, *, title: str) 
                 "--headless=new",
                 "--disable-gpu",
                 "--no-sandbox",
-                "--allow-file-access-from-files",
+                "--disable-background-networking",
+                "--disable-component-update",
+                "--disable-default-apps",
+                "--disable-dev-shm-usage",
+                "--disable-extensions",
+                "--disable-sync",
+                "--metrics-recording-only",
+                "--no-default-browser-check",
+                "--no-first-run",
+                f"--user-data-dir={str(Path(tmpdir) / 'chrome-profile-new')}",
                 "--no-pdf-header-footer",
                 "--print-to-pdf-no-header",
                 f"--print-to-pdf={str(output_path)}",
@@ -488,7 +542,16 @@ def _write_markdown_pdf_chrome(markdown: str, output_path: Path, *, title: str) 
                 "--headless",
                 "--disable-gpu",
                 "--no-sandbox",
-                "--allow-file-access-from-files",
+                "--disable-background-networking",
+                "--disable-component-update",
+                "--disable-default-apps",
+                "--disable-dev-shm-usage",
+                "--disable-extensions",
+                "--disable-sync",
+                "--metrics-recording-only",
+                "--no-default-browser-check",
+                "--no-first-run",
+                f"--user-data-dir={str(Path(tmpdir) / 'chrome-profile-legacy')}",
                 "--no-pdf-header-footer",
                 "--print-to-pdf-no-header",
                 f"--print-to-pdf={str(output_path)}",
@@ -504,8 +567,16 @@ def _write_markdown_pdf_chrome(markdown: str, output_path: Path, *, title: str) 
                     check=False,
                     capture_output=True,
                     text=True,
-                    timeout=60,
+                    timeout=CHROME_RENDER_TIMEOUT_SECONDS,
                 )
+            except subprocess.TimeoutExpired:
+                if _validate_pdf_file(output_path) is None:
+                    return None
+                last_error = (
+                    "rendering timed out after "
+                    f"{CHROME_RENDER_TIMEOUT_SECONDS} seconds"
+                )
+                break
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 continue
@@ -689,6 +760,7 @@ def _styles() -> dict[str, ParagraphStyle]:
             leading=14,
             spaceAfter=4,
             textColor=colors.HexColor("#1a1a1a"),
+            wordWrap="CJK",
         ),
         "list_body": ParagraphStyle(
             "report_list_body",
@@ -698,6 +770,47 @@ def _styles() -> dict[str, ParagraphStyle]:
             leading=14,
             spaceAfter=0,
             textColor=colors.HexColor("#1a1a1a"),
+            wordWrap="CJK",
+        ),
+        "table_body": ParagraphStyle(
+            "report_table_body",
+            parent=sample["BodyText"],
+            fontName="Helvetica",
+            fontSize=9,
+            leading=11.5,
+            spaceAfter=0,
+            textColor=colors.HexColor("#1a1a1a"),
+            wordWrap="CJK",
+        ),
+        "table_body_compact": ParagraphStyle(
+            "report_table_body_compact",
+            parent=sample["BodyText"],
+            fontName="Helvetica",
+            fontSize=8.25,
+            leading=10.5,
+            spaceAfter=0,
+            textColor=colors.HexColor("#1a1a1a"),
+            wordWrap="CJK",
+        ),
+        "table_header": ParagraphStyle(
+            "report_table_header",
+            parent=sample["BodyText"],
+            fontName="Helvetica-Bold",
+            fontSize=9,
+            leading=11.5,
+            spaceAfter=0,
+            textColor=colors.HexColor("#111111"),
+            wordWrap="CJK",
+        ),
+        "table_header_compact": ParagraphStyle(
+            "report_table_header_compact",
+            parent=sample["BodyText"],
+            fontName="Helvetica-Bold",
+            fontSize=8.25,
+            leading=10.5,
+            spaceAfter=0,
+            textColor=colors.HexColor("#111111"),
+            wordWrap="CJK",
         ),
         "h1": ParagraphStyle(
             "report_h1",
@@ -707,6 +820,7 @@ def _styles() -> dict[str, ParagraphStyle]:
             leading=22,
             spaceAfter=10,
             textColor=colors.HexColor("#111111"),
+            wordWrap="CJK",
         ),
         "h2": ParagraphStyle(
             "report_h2",
@@ -716,6 +830,7 @@ def _styles() -> dict[str, ParagraphStyle]:
             leading=18,
             spaceAfter=8,
             textColor=colors.HexColor("#222222"),
+            wordWrap="CJK",
         ),
         "h3": ParagraphStyle(
             "report_h3",
@@ -725,6 +840,7 @@ def _styles() -> dict[str, ParagraphStyle]:
             leading=16,
             spaceAfter=6,
             textColor=colors.HexColor("#333333"),
+            wordWrap="CJK",
         ),
         "code": ParagraphStyle(
             "report_code",
@@ -737,6 +853,7 @@ def _styles() -> dict[str, ParagraphStyle]:
             spaceAfter=6,
             textColor=colors.HexColor("#1a1a1a"),
             backColor=colors.HexColor("#f5f5f5"),
+            wordWrap="CJK",
         ),
         "quote": ParagraphStyle(
             "report_quote",
@@ -750,6 +867,7 @@ def _styles() -> dict[str, ParagraphStyle]:
             backColor=colors.HexColor("#f5f5f5"),
             borderPadding=6,
             spaceAfter=6,
+            wordWrap="CJK",
         ),
     }
 
@@ -870,6 +988,33 @@ def _add_blockquote(lines: list[str], start_idx: int, story: list, styles: dict[
     return idx
 
 
+def _table_column_widths(rows: list[list[str]], available_width: float) -> list[float]:
+    max_cols = max((len(row) for row in rows), default=0)
+    if max_cols <= 0:
+        return []
+
+    minimum_width = 38 if max_cols >= 7 else 48
+    base_width = min(minimum_width, available_width / max_cols)
+    remaining_width = max(0.0, available_width - (base_width * max_cols))
+    weights: list[int] = []
+    for column_index in range(max_cols):
+        longest_cell = max(
+            (
+                len(re.sub(r"[*_\x60]", "", row[column_index]))
+                for row in rows
+                if column_index < len(row)
+            ),
+            default=1,
+        )
+        weights.append(max(1, min(longest_cell, 28)))
+
+    total_weight = sum(weights)
+    return [
+        base_width + (remaining_width * weight / total_weight)
+        for weight in weights
+    ]
+
+
 def _add_table(lines: list[str], start_idx: int, story: list, styles: dict[str, ParagraphStyle]) -> int:
     header = _split_markdown_table_row(lines[start_idx])
     idx = start_idx + 2  # Skip divider row.
@@ -887,12 +1032,26 @@ def _add_table(lines: list[str], start_idx: int, story: list, styles: dict[str, 
     rows = [header] + body_rows
     max_cols = max((len(row) for row in rows), default=0)
     normalized_rows = [row + [""] * (max_cols - len(row)) for row in rows]
-    table_data = [
-        [Paragraph(_format_inline_markdown(cell), styles["body"]) for cell in row]
-        for row in normalized_rows
-    ]
+    compact = max_cols >= 7
+    body_style = styles["table_body_compact" if compact else "table_body"]
+    header_style = styles["table_header_compact" if compact else "table_header"]
+    table_data = []
+    for row_index, row in enumerate(normalized_rows):
+        cell_style = header_style if row_index == 0 else body_style
+        table_data.append(
+            [Paragraph(_format_inline_markdown(cell), cell_style) for cell in row]
+        )
 
-    table = Table(table_data, hAlign="LEFT", repeatRows=1)
+    available_width = LETTER[0] - 108
+    column_widths = _table_column_widths(normalized_rows, available_width)
+    table = Table(
+        table_data,
+        colWidths=column_widths,
+        hAlign="LEFT",
+        repeatRows=1,
+        splitByRow=1,
+        splitInRow=1,
+    )
     table.setStyle(
         TableStyle(
             [
@@ -1010,6 +1169,51 @@ def _write_markdown_pdf_legacy(markdown: str, output_path: Path, *, title: str =
     return None
 
 
+def _validate_pdf_file(path: Path) -> str | None:
+    """Return an error when a renderer did not produce a complete PDF file."""
+    try:
+        if not path.is_file():
+            return "renderer did not create an output file"
+        file_size = path.stat().st_size
+        if file_size < 14:
+            return "renderer produced an empty or truncated file"
+        with path.open("rb") as pdf_file:
+            header = pdf_file.read(8)
+            if not header.startswith(b"%PDF-"):
+                return "output does not have a PDF header"
+            pdf_file.seek(max(0, file_size - 4096))
+            trailer = pdf_file.read()
+        if not trailer.rstrip().endswith(b"%%EOF"):
+            return "output does not have a complete PDF trailer"
+    except OSError as exc:
+        return f"could not inspect renderer output ({type(exc).__name__}: {exc})"
+    return None
+
+
+def _render_pdf_candidate(
+    renderer,
+    markdown: str,
+    candidate_path: Path,
+    *,
+    title: str,
+    backend_name: str,
+) -> str | None:
+    candidate_path.unlink(missing_ok=True)
+    try:
+        error = renderer(markdown, candidate_path, title=title)
+    except Exception as exc:  # noqa: BLE001
+        error = f"{backend_name} renderer raised {type(exc).__name__}: {exc}"
+    if error:
+        candidate_path.unlink(missing_ok=True)
+        return error
+
+    validation_error = _validate_pdf_file(candidate_path)
+    if validation_error:
+        candidate_path.unlink(missing_ok=True)
+        return f"{backend_name} renderer produced an invalid PDF: {validation_error}."
+    return None
+
+
 def write_markdown_pdf(markdown: str, output_path: Path, *, title: str = "AI Co-Scientist Report") -> str | None:
     """
     Export markdown text to PDF.
@@ -1018,14 +1222,47 @@ def write_markdown_pdf(markdown: str, output_path: Path, *, title: str = "AI Co-
     1) High-fidelity HTML/CSS via headless Chrome/Chromium
     2) Legacy ReportLab fallback
     """
-    normalized = (markdown or "").strip()
+    normalized = str(markdown or "").strip()
+    safe_title = str(title or "AI Co-Scientist Report")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    high_fidelity_error = _write_markdown_pdf_chrome(normalized, output_path, title=title)
-    if high_fidelity_error is None:
-        return None
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=output_path.parent,
+        prefix=f".{output_path.name}.",
+        suffix=".tmp.pdf",
+    )
+    os.close(descriptor)
+    candidate_path = Path(temporary_name)
+    try:
+        high_fidelity_error = _render_pdf_candidate(
+            _write_markdown_pdf_chrome,
+            normalized,
+            candidate_path,
+            title=safe_title,
+            backend_name="Chromium",
+        )
+        if high_fidelity_error is None:
+            try:
+                os.replace(candidate_path, output_path)
+            except OSError as exc:
+                return f"PDF export failed while publishing the generated file ({type(exc).__name__}: {exc})"
+            return None
 
-    legacy_error = _write_markdown_pdf_legacy(normalized, output_path, title=title)
-    if legacy_error is None:
-        return None
+        legacy_error = _render_pdf_candidate(
+            _write_markdown_pdf_legacy,
+            normalized,
+            candidate_path,
+            title=safe_title,
+            backend_name="ReportLab",
+        )
+        if legacy_error is None:
+            try:
+                os.replace(candidate_path, output_path)
+            except OSError as exc:
+                return f"PDF export failed while publishing the generated file ({type(exc).__name__}: {exc})"
+            return None
 
-    return f"{high_fidelity_error} Fallback renderer error: {legacy_error}"
+        return f"{high_fidelity_error} Fallback renderer error: {legacy_error}"
+    finally:
+        candidate_path.unlink(missing_ok=True)

@@ -7,15 +7,20 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
+import hmac
+import json
 import logging
 import os
 from pathlib import Path
 import re
+import secrets
 import threading
 import time
 import traceback
@@ -23,7 +28,7 @@ import uuid
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from google.adk import Runner
 from google.adk.sessions import InMemorySessionService
@@ -58,6 +63,70 @@ MAX_CONCURRENT_TURNS = int(os.environ.get("ADK_MAX_CONCURRENT_TURNS", "6"))
 _global_turn_semaphore = threading.Semaphore(MAX_CONCURRENT_TURNS)
 GA4_MEASUREMENT_ID = os.environ.get("GA4_MEASUREMENT_ID", "").strip()
 _GA4_ID_PATTERN = re.compile(r"^G-[A-Z0-9]+$")
+SESSION_COOKIE_NAME = "co_scientist_session"
+SESSION_COOKIE_MAX_AGE = 60 * 60 * 24 * 30
+_configured_session_secret = os.environ.get("AI_CO_SCIENTIST_SESSION_SECRET", "").strip()
+_SESSION_SIGNING_KEY = (
+    _configured_session_secret.encode("utf-8")
+    if _configured_session_secret
+    else secrets.token_bytes(32)
+)
+
+
+def _sign_owner_id(owner_id: str) -> str:
+    signature = hmac.new(
+        _SESSION_SIGNING_KEY,
+        owner_id.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+    return f"{owner_id}.{encoded_signature}"
+
+
+def _verify_owner_cookie(value: str) -> str | None:
+    token = str(value or "").strip()
+    if not token or "." not in token:
+        return None
+    owner_id, supplied_signature = token.rsplit(".", 1)
+    if not re.fullmatch(r"session_[A-Za-z0-9_-]{24,80}", owner_id):
+        return None
+    expected = _sign_owner_id(owner_id).rsplit(".", 1)[1]
+    if not hmac.compare_digest(supplied_signature, expected):
+        return None
+    return owner_id
+
+
+def _new_owner_id() -> str:
+    return f"session_{secrets.token_urlsafe(24)}"
+
+
+def _configure_session_signing_key(state_dir: Path) -> None:
+    """Keep browser ownership stable for as long as the local MVP state exists."""
+    global _SESSION_SIGNING_KEY
+    if _configured_session_secret:
+        return
+    secret_path = state_dir / ".session_secret"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        secret = secret_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        secret = secrets.token_urlsafe(48)
+        try:
+            with secret_path.open("x", encoding="utf-8") as handle:
+                handle.write(f"{secret}\n")
+            secret_path.chmod(0o600)
+        except FileExistsError:
+            secret = secret_path.read_text(encoding="utf-8").strip()
+    if len(secret) < 32:
+        raise RuntimeError("Local browser session secret is invalid.")
+    _SESSION_SIGNING_KEY = secret.encode("utf-8")
+
+
+def _request_owner_id(request: Request) -> str:
+    owner_id = str(getattr(request.state, "owner_id", "") or "").strip()
+    if not owner_id:
+        raise HTTPException(status_code=400, detail="Browser session is unavailable.")
+    return owner_id
 
 
 class RateLimiter:
@@ -340,6 +409,7 @@ class ConversationSession:
 class RunRecord:
     run_id: str
     kind: str
+    owner_id: str = ""
     status: str = "queued"
     task_id: str | None = None
     query: str = ""
@@ -358,6 +428,7 @@ class RunRecord:
         return {
             "run_id": self.run_id,
             "kind": self.kind,
+            "owner_id": self.owner_id,
             "status": self.status,
             "task_id": self.task_id,
             "query": self.query,
@@ -596,6 +667,7 @@ class UiRuntime:
         self.runs_lock = asyncio.Lock()
         self.runs: dict[str, RunRecord] = {}
         self.background_tasks: set[asyncio.Task] = set()
+        self.run_tasks: dict[str, asyncio.Task] = {}
         self._thread_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TURNS + 4, thread_name_prefix="wf")
 
     async def startup(self) -> None:
@@ -1144,10 +1216,18 @@ class UiRuntime:
 
     # -- Run management -------------------------------------------------------
 
-    async def _create_run(self, kind: str, *, query: str = "", task_id: str | None = None) -> RunRecord:
+    async def _create_run(
+        self,
+        kind: str,
+        *,
+        query: str = "",
+        task_id: str | None = None,
+        owner_id: str = "",
+    ) -> RunRecord:
         run = RunRecord(
             run_id=f"run_{uuid.uuid4().hex[:10]}",
             kind=kind,
+            owner_id=owner_id,
             query=query,
             title=_generate_chat_title(query) if query.strip() else "",
             task_id=task_id,
@@ -1214,9 +1294,58 @@ class UiRuntime:
             self.store.save_run(run_payload)
         logger.info("[ui:%s] %s", run_id, event["human_line"])
 
-    def _track_background_task(self, task: asyncio.Task) -> None:
+    def _track_background_task(self, run_id: str, task: asyncio.Task) -> None:
         self.background_tasks.add(task)
-        task.add_done_callback(lambda done: self.background_tasks.discard(done))
+        self.run_tasks[run_id] = task
+
+        def _discard(done: asyncio.Task) -> None:
+            self.background_tasks.discard(done)
+            if self.run_tasks.get(run_id) is done:
+                self.run_tasks.pop(run_id, None)
+
+        task.add_done_callback(_discard)
+
+    async def wait_for_run(self, run_id: str) -> dict | None:
+        task = self.run_tasks.get(run_id)
+        if task is not None:
+            await asyncio.gather(asyncio.shield(task), return_exceptions=True)
+        return await self.get_run(run_id)
+
+    async def stream_run(self, run_id: str):
+        """Yield run snapshots while keeping the initiating HTTP request active."""
+        last_snapshot = ""
+        last_write = time.monotonic()
+        while True:
+            payload = await self.get_run(run_id)
+            if payload is None:
+                return
+            public_payload = dict(payload)
+            public_payload.pop("owner_id", None)
+            snapshot = json.dumps(public_payload, ensure_ascii=False, separators=(",", ":"))
+            if snapshot != last_snapshot:
+                yield f"{snapshot}\n"
+                last_snapshot = snapshot
+                last_write = time.monotonic()
+
+            task = self.run_tasks.get(run_id)
+            if task is None or task.done():
+                final_payload = await self.wait_for_run(run_id)
+                if final_payload is not None:
+                    final_payload = dict(final_payload)
+                    final_payload.pop("owner_id", None)
+                    final_snapshot = json.dumps(
+                        final_payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    if final_snapshot != last_snapshot:
+                        yield f"{final_snapshot}\n"
+                return
+
+            if time.monotonic() - last_write >= 5:
+                yield "\n"
+                last_write = time.monotonic()
+            await asyncio.sleep(0.25)
 
     # -- Execution flows -------------------------------------------------------
 
@@ -1228,7 +1357,7 @@ class UiRuntime:
         parent_task_id: str | None = None,
         owner_ip: str = "",
     ) -> RunRecord:
-        run = await self._create_run("new_query", query=query)
+        run = await self._create_run("new_query", query=query, owner_id=owner_ip)
         job = asyncio.create_task(
             self._run_new_query(
                 run.run_id,
@@ -1238,19 +1367,24 @@ class UiRuntime:
                 owner_ip=owner_ip,
             )
         )
-        self._track_background_task(job)
+        self._track_background_task(run.run_id, job)
         return run
 
-    async def start_task(self, task_id: str) -> RunRecord:
-        run = await self._create_run("start_task", task_id=task_id)
+    async def start_task(self, task_id: str, *, owner_id: str = "") -> RunRecord:
+        run = await self._create_run("start_task", task_id=task_id, owner_id=owner_id)
         job = asyncio.create_task(self._run_start_task(run.run_id, task_id))
-        self._track_background_task(job)
+        self._track_background_task(run.run_id, job)
         return run
 
-    async def feedback_task(self, task_id: str, message: str) -> RunRecord:
-        run = await self._create_run("feedback_task", task_id=task_id, query=message)
+    async def feedback_task(self, task_id: str, message: str, *, owner_id: str = "") -> RunRecord:
+        run = await self._create_run(
+            "feedback_task",
+            task_id=task_id,
+            query=message,
+            owner_id=owner_id,
+        )
         job = asyncio.create_task(self._run_feedback_task(run.run_id, task_id, message))
-        self._track_background_task(job)
+        self._track_background_task(run.run_id, job)
         return run
 
     async def _run_new_query(
@@ -1606,6 +1740,28 @@ class UiRuntime:
                     follow_up_suggestions=task["follow_up_suggestions"],
                 )
                 break
+            else:
+                run_error = (
+                    "Execution stopped because the workflow did not reach a terminal state "
+                    f"after {max_continue_loops} continuation attempts."
+                )
+                task["status"] = "failed"
+                task["awaiting_hitl"] = False
+                await self._save_task_with_progress(task, run_id)
+                await self._append_progress_event(
+                    run_id,
+                    phase="execute",
+                    event_type="run.failed",
+                    status="error",
+                    human_line=run_error,
+                    task_id=task_id,
+                )
+                await self._update_run(
+                    run_id,
+                    status="failed",
+                    task_id=task_id,
+                    error=run_error,
+                )
 
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -1941,6 +2097,31 @@ app = FastAPI(title="AI Co-Scientist UI", version="0.2.0")
 app.mount("/static", StaticFiles(directory=str(UI_DIR)), name="static")
 
 
+@app.middleware("http")
+async def _browser_session_middleware(request: Request, call_next):
+    cookie_value = request.cookies.get(SESSION_COOKIE_NAME, "")
+    owner_id = _verify_owner_cookie(cookie_value)
+    should_set_cookie = owner_id is None
+    if owner_id is None:
+        owner_id = _new_owner_id()
+    request.state.owner_id = owner_id
+
+    response = await call_next(request)
+    if should_set_cookie:
+        forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+        is_secure = forwarded_proto == "https" or request.url.scheme == "https"
+        response.set_cookie(
+            SESSION_COOKIE_NAME,
+            _sign_owner_id(owner_id),
+            max_age=SESSION_COOKIE_MAX_AGE,
+            httponly=True,
+            secure=is_secure,
+            samesite="lax",
+            path="/",
+        )
+    return response
+
+
 def _ga4_head_snippet() -> str:
     if not GA4_MEASUREMENT_ID:
         return ""
@@ -1982,6 +2163,8 @@ def _render_ui_page(filename: str) -> HTMLResponse:
 
 @app.on_event("startup")
 async def _startup() -> None:
+    if not _configured_session_secret:
+        _configure_session_signing_key(STATE_PATH.parent)
     await runtime.startup()
     if runtime.ready:
         _port = int(os.environ.get("CO_SCI_UI_PORT", "8080"))
@@ -2027,8 +2210,8 @@ async def rate_limit_status(request: Request) -> dict:
 
 @app.get("/api/tasks")
 async def list_tasks(request: Request) -> dict:
-    ip = _client_ip(request)
-    convs = runtime.list_conversations(owner_ip=ip)
+    owner_id = _request_owner_id(request)
+    convs = runtime.list_conversations(owner_ip=owner_id)
     all_tasks = []
     for c in convs:
         tasks = runtime.store.get_conversation_tasks(c["conversation_id"])
@@ -2039,14 +2222,14 @@ async def list_tasks(request: Request) -> dict:
 
 @app.get("/api/conversations")
 async def list_conversations(request: Request) -> dict:
-    ip = _client_ip(request)
-    return {"conversations": runtime.list_conversations(owner_ip=ip)}
+    owner_id = _request_owner_id(request)
+    return {"conversations": runtime.list_conversations(owner_ip=owner_id)}
 
 
 @app.get("/api/conversations/{conversation_id}")
 async def conversation_detail(conversation_id: str, request: Request) -> dict:
-    ip = _client_ip(request)
-    if not runtime.store.conversation_owned_by(conversation_id, ip):
+    owner_id = _request_owner_id(request)
+    if not runtime.store.conversation_owned_by(conversation_id, owner_id):
         raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
     detail = await runtime.get_conversation_detail(conversation_id)
     if not detail:
@@ -2059,9 +2242,9 @@ async def task_detail(task_id: str, request: Request) -> dict:
     task = runtime.store.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
-    ip = _client_ip(request)
+    owner_id = _request_owner_id(request)
     conv_id = task.get("conversation_id", "")
-    if conv_id and not runtime.store.conversation_owned_by(conv_id, ip):
+    if conv_id and not runtime.store.conversation_owned_by(conv_id, owner_id):
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
     detail = await runtime.get_task_detail(task_id)
     if not detail:
@@ -2088,18 +2271,38 @@ async def task_evidence_graph(task_id: str, request: Request) -> dict:
 
 
 @app.post("/api/query")
-async def start_query(payload: QueryRequest, request: Request) -> dict:
+async def start_query(payload: QueryRequest, request: Request):
     if not runtime.ready:
         raise HTTPException(status_code=503, detail=runtime.ready_error or "Runtime not ready.")
     _enforce_rate_limit(request)
-    ip = _client_ip(request)
+    owner_id = _request_owner_id(request)
+    conversation_id = payload.conversation_id.strip() if payload.conversation_id else None
+    parent_task_id = payload.parent_task_id.strip() if payload.parent_task_id else None
+
+    if conversation_id and not runtime.store.conversation_owned_by(conversation_id, owner_id):
+        raise HTTPException(status_code=404, detail=f"Conversation {conversation_id} not found.")
+    if parent_task_id:
+        parent_task = runtime.store.get_task(parent_task_id)
+        parent_conversation_id = str((parent_task or {}).get("conversation_id", "") or "").strip()
+        if (
+            not parent_task
+            or not parent_conversation_id
+            or not runtime.store.conversation_owned_by(parent_conversation_id, owner_id)
+        ):
+            raise HTTPException(status_code=404, detail=f"Task {parent_task_id} not found.")
+        if conversation_id and parent_conversation_id != conversation_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Parent task does not belong to the selected conversation.",
+            )
+
     run = await runtime.start_new_query(
         payload.query.strip(),
-        conversation_id=payload.conversation_id.strip() if payload.conversation_id else None,
-        parent_task_id=payload.parent_task_id.strip() if payload.parent_task_id else None,
-        owner_ip=ip,
+        conversation_id=conversation_id,
+        parent_task_id=parent_task_id,
+        owner_ip=owner_id,
     )
-    return run.to_dict()
+    return await _run_response(run.run_id, request)
 
 
 def _check_task_ownership(task_id: str, request: Request) -> dict:
@@ -2108,10 +2311,47 @@ def _check_task_ownership(task_id: str, request: Request) -> dict:
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
     conv_id = task.get("conversation_id", "")
-    ip = _client_ip(request)
-    if conv_id and not runtime.store.conversation_owned_by(conv_id, ip):
+    owner_id = _request_owner_id(request)
+    if conv_id and not runtime.store.conversation_owned_by(conv_id, owner_id):
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
     return task
+
+
+async def _check_run_ownership(run_id: str, request: Request) -> dict:
+    payload = await runtime.get_run(run_id)
+    if not payload:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found.")
+    owner_id = _request_owner_id(request)
+    stored_owner_id = str(payload.get("owner_id", "") or "").strip()
+    if stored_owner_id:
+        if not hmac.compare_digest(stored_owner_id, owner_id):
+            raise HTTPException(status_code=404, detail=f"Run {run_id} not found.")
+        return payload
+
+    task_id = str(payload.get("task_id", "") or "").strip()
+    if task_id:
+        _check_task_ownership(task_id, request)
+        return payload
+    raise HTTPException(status_code=404, detail=f"Run {run_id} not found.")
+
+
+async def _run_response(run_id: str, request: Request):
+    accept = request.headers.get("accept", "").lower()
+    if "application/x-ndjson" in accept:
+        return StreamingResponse(
+            runtime.stream_run(run_id),
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-cache, no-store",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    payload = await runtime.wait_for_run(run_id)
+    if not payload:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found.")
+    public_payload = dict(payload)
+    public_payload.pop("owner_id", None)
+    return public_payload
 
 
 @app.post("/api/tasks/{task_id}/start")
@@ -2120,8 +2360,8 @@ async def start_task(task_id: str, request: Request, payload: StartRequest | Non
         raise HTTPException(status_code=503, detail=runtime.ready_error or "Runtime not ready.")
     _enforce_rate_limit(request)
     _check_task_ownership(task_id.strip(), request)
-    run = await runtime.start_task(task_id.strip())
-    return run.to_dict()
+    run = await runtime.start_task(task_id.strip(), owner_id=_request_owner_id(request))
+    return await _run_response(run.run_id, request)
 
 
 @app.post("/api/tasks/{task_id}/continue")
@@ -2130,8 +2370,8 @@ async def continue_task(task_id: str, request: Request) -> dict:
         raise HTTPException(status_code=503, detail=runtime.ready_error or "Runtime not ready.")
     _enforce_rate_limit(request)
     _check_task_ownership(task_id.strip(), request)
-    run = await runtime.start_task(task_id.strip())
-    return run.to_dict()
+    run = await runtime.start_task(task_id.strip(), owner_id=_request_owner_id(request))
+    return await _run_response(run.run_id, request)
 
 
 @app.post("/api/tasks/{task_id}/feedback")
@@ -2144,10 +2384,14 @@ async def feedback_task(task_id: str, request: Request, payload: FeedbackRequest
     # When user types "approve"/"continue" etc. while plan is pending, treat as approval (start_task)
     # instead of revision feedback — otherwise "revise: approve" confuses the planner.
     if task.get("awaiting_hitl") and _is_continue_execution_command(msg):
-        run = await runtime.start_task(task_id.strip())
-        return run.to_dict()
-    run = await runtime.feedback_task(task_id.strip(), msg)
-    return run.to_dict()
+        run = await runtime.start_task(task_id.strip(), owner_id=_request_owner_id(request))
+        return await _run_response(run.run_id, request)
+    run = await runtime.feedback_task(
+        task_id.strip(),
+        msg,
+        owner_id=_request_owner_id(request),
+    )
+    return await _run_response(run.run_id, request)
 
 
 @app.post("/api/tasks/{task_id}/revise")
@@ -2156,8 +2400,12 @@ async def revise_task(task_id: str, request: Request, payload: ReviseRequest) ->
         raise HTTPException(status_code=503, detail=runtime.ready_error or "Runtime not ready.")
     _enforce_rate_limit(request)
     _check_task_ownership(task_id.strip(), request)
-    run = await runtime.feedback_task(task_id.strip(), payload.scope.strip())
-    return run.to_dict()
+    run = await runtime.feedback_task(
+        task_id.strip(),
+        payload.scope.strip(),
+        owner_id=_request_owner_id(request),
+    )
+    return await _run_response(run.run_id, request)
 
 
 @app.post("/api/tasks/{task_id}/rollback")
@@ -2166,11 +2414,11 @@ async def rollback_task(task_id: str, payload: RollbackRequest) -> dict:
 
 
 @app.get("/api/runs/{run_id}")
-async def get_run(run_id: str) -> dict:
-    payload = await runtime.get_run(run_id.strip())
-    if not payload:
-        raise HTTPException(status_code=404, detail=f"Run {run_id} not found.")
-    return payload
+async def get_run(run_id: str, request: Request) -> dict:
+    payload = await _check_run_ownership(run_id.strip(), request)
+    public_payload = dict(payload)
+    public_payload.pop("owner_id", None)
+    return public_payload
 
 
 @app.get("/api/tasks/{task_id}/report.pdf")
@@ -2179,14 +2427,20 @@ async def export_report_pdf(task_id: str, request: Request) -> FileResponse:
     task = runtime.store.get_task(task_id.strip())
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found.")
-    markdown = task.get("report_markdown", "").strip()
+    markdown = str(task.get("report_markdown", "") or "").strip()
     if not markdown:
         raise HTTPException(status_code=404, detail="No report available for this task.")
     safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", task_id.strip())
     pdf_path = runtime._report_dir() / f"{safe_id}.pdf"
-    error = write_markdown_pdf(markdown, pdf_path, title=task.get("title", "Report"))
+    error = await asyncio.to_thread(
+        write_markdown_pdf,
+        markdown,
+        pdf_path,
+        title=str(task.get("title", "Report") or "Report"),
+    )
     if error:
-        raise HTTPException(status_code=503, detail=f"PDF export failed: {error}")
+        logger.warning("PDF export failed for task %s: %s", task_id, error)
+        raise HTTPException(status_code=503, detail="PDF export failed. Please try again.")
     return FileResponse(
         pdf_path,
         media_type="application/pdf",

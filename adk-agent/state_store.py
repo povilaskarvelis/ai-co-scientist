@@ -6,6 +6,8 @@ import json
 import logging
 import os
 from pathlib import Path
+import tempfile
+import threading
 from typing import Any, Protocol
 import uuid
 
@@ -41,6 +43,7 @@ class JsonTaskStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._data: dict[str, Any] = {
             "conversations": {},
             "tasks": {},
@@ -50,113 +53,139 @@ class JsonTaskStore:
         self._load()
 
     def _load(self) -> None:
-        if self.path.exists():
-            try:
-                loaded = json.loads(self.path.read_text(encoding="utf-8"))
-            except Exception:  # noqa: BLE001
-                logger.warning("Failed to load JSON state store from %s", self.path, exc_info=True)
-                return
-            if isinstance(loaded, dict):
-                self._data["conversations"] = dict(loaded.get("conversations") or {})
-                self._data["tasks"] = dict(loaded.get("tasks") or {})
-                self._data["runs"] = dict(loaded.get("runs") or {})
-                self._data["workflow_sessions"] = dict(loaded.get("workflow_sessions") or {})
+        with self._lock:
+            if self.path.exists():
+                try:
+                    loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001
+                    logger.warning("Failed to load JSON state store from %s", self.path, exc_info=True)
+                    return
+                if isinstance(loaded, dict):
+                    self._data["conversations"] = dict(loaded.get("conversations") or {})
+                    self._data["tasks"] = dict(loaded.get("tasks") or {})
+                    self._data["runs"] = dict(loaded.get("runs") or {})
+                    self._data["workflow_sessions"] = dict(loaded.get("workflow_sessions") or {})
 
     def _save(self) -> None:
-        self.path.write_text(
-            json.dumps(self._data, indent=2, ensure_ascii=False, default=str),
-            encoding="utf-8",
-        )
+        with self._lock:
+            payload = json.dumps(self._data, indent=2, ensure_ascii=False, default=str)
+            temporary_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=self.path.parent,
+                    prefix=f".{self.path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as temporary_file:
+                    temporary_path = Path(temporary_file.name)
+                    temporary_file.write(payload)
+                    temporary_file.flush()
+                    os.fsync(temporary_file.fileno())
+                os.replace(temporary_path, self.path)
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
 
     def has_any_data(self) -> bool:
-        return bool(self._data.get("conversations") or self._data.get("tasks") or self._data.get("runs"))
+        with self._lock:
+            return bool(self._data.get("conversations") or self._data.get("tasks") or self._data.get("runs"))
 
     def save_task(self, task: dict[str, Any], *, owner_ip: str = "", flush: bool = True) -> None:
-        stored_task = copy.deepcopy(task)
-        stored_task["updated_at"] = _utc_now()
-        self._data["tasks"][stored_task["task_id"]] = stored_task
-        conv_id = str(stored_task.get("conversation_id", "") or "").strip()
-        if conv_id:
-            conv = self._data["conversations"].setdefault(
-                conv_id,
-                {
-                    "conversation_id": conv_id,
-                    "title": stored_task.get("title", ""),
-                    "task_ids": [],
-                    "owner_ip": owner_ip,
-                    "created_at": stored_task.get("created_at", _utc_now()),
-                    "updated_at": _utc_now(),
-                },
-            )
-            if stored_task["task_id"] not in conv["task_ids"]:
-                conv["task_ids"].append(stored_task["task_id"])
-            conv["updated_at"] = _utc_now()
-            conv["title"] = stored_task.get("title") or conv.get("title", "")
-            if owner_ip:
-                conv["owner_ip"] = owner_ip
-        if flush:
-            self._save()
+        with self._lock:
+            stored_task = copy.deepcopy(task)
+            stored_task["updated_at"] = _utc_now()
+            self._data["tasks"][stored_task["task_id"]] = stored_task
+            conv_id = str(stored_task.get("conversation_id", "") or "").strip()
+            if conv_id:
+                conv = self._data["conversations"].setdefault(
+                    conv_id,
+                    {
+                        "conversation_id": conv_id,
+                        "title": stored_task.get("title", ""),
+                        "task_ids": [],
+                        "owner_ip": owner_ip,
+                        "created_at": stored_task.get("created_at", _utc_now()),
+                        "updated_at": _utc_now(),
+                    },
+                )
+                if stored_task["task_id"] not in conv["task_ids"]:
+                    conv["task_ids"].append(stored_task["task_id"])
+                conv["updated_at"] = _utc_now()
+                conv["title"] = stored_task.get("title") or conv.get("title", "")
+                if owner_ip and not str(conv.get("owner_ip", "") or "").strip():
+                    conv["owner_ip"] = owner_ip
+            if flush:
+                self._save()
 
     def get_task(self, task_id: str) -> dict[str, Any] | None:
-        task = self._data["tasks"].get(task_id)
-        return copy.deepcopy(task) if isinstance(task, dict) else None
+        with self._lock:
+            task = self._data["tasks"].get(task_id)
+            return copy.deepcopy(task) if isinstance(task, dict) else None
 
     def list_conversations(self, *, owner_ip: str = "") -> list[dict[str, Any]]:
-        result = []
-        for conv in self._data["conversations"].values():
-            if owner_ip and conv.get("owner_ip", "") != owner_ip:
-                continue
-            task_ids = conv.get("task_ids", [])
-            tasks = [self._data["tasks"].get(tid) for tid in task_ids]
-            tasks = [t for t in tasks if isinstance(t, dict)]
-            latest = max(tasks, key=lambda t: t.get("updated_at", "")) if tasks else None
-            result.append(
-                {
-                    "conversation_id": conv["conversation_id"],
-                    "title": conv.get("title", "Research"),
-                    "latest_status": latest["status"] if latest else "unknown",
-                    "updated_at": conv.get("updated_at", ""),
-                    "iteration_count": len(tasks),
-                }
-            )
-        result.sort(key=lambda c: c.get("updated_at", ""), reverse=True)
-        return result
+        with self._lock:
+            result = []
+            for conv in self._data["conversations"].values():
+                if owner_ip and conv.get("owner_ip", "") != owner_ip:
+                    continue
+                task_ids = conv.get("task_ids", [])
+                tasks = [self._data["tasks"].get(tid) for tid in task_ids]
+                tasks = [t for t in tasks if isinstance(t, dict)]
+                latest = max(tasks, key=lambda t: t.get("updated_at", "")) if tasks else None
+                result.append(
+                    {
+                        "conversation_id": conv["conversation_id"],
+                        "title": conv.get("title", "Research"),
+                        "latest_status": latest["status"] if latest else "unknown",
+                        "updated_at": conv.get("updated_at", ""),
+                        "iteration_count": len(tasks),
+                    }
+                )
+            result.sort(key=lambda c: c.get("updated_at", ""), reverse=True)
+            return result
 
     def conversation_owned_by(self, conversation_id: str, owner_ip: str) -> bool:
-        conv = self._data["conversations"].get(conversation_id)
-        if not isinstance(conv, dict):
-            return False
-        return conv.get("owner_ip", "") == owner_ip
+        with self._lock:
+            conv = self._data["conversations"].get(conversation_id)
+            if not isinstance(conv, dict):
+                return False
+            return conv.get("owner_ip", "") == owner_ip
 
     def get_conversation_tasks(self, conversation_id: str) -> list[dict[str, Any]]:
-        conv = self._data["conversations"].get(conversation_id)
-        if not isinstance(conv, dict):
-            return []
-        tasks = [self._data["tasks"].get(tid) for tid in conv.get("task_ids", [])]
-        return [copy.deepcopy(task) for task in tasks if isinstance(task, dict)]
+        with self._lock:
+            conv = self._data["conversations"].get(conversation_id)
+            if not isinstance(conv, dict):
+                return []
+            tasks = [self._data["tasks"].get(tid) for tid in conv.get("task_ids", [])]
+            return [copy.deepcopy(task) for task in tasks if isinstance(task, dict)]
 
     def save_run(self, run: dict[str, Any], *, flush: bool = False) -> None:
-        stored_run = copy.deepcopy(run)
-        stored_run["updated_at"] = _utc_now()
-        self._data["runs"][stored_run["run_id"]] = stored_run
-        if flush:
-            self._save()
+        with self._lock:
+            stored_run = copy.deepcopy(run)
+            stored_run["updated_at"] = _utc_now()
+            self._data["runs"][stored_run["run_id"]] = stored_run
+            if flush:
+                self._save()
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
-        run = self._data["runs"].get(run_id)
-        return copy.deepcopy(run) if isinstance(run, dict) else None
+        with self._lock:
+            run = self._data["runs"].get(run_id)
+            return copy.deepcopy(run) if isinstance(run, dict) else None
 
     def mark_incomplete_runs_failed(self, reason: str) -> int:
-        updated = 0
-        for run_id, run in list(self._data["runs"].items()):
-            if not isinstance(run, dict):
-                continue
-            if _interrupt_run_payload(run, reason):
-                self._data["runs"][run_id] = run
-                updated += 1
-        if updated:
-            self._save()
-        return updated
+        with self._lock:
+            updated = 0
+            for run_id, run in list(self._data["runs"].items()):
+                if not isinstance(run, dict):
+                    continue
+                if _interrupt_run_payload(run, reason):
+                    self._data["runs"][run_id] = run
+                    updated += 1
+            if updated:
+                self._save()
+            return updated
 
     def save_workflow_session(
         self,
@@ -165,24 +194,26 @@ class JsonTaskStore:
         task_id: str = "",
         state: dict[str, Any] | None = None,
     ) -> None:
-        if not conversation_id:
-            return
-        if not state:
-            self._data["workflow_sessions"].pop(conversation_id, None)
+        with self._lock:
+            if not conversation_id:
+                return
+            if not state:
+                self._data["workflow_sessions"].pop(conversation_id, None)
+                self._save()
+                return
+            self._data["workflow_sessions"][conversation_id] = {
+                "conversation_id": conversation_id,
+                "task_id": task_id or "",
+                "schema_version": WORKFLOW_SNAPSHOT_SCHEMA,
+                "state": copy.deepcopy(state),
+                "updated_at": _utc_now(),
+            }
             self._save()
-            return
-        self._data["workflow_sessions"][conversation_id] = {
-            "conversation_id": conversation_id,
-            "task_id": task_id or "",
-            "schema_version": WORKFLOW_SNAPSHOT_SCHEMA,
-            "state": copy.deepcopy(state),
-            "updated_at": _utc_now(),
-        }
-        self._save()
 
     def get_workflow_session(self, conversation_id: str) -> dict[str, Any] | None:
-        payload = self._data["workflow_sessions"].get(conversation_id)
-        return copy.deepcopy(payload) if isinstance(payload, dict) else None
+        with self._lock:
+            payload = self._data["workflow_sessions"].get(conversation_id)
+            return copy.deepcopy(payload) if isinstance(payload, dict) else None
 
 
 def _require_psycopg() -> tuple[Any, Any, Any]:
@@ -323,7 +354,8 @@ class PostgresTaskStore:
                         ELSE conversations.title
                     END,
                     owner_ip = CASE
-                        WHEN EXCLUDED.owner_ip <> '' THEN EXCLUDED.owner_ip
+                        WHEN conversations.owner_ip = '' AND EXCLUDED.owner_ip <> ''
+                            THEN EXCLUDED.owner_ip
                         ELSE conversations.owner_ip
                     END,
                     updated_at = GREATEST(conversations.updated_at, EXCLUDED.updated_at)

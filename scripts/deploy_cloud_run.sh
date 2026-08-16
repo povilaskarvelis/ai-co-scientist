@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # ── Required ─────────────────────────────────────────────────────────────────
-# PROJECT_ID  – GCP project (pass via env or edit default below)
+# PROJECT_ID  – GCP project (pass via environment)
 # GOOGLE_API_KEY – Google AI Studio key (required only when USE_VERTEX_AI=false; stored in Secret Manager)
 # ── Optional overrides ───────────────────────────────────────────────────────
 # REGION, SERVICE_NAME, REPO_NAME, IMAGE_NAME, USE_VERTEX_AI, GA4_MEASUREMENT_ID, CONCURRENCY, CPU,
 # MIN_INSTANCES, MAX_INSTANCES
 # ─────────────────────────────────────────────────────────────────────────────
 
-PROJECT_ID="gen-lang-client-0943167408"
+PROJECT_ID="${PROJECT_ID:-}"
 REGION="${REGION:-us-central1}"
 SERVICE_NAME="${SERVICE_NAME:-ai-co-scientist}"
 REPO_NAME="${REPO_NAME:-co-scientist-images}"
@@ -22,7 +22,7 @@ GA4_MEASUREMENT_ID="${GA4_MEASUREMENT_ID:-G-NTCXHW3B2G}"
 CONCURRENCY="${CONCURRENCY:-8}"
 CPU="${CPU:-2}"
 MIN_INSTANCES="${MIN_INSTANCES:-0}"
-MAX_INSTANCES="${MAX_INSTANCES:-2}"
+MAX_INSTANCES="${MAX_INSTANCES:-1}"
 
 ENV_FILE="adk-agent/.env"
 
@@ -111,7 +111,7 @@ gcloud builds submit \
   --project "${PROJECT_ID}" \
   --tag "${IMAGE_URI}" \
   --suppress-logs \
-  . || true
+  .
 
 # ── Store secrets in Secret Manager ───────────────────────────────────────────
 

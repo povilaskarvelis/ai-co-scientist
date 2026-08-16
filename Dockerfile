@@ -12,7 +12,8 @@ WORKDIR /app
 
 # Install Python dependencies first for better layer caching.
 COPY adk-agent/requirements.txt /app/adk-agent/requirements.txt
-RUN pip install --no-cache-dir -r /app/adk-agent/requirements.txt
+RUN python -m pip install --no-cache-dir --upgrade "pip>=26.1.2" \
+    && python -m pip install --no-cache-dir -r /app/adk-agent/requirements.txt
 
 # Install MCP Node dependencies.
 COPY research-mcp/package.json /app/research-mcp/package.json
