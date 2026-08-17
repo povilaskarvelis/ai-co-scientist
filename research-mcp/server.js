@@ -24,6 +24,10 @@ import {
   getHpoSearchQueryVariants,
   rankHpoSearchDocs,
 } from "./hpo_helpers.js";
+import {
+  selectOpenTargetsDiseaseAssociation,
+  shouldUseLiveOpenTargetsApi,
+} from "./open_targets_helpers.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -105,6 +109,7 @@ const NEMAR_DATAEXPLORER_VIEW_API = `${NEMAR_DATAEXPLORER_API}/viewapi`;
 const BRAINCODE_CONP_QUERY = "braincode";
 const NEUROBAGEL_API = "https://api.neurobagel.org";
 const OPENNEURO_GRAPHQL = "https://openneuro.org/crn/graphql";
+const OPEN_TARGETS_GRAPHQL_API = "https://api.platform.opentargets.org/api/v4/graphql";
 const DANDI_API = "https://api.dandiarchive.org/api";
 const ENIGMA_TOOLBOX_REPO = "MICA-MNI/ENIGMA";
 const ENIGMA_SUMMARY_STATS_PATH = "enigmatoolbox/datasets/summary_statistics";
@@ -533,6 +538,9 @@ function buildResultQueryScope(requestArgs) {
     "gene",
     "genes",
     "disease",
+    "target",
+    "target_id",
+    "release",
     "compound",
     "drugName",
     "variantId",
@@ -6057,6 +6065,139 @@ server.registerTool(
   }
 );
 
+async function queryOpenTargetsGraphql(query, variables) {
+  const response = await fetchWithRetry(OPEN_TARGETS_GRAPHQL_API, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "User-Agent": "ai-co-scientist/1.0",
+    },
+    body: JSON.stringify({ query, variables }),
+    retries: 1,
+    timeoutMs: 20000,
+    maxBackoffMs: 2500,
+  });
+  const payload = await response.json();
+  const errorText = formatGraphQLErrors(payload);
+  if (errorText) throw new Error(`Open Targets returned errors: ${errorText}`);
+  return payload?.data || {};
+}
+
+async function getLiveOpenTargetsAssociation(targetQuery, diseaseQuery, maxDiseaseMatches) {
+  const directTargetId = normalizeWhitespace(targetQuery).split(".")[0].toUpperCase();
+  let targetId = /^ENSG\d{11}$/.test(directTargetId) ? directTargetId : "";
+  let targetSymbol = "";
+  let targetName = "";
+  let targetResolutionSource = "direct_input";
+
+  if (!targetId) {
+    const resolved = await resolveGeneWithMyGene(targetQuery, "human");
+    if (!resolved.bestHit) throw new Error(`Could not resolve target '${targetQuery}' to a human gene.`);
+    const ids = normalizeMyGeneIds(resolved.bestHit);
+    targetId = ids.ensemblGenes.find((value) => /^ENSG\d{11}$/.test(value)) || "";
+    targetSymbol = ids.symbol;
+    targetName = ids.name;
+    targetResolutionSource = `${MYGENE_API}/query`;
+    if (!targetId) throw new Error(`Could not resolve target '${targetQuery}' to an Ensembl gene ID.`);
+  }
+
+  const boundedMatches = Math.max(1, Math.min(10, Math.round(maxDiseaseMatches || 5)));
+  const searchData = await queryOpenTargetsGraphql(
+    `query SearchDisease($query: String!, $size: Int!) {
+      search(queryString: $query, entityNames: ["disease"], page: {index: 0, size: $size}) {
+        hits { id name entity score }
+      }
+    }`,
+    { query: diseaseQuery, size: boundedMatches },
+  );
+  const candidates = (Array.isArray(searchData?.search?.hits) ? searchData.search.hits : [])
+    .filter((hit) => normalizeWhitespace(hit?.entity || "") === "disease")
+    .slice(0, boundedMatches);
+  if (candidates.length === 0) {
+    throw new Error(`Could not resolve disease or trait '${diseaseQuery}' in the current Open Targets platform.`);
+  }
+
+  const associationData = await queryOpenTargetsGraphql(
+    `query TargetDiseaseAssociation($targetId: String!, $diseaseIds: [String!]!, $size: Int!) {
+      target(ensemblId: $targetId) {
+        id
+        approvedSymbol
+        approvedName
+        associatedDiseases(Bs: $diseaseIds, enableIndirect: false, page: {index: 0, size: $size}) {
+          rows {
+            disease { id name }
+            score
+            datatypeScores { id score }
+          }
+        }
+      }
+    }`,
+    {
+      targetId,
+      diseaseIds: candidates.map((candidate) => candidate.id),
+      size: boundedMatches,
+    },
+  );
+  const target = associationData?.target;
+  if (!target) throw new Error(`Open Targets did not return target '${targetId}'.`);
+
+  const rows = Array.isArray(target?.associatedDiseases?.rows) ? target.associatedDiseases.rows : [];
+  const selected = selectOpenTargetsDiseaseAssociation(candidates, rows);
+  const firstCandidate = candidates[0] || {};
+  if (!selected) {
+    return {
+      ok: true,
+      found: false,
+      source_mode: "live",
+      release: "current live platform",
+      message: `No direct target-disease association row was returned for the resolved disease candidates.`,
+      target_query: targetQuery,
+      target_id: targetId,
+      target_symbol: normalizeWhitespace(target?.approvedSymbol || targetSymbol || targetQuery),
+      target_name: normalizeWhitespace(target?.approvedName || targetName),
+      target_resolution_source: targetResolutionSource,
+      disease_query: diseaseQuery,
+      disease_id: normalizeWhitespace(firstCandidate?.id || ""),
+      disease_name: normalizeWhitespace(firstCandidate?.name || diseaseQuery),
+      disease_resolution_source: OPEN_TARGETS_GRAPHQL_API,
+      candidate_diseases: candidates.map((candidate) => ({
+        disease_id: normalizeWhitespace(candidate?.id || ""),
+        disease_name: normalizeWhitespace(candidate?.name || ""),
+      })),
+      score: null,
+      evidence_count: null,
+      datatype_scores: [],
+      association_source_url: OPEN_TARGETS_GRAPHQL_API,
+    };
+  }
+
+  const disease = selected.row.disease || {};
+  return {
+    ok: true,
+    found: true,
+    source_mode: "live",
+    release: "current live platform",
+    target_query: targetQuery,
+    target_id: targetId,
+    target_symbol: normalizeWhitespace(target?.approvedSymbol || targetSymbol || targetQuery),
+    target_name: normalizeWhitespace(target?.approvedName || targetName),
+    target_resolution_source: targetResolutionSource,
+    disease_query: diseaseQuery,
+    disease_id: normalizeWhitespace(disease?.id || selected.candidate?.id || ""),
+    disease_name: normalizeWhitespace(disease?.name || selected.candidate?.name || diseaseQuery),
+    disease_resolution_source: OPEN_TARGETS_GRAPHQL_API,
+    candidate_diseases: candidates.map((candidate) => ({
+      disease_id: normalizeWhitespace(candidate?.id || ""),
+      disease_name: normalizeWhitespace(candidate?.name || ""),
+    })),
+    score: Number(selected.row.score),
+    evidence_count: null,
+    datatype_scores: Array.isArray(selected.row.datatypeScores) ? selected.row.datatypeScores : [],
+    association_source_url: OPEN_TARGETS_GRAPHQL_API,
+  };
+}
+
 // ============================================
 // TOOL 7: Open Targets association score lookup
 // ============================================
@@ -6064,7 +6205,7 @@ server.registerTool(
   "get_open_targets_association",
   {
     description:
-      "Looks up a target-disease association score from Open Targets using the official EBI parquet release archive. Prefer this over BigQuery/current Open Targets sources when the question pins a specific release such as 'September 2025' or asks for an association score for one target-disease pair.",
+      "Looks up a target-disease association score from Open Targets. Uses the official live GraphQL API for current/latest requests and the official EBI parquet archive when a specific release such as 'September 2025' is requested.",
     inputSchema: {
       target: z
         .string()
@@ -6088,16 +6229,32 @@ server.registerTool(
     },
   },
   async ({ target, disease, release = "latest", maxDiseaseMatches = 5 }) => {
-    const result = await runPythonJsonHelper(
-      OPEN_TARGETS_RELEASE_QUERY_SCRIPT,
-      {
-        target,
-        disease,
-        release,
-        max_disease_matches: maxDiseaseMatches,
-      },
-      { timeoutMs: 180000 }
-    );
+    let result;
+    try {
+      result = shouldUseLiveOpenTargetsApi(release)
+        ? await getLiveOpenTargetsAssociation(target, disease, maxDiseaseMatches)
+        : await runPythonJsonHelper(
+          OPEN_TARGETS_RELEASE_QUERY_SCRIPT,
+          {
+            target,
+            disease,
+            release,
+            max_disease_matches: maxDiseaseMatches,
+          },
+          { timeoutMs: 180000 }
+        );
+    } catch (error) {
+      const detail = compactErrorMessage(error?.message || "unknown Open Targets error", 320);
+      return {
+        content: [{ type: "text", text: `Error in get_open_targets_association: ${detail}` }],
+        structuredContent: {
+          schema: "get_open_targets_association.v1",
+          result_status: "error",
+          found: false,
+          error: detail,
+        },
+      };
+    }
 
     if (result?.ok && result?.found === false) {
       const releaseTag = normalizeWhitespace(result.release || release || "");
@@ -6135,7 +6292,9 @@ server.registerTool(
               ].filter(Boolean),
               limitations: [
                 normalizeWhitespace(result.message || "No exact target-disease association row was present in this archived release."),
-                "This uses the official archived parquet release files rather than the current live API or BigQuery mirror.",
+                result.source_mode === "live"
+                  ? "This is the current live Open Targets platform snapshot; name a release for a reproducible archive lookup."
+                  : "This uses the official archived parquet release files rather than the current live API or BigQuery mirror.",
               ],
             }),
           },
@@ -6174,16 +6333,22 @@ server.registerTool(
     const diseaseId = normalizeWhitespace(result.disease_id || "");
     const diseaseName = normalizeWhitespace(result.disease_name || disease || "");
     const scoreValue = Number(result.score);
-    const evidenceCount = Number(result.evidence_count);
+    const evidenceCount = result.evidence_count === null || result.evidence_count === undefined
+      ? null
+      : Number(result.evidence_count);
     const candidateDiseases = Array.isArray(result.candidate_diseases) ? result.candidate_diseases : [];
+    const datatypeScores = Array.isArray(result.datatype_scores) ? result.datatype_scores : [];
 
     const keyFields = [
       `Release: ${releaseTag || "latest archived release"}`,
       `Target: ${targetSymbol}${targetId ? ` (${targetId})` : ""}${targetName ? ` — ${targetName}` : ""}`,
       `Disease: ${diseaseName}${diseaseId ? ` (${diseaseId})` : ""}`,
       `Association score: ${Number.isFinite(scoreValue) ? String(scoreValue) : normalizeWhitespace(result.score || "")}`,
-      `Evidence count: ${Number.isFinite(evidenceCount) ? String(evidenceCount) : normalizeWhitespace(result.evidence_count || "")}`,
-    ];
+      Number.isFinite(evidenceCount) ? `Evidence count: ${String(evidenceCount)}` : null,
+      ...datatypeScores.slice(0, 8).map((entry) => (
+        `Datatype ${normalizeWhitespace(entry?.id || "unknown")}: ${Number.isFinite(Number(entry?.score)) ? String(Number(entry.score)) : "unavailable"}`
+      )),
+    ].filter(Boolean);
 
     if (candidateDiseases.length > 1) {
       const preview = candidateDiseases
@@ -6209,12 +6374,26 @@ server.registerTool(
               normalizeWhitespace(result.target_resolution_source || ""),
             ].filter(Boolean),
             limitations: [
-              "This uses the official archived parquet release files rather than the current live API or BigQuery mirror.",
+              result.source_mode === "live"
+                ? "This is the current live Open Targets platform snapshot; name a release for a reproducible archive lookup."
+                : "This uses the official archived parquet release files rather than the current live API or BigQuery mirror.",
               "The lookup resolves one target-disease pair at a time.",
             ],
           }),
         },
       ],
+      structuredContent: {
+        schema: "get_open_targets_association.v1",
+        result_status: "ok",
+        found: true,
+        release: releaseTag || null,
+        target_id: targetId || null,
+        disease_id: diseaseId || null,
+        score: Number.isFinite(scoreValue) ? scoreValue : null,
+        evidence_count: Number.isFinite(evidenceCount) ? evidenceCount : null,
+        datatype_scores: datatypeScores,
+        source_mode: result.source_mode || "archive",
+      },
     };
   }
 );

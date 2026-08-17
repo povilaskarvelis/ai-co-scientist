@@ -12,8 +12,9 @@
   }
 
   function sanitizeDisplaySummary(text) {
-    return String(text || "")
-      .replace(/\bHand-?off:\s*`{2,3}(?:json)?[\s\S]*?`{2,3}/gi, " ")
+    const visibleText = String(text || "").split(/\bHand-?off:/i)[0];
+    return visibleText
+      .replace(/\bThe step is\s*$/i, " ")
       .replace(/\s+/g, " ")
       .trim();
   }

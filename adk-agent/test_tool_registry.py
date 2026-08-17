@@ -27,12 +27,13 @@ def test_iter_active_source_precedence_rules_includes_neuroscience_dataset_disco
     assert "Neuroscience dataset discovery" in topics
 
 
-def test_open_targets_archive_tool_metadata_mentions_release_specific_lookup():
+def test_open_targets_tool_metadata_distinguishes_live_and_release_specific_lookup():
     assert "data" in tool_registry.TOOL_TO_DOMAINS["get_open_targets_association"]
     desc = tool_registry.TOOL_DESCRIPTIONS["get_open_targets_association"]
+    assert "live" in desc.lower()
     assert "release" in desc.lower()
     preferred_for = tool_registry.TOOL_ROUTING_METADATA["get_open_targets_association"]["preferred_for"]
-    assert "specific platform release" in preferred_for
+    assert "named releases" in preferred_for
 
 
 def test_evidence_contracts_define_source_semantics_separately_from_prompts():

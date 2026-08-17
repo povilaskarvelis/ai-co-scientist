@@ -17,5 +17,13 @@ test("structured handoff payloads stay out of the human activity summary", () =>
     "Targets identified. Hand-off: ``json [{\"entity_type\":\"protein\",\"label\":\"GFRAL\"}] `` Used curated sources.",
   );
 
-  assert.equal(rendered, "Targets identified. Used curated sources.");
+  assert.equal(rendered, "Targets identified.");
+});
+
+test("handoff removal also clears the executor's dangling transition phrase", () => {
+  const rendered = sanitizeDisplaySummary(
+    "Two relevant trials were identified. The step is Handoff: NCT06662539 ```json {\"step_id\":\"S5\"}",
+  );
+
+  assert.equal(rendered, "Two relevant trials were identified.");
 });

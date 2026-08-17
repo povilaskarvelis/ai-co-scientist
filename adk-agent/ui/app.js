@@ -647,21 +647,6 @@ function isInternalActivityTool(value) {
   return INTERNAL_ACTIVITY_TOOL_NAMES.has(normalizeActivityText(value));
 }
 
-function activityQuietSeconds(updatedAt = "", latestEvent = null, latestSummary = null) {
-  const timestamps = [updatedAt, latestEvent?.at, latestSummary?.at]
-    .map((value) => Date.parse(String(value || "")))
-    .filter((value) => Number.isFinite(value));
-  if (!timestamps.length) return 0;
-  return Math.max(0, Math.floor((Date.now() - Math.max(...timestamps)) / 1000));
-}
-
-function formatActivityQuietDuration(seconds) {
-  const safeSeconds = Math.max(0, Number(seconds || 0));
-  if (safeSeconds < 60) return `about ${Math.max(20, Math.floor(safeSeconds / 5) * 5)} seconds`;
-  const minutes = Math.max(1, Math.floor(safeSeconds / 60));
-  return `about ${minutes} minute${minutes === 1 ? "" : "s"}`;
-}
-
 function activityStepStatusLabel(status) {
   const normalized = String(status || "").trim();
   if (normalized === "completed") return "Completed";
@@ -830,7 +815,7 @@ function reactTraceLines({ trace = "", phases = null } = {}) {
   return lines;
 }
 
-function buildActivitySnapshot({ taskId = "", status = "", events = [], summaries = [], planApproved = true, updatedAt = "" } = {}) {
+function buildActivitySnapshot({ taskId = "", status = "", events = [], summaries = [], planApproved = true } = {}) {
   const normalizedStatus = String(status || "").trim();
   const safeEvents = (Array.isArray(events) ? events : []).filter((event) => {
     if (String(event?.type || "") === "plan.initializing") return false;
@@ -918,23 +903,6 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
     preview = "Execution finished. Expand to inspect details.";
   } else {
     preview = "Click for activity details";
-  }
-
-  const isActive = ["running", "queued", "in_progress"].includes(normalizedStatus);
-  const quietSeconds = activityQuietSeconds(updatedAt, latestEvent, latestSummary);
-  if (isActive && quietSeconds >= 20) {
-    const sid = String(currentStepFromDetails?.id || latestStepStarted?.metrics?.step_id || "").trim();
-    const goal = normalizeActivityText(currentStepFromDetails?.goal || "");
-    if (latestToolCalled?.human_line) {
-      summary = `Still working — ${normalizeActivityText(latestToolCalled.human_line).replace(/…$/, "")}`;
-    } else if (sid && goal) {
-      summary = `Still working on ${sid}: ${goal}`;
-    } else if (sid) {
-      summary = `Still working on ${sid}`;
-    } else {
-      summary = "Still preparing the next research step";
-    }
-    preview = `No new progress update for ${formatActivityQuietDuration(quietSeconds)}; the run is still active.`;
   }
 
   if (normalizeActivityText(preview) === normalizeActivityText(summary)) {
@@ -1029,26 +997,13 @@ function getRunForTask(taskId) {
   return tid ? (state.runsByTaskId[tid] || null) : null;
 }
 
-const RESEARCH_EVENT_TYPES = new Set([
-  "plan.generated", "plan.retry", "plan.failed", "task.created", "step.completed", "step.started", "step.retry", "tool.called", "tool.failed",
-  "synthesis.completed", "checkpoint.opened", "execution.paused", "execution.running", "run.completed",
-]);
-
-function hasResearchProgress(run) {
-  const evs = Array.isArray(run?.progress_events) ? run.progress_events : [];
-  return evs.some((e) => RESEARCH_EVENT_TYPES.has(String(e?.type || "")));
-}
-
 function minimalLoadingSpinnerHtml(label = "") {
   const labelHtml = label ? `<span class="loading-label">${escapeHtml(label)}</span>` : "";
   return `<article class="message assistant loading-spinner-only" data-role="loading-spinner"><span class="activity-wheel" aria-hidden="true"></span>${labelHtml}</article>`;
 }
 
 function pendingRunLabel() {
-  const run = state.pendingRunId ? (state.runsByRunId[state.pendingRunId] || state.runsByTaskId["__pending__"]) : null;
-  const evs = Array.isArray(run?.progress_events) ? run.progress_events : [];
-  if (evs.some((e) => String(e?.type || "") === "plan.initializing")) return "Preparing a plan\u2026";
-  return "";
+  return state.pendingUserMessage ? "Planning\u2026" : "";
 }
 
 function updateLoadingSpinnerLabel() {
@@ -1110,17 +1065,7 @@ function iterationActivitySnapshot(iteration) {
     events,
     summaries,
     planApproved,
-    updatedAt: run?.updated_at || task?.updated_at || "",
   });
-}
-
-function pendingActivitySnapshot() {
-  const run = state.pendingRunId ? (state.runsByRunId[state.pendingRunId] || state.runsByTaskId["__pending__"]) : null;
-  const taskId = String(run?.task_id || "").trim() || "pending";
-  const status = String(run?.status || "queued").trim();
-  const events = Array.isArray(run?.progress_events) ? run.progress_events : [];
-  const summaries = Array.isArray(run?.progress_summaries) ? run.progress_summaries : [];
-  return buildActivitySnapshot({ taskId, status, events, summaries, updatedAt: run?.updated_at || "" });
 }
 
 function taskHasStarted(task) {
@@ -1150,7 +1095,6 @@ function updateInlineActivityCard(run) {
     status: String(run.status || "").trim(),
     events: Array.isArray(run.progress_events) ? run.progress_events : [],
     summaries: Array.isArray(run.progress_summaries) ? run.progress_summaries : [],
-    updatedAt: run.updated_at || "",
   });
   if (!snapshot) return;
 
@@ -1221,13 +1165,7 @@ function renderMessages() {
     const parts = [];
     if (state.pendingUserMessage) {
       parts.push(`<article class="message user"><pre class="message-body">${escapeHtml(state.pendingUserMessage)}</pre></article>`);
-      const pendingRun = state.pendingRunId ? (state.runsByRunId[state.pendingRunId] || state.runsByTaskId["__pending__"]) : null;
-      if (pendingRun && hasResearchProgress(pendingRun)) {
-        const pendingCard = activityCardHtml(pendingActivitySnapshot());
-        if (pendingCard) parts.push(pendingCard);
-      } else {
-        parts.push(minimalLoadingSpinnerHtml(pendingRunLabel()));
-      }
+      parts.push(minimalLoadingSpinnerHtml(pendingRunLabel()));
     }
     parts.push(`<article class="message assistant"><div class="message-body markdown-body">${markdownToHtml(state.clarificationMessage)}</div></article>`);
     if (setInnerHtmlIfChanged(el.messages, parts.join(""))) {
@@ -1241,13 +1179,7 @@ function renderMessages() {
       const parts = [
         `<article class="message user"><pre class="message-body">${escapeHtml(state.pendingUserMessage)}</pre></article>`,
       ];
-      const pendingRun = state.pendingRunId ? (state.runsByRunId[state.pendingRunId] || state.runsByTaskId["__pending__"]) : null;
-      if (pendingRun && hasResearchProgress(pendingRun)) {
-        const pendingCard = activityCardHtml(pendingActivitySnapshot());
-        if (pendingCard) parts.push(pendingCard);
-      } else {
-        parts.push(minimalLoadingSpinnerHtml(pendingRunLabel()));
-      }
+      parts.push(minimalLoadingSpinnerHtml(pendingRunLabel()));
       if (setInnerHtmlIfChanged(el.messages, parts.join(""))) {
         el.messages.scrollTop = el.messages.scrollHeight;
       }
@@ -1300,13 +1232,7 @@ function renderMessages() {
 
   if (state.pendingUserMessage) {
     parts.push(`<article class="message user"><pre class="message-body">${escapeHtml(state.pendingUserMessage)}</pre></article>`);
-    const pendingRun = state.pendingRunId ? (state.runsByRunId[state.pendingRunId] || state.runsByTaskId["__pending__"]) : null;
-    if (pendingRun && hasResearchProgress(pendingRun)) {
-      const pendingCard = activityCardHtml(pendingActivitySnapshot());
-      if (pendingCard) parts.push(pendingCard);
-    } else {
-      parts.push(minimalLoadingSpinnerHtml(pendingRunLabel()));
-    }
+    parts.push(minimalLoadingSpinnerHtml(pendingRunLabel()));
   }
 
   if (setInnerHtmlIfChanged(el.messages, parts.join(""))) {

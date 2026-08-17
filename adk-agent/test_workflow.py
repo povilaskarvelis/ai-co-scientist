@@ -556,6 +556,8 @@ def test_planner_instruction_preserves_core_rules_but_trims_large_playbooks():
     assert '"handoff": null' in instruction
     assert "never insert a universal shortlist size" in instruction
     assert "Stable database accessions" in instruction
+    assert "one step should apply the same source or tool family across all named entities" in instruction
+    assert "Do not create one step per compared entity" in instruction
     assert "structured-data-planning" in instruction
     assert "archive-dataset-discovery-planning" in instruction
     assert "clinical-trials-planning" in instruction
@@ -2621,11 +2623,18 @@ def test_planner_keeps_archive_search_and_metadata_inspection_in_one_step():
 def test_planner_groups_named_comparison_items_by_shared_source():
     instruction = workflow.PLANNER_INSTRUCTION_TEMPLATE
 
-    assert "Keep repeated work together when one source and one evidence criterion" in instruction
-    assert "Keep work separate when sources answer different evidence dimensions" in instruction
+    assert "one step should apply the same source or tool family across all named entities" in instruction
+    assert "Separate steps only when they require a different evidence source" in instruction
+    assert "Do not create one step per compared entity" in instruction
     assert "API return order is not a ranking" in instruction
     assert "never insert a universal shortlist size" in instruction
     assert "top 5" not in instruction.lower()
+
+    comparison_skill = Path(
+        "adk-agent/co_scientist/skills/comparative-assessment-planning/SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "Apply each evidence step across all compared entities" in comparison_skill
+    assert "do not add a synthesis-only plan step" in comparison_skill
 
 
 def test_plan_normalization_preserves_scientific_scope_and_source_steps():
@@ -4723,6 +4732,15 @@ def test_router_before_model_callback_forces_research_workflow_for_all_landing_p
         call = workflow._extract_function_calls(response)[0]
         assert call["name"] == "transfer_to_agent", query
         assert call["args"]["agent_name"] == "research_workflow", query
+
+
+def test_pending_query_ui_stays_in_planning_state_until_plan_is_ready():
+    app_js = Path("adk-agent/ui/app.js").read_text(encoding="utf-8")
+
+    assert 'return state.pendingUserMessage ? "Planning\\u2026" : "";' in app_js
+    assert "hasResearchProgress" not in app_js
+    assert "Still preparing the next research step" not in app_js
+    assert "No new progress update" not in app_js
 
 
 def test_router_requests_variant_identity_before_individual_variant_classification():

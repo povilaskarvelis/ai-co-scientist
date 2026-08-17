@@ -99,7 +99,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "list_bigquery_tables": "List tables in a BigQuery dataset or inspect a table schema",
     "run_bigquery_select_query": "Run read-only SQL against allowlisted BigQuery datasets",
     "get_open_targets_l2g": "Get an Open Targets L2G (locus-to-gene) score from the official archived release files. Prefer this for Open Targets genetics questions about credible sets, variant-to-gene links, or L2G scores.",
-    "get_open_targets_association": "Get an Open Targets target-disease association score from the official archived release parquet files. Prefer this for release-specific Open Targets questions such as 'September 2025 release'.",
+    "get_open_targets_association": "Get an Open Targets target-disease association score from the official live API for current requests or the official archive when a specific release is named.",
     "search_zenodo_records": "Search Zenodo for published datasets, software, and other research outputs via /api/records (Elasticsearch query syntax; optional type and community filters)",
     "get_zenodo_record": "Fetch one Zenodo record by numeric id, 10.5281/zenodo.N DOI, or record URL; returns metadata and file download links",
     "search_clinical_trials": "Search ClinicalTrials.gov (returns NCT IDs)",
@@ -219,7 +219,7 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
     },
     "get_open_targets_association": {
         "overlap_group": "open_targets_lookup",
-        "preferred_for": "Open Targets association score lookups for one target-disease pair, especially when the question pins a specific platform release such as September 2025",
+        "preferred_for": "Open Targets association score lookups for one target-disease pair; current/latest requests use the live platform and named releases use the reproducible archive",
         "fallback_tools": ["get_open_targets_l2g", "run_bigquery_select_query", "list_bigquery_tables", "resolve_gene_identifiers"],
     },
     "search_clinical_trials": {
@@ -728,7 +728,7 @@ SOURCE_PRECEDENCE_RULES: list[dict[str, Any]] = [
     {
         "topic": "Open Targets association lookup",
         "tools": ["get_open_targets_association", "run_bigquery_select_query"],
-        "summary": "Use `get_open_targets_association` when you need a target-disease association score from a specific Open Targets release; use `run_bigquery_select_query` for broader current-snapshot exploration across Open Targets tables.",
+        "summary": "Use `get_open_targets_association` for a target-disease association score: the live platform serves current/latest requests and the archive serves named releases. Use `run_bigquery_select_query` for broader current-snapshot exploration across Open Targets tables.",
     },
     {
         "topic": "GWAS Catalog lookup",
