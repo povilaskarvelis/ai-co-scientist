@@ -297,6 +297,16 @@ def _is_terminal_workflow_error_response(text: str) -> bool:
     )
 
 
+def _is_planner_failure_response(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    return (
+        not normalized
+        or normalized in {"(no response)", "no response"}
+        or normalized.startswith("## planner parse error")
+        or normalized.startswith("## planner validation error")
+    )
+
+
 def _fire_and_forget_threadsafe(coro: Any, loop: asyncio.AbstractEventLoop, *, label: str = "") -> None:
     try:
         future = asyncio.run_coroutine_threadsafe(coro, loop)
@@ -1240,6 +1250,20 @@ class UiRuntime:
     async def _read_persistable_session_state(self, conversation_id: str) -> dict:
         return _extract_persistable_session_state(await self._read_session_state(conversation_id))
 
+    async def _restore_persistable_session_state(
+        self, conversation_id: str, snapshot: dict | None,
+    ) -> None:
+        """Restore workflow checkpoint state after a failed plan revision."""
+        session_state = await self._read_session_state(conversation_id)
+        if session_state is None:
+            return
+        source = snapshot if isinstance(snapshot, dict) else {}
+        for key in PERSISTED_SESSION_STATE_KEYS:
+            if key in source:
+                session_state[key] = copy.deepcopy(source[key])
+            else:
+                session_state.pop(key, None)
+
     async def _persist_conversation_state(self, conversation_id: str, *, task_id: str = "") -> None:
         if not conversation_id:
             return
@@ -2018,6 +2042,7 @@ class UiRuntime:
 
             direct_response_detected = (
                 not terminal_error
+                and not _is_planner_failure_response(response_text)
                 and (
                     responding_author in _DIRECT_RESPONSE_AGENTS
                     or (not wf_state and not plan_pending and not has_steps)
@@ -2070,14 +2095,29 @@ class UiRuntime:
                         )
                         wf_state = await self._read_workflow_state(conv_id)
                         plan_pending = await self._is_plan_pending_approval(conv_id)
+                        terminal_error = _is_terminal_workflow_error_response(response_text)
+                        has_steps = bool(_steps_from_workflow_state(wf_state))
+                        direct_response_detected = (
+                            not terminal_error
+                            and not _is_planner_failure_response(response_text)
+                            and (
+                                responding_author in _DIRECT_RESPONSE_AGENTS
+                                or (not wf_state and not plan_pending and not has_steps)
+                            )
+                        )
                         task["steps"] = _steps_from_workflow_state(wf_state)
                         task["current_step_index"] = 0
                         restated = (wf_state or {}).get("objective", "").strip()
                         if restated:
                             task["objective"] = restated
                             task["title"] = _generate_chat_title(restated)
-                        planner_failed = not wf_state and not plan_pending
-                        if not planner_failed:
+                        planner_failed = (
+                            not terminal_error
+                            and not direct_response_detected
+                            and not wf_state
+                            and not plan_pending
+                        )
+                        if terminal_error or direct_response_detected or not planner_failed:
                             break
 
             if terminal_error:
@@ -2387,6 +2427,7 @@ class UiRuntime:
             conv_id = task["conversation_id"]
             await self._acquire_conversation_session(conv_id)
             conversation_acquired = True
+            previous_session_state = await self._read_persistable_session_state(conv_id)
             await self._update_run(run_id, task_id=task_id, title=task.get("title", ""))
 
             prompt = f"revise: {message}"
@@ -2399,10 +2440,39 @@ class UiRuntime:
                 task_id=task_id,
             )
 
-            response_text, _ = await self._run_workflow_turn_filtered(
-                conv_id, prompt, run_id=run_id,
-            )
+            response_text = ""
+            wf_state = None
+            plan_pending = False
+            planner_failed = False
+            max_plan_attempts = 2
+            for plan_attempt in range(1, max_plan_attempts + 1):
+                response_text, _ = await self._run_workflow_turn_filtered(
+                    conv_id, prompt, run_id=run_id,
+                )
+                if _is_terminal_workflow_error_response(response_text):
+                    break
+                wf_state = await self._read_workflow_state(conv_id)
+                plan_pending = await self._is_plan_pending_approval(conv_id)
+                planner_failed = (
+                    _is_planner_failure_response(response_text)
+                    or not wf_state
+                    or not plan_pending
+                )
+                if not planner_failed:
+                    break
+                if plan_attempt < max_plan_attempts:
+                    await self._restore_persistable_session_state(conv_id, previous_session_state)
+                    await self._append_progress_event(
+                        run_id,
+                        phase="plan",
+                        event_type="plan.retry",
+                        status="progress",
+                        human_line=f"Plan revision failed (attempt {plan_attempt}), retrying...",
+                        task_id=task_id,
+                    )
+
             if _is_terminal_workflow_error_response(response_text):
+                await self._restore_persistable_session_state(conv_id, previous_session_state)
                 run_error = _derive_run_error_message(response_text, "Run failed.")
                 task["status"] = "failed"
                 task["report_markdown"] = response_text
@@ -2420,8 +2490,27 @@ class UiRuntime:
                 )
                 return
 
-            wf_state = await self._read_workflow_state(conv_id)
-            plan_pending = await self._is_plan_pending_approval(conv_id)
+            if planner_failed:
+                await self._restore_persistable_session_state(conv_id, previous_session_state)
+                planner_error = _derive_run_error_message(
+                    response_text,
+                    "Planner failed to generate a valid revised research plan.",
+                )
+                task["status"] = "in_progress"
+                task["awaiting_hitl"] = bool(previous_session_state.get(STATE_PLAN_PENDING_APPROVAL, False))
+                await self._save_task_with_progress(task, run_id)
+                await self._update_run(
+                    run_id, status="failed", task_id=task_id, error=planner_error,
+                )
+                await self._append_progress_event(
+                    run_id,
+                    phase="plan",
+                    event_type="plan.failed",
+                    status="error",
+                    human_line=planner_error,
+                    task_id=task_id,
+                )
+                return
 
             task["steps"] = _steps_from_workflow_state(wf_state)
             task["hitl_history"].append(f"revise:{message}")

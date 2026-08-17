@@ -391,6 +391,12 @@ def test_terminal_workflow_error_detection_matches_rate_limit_message():
     )
 
 
+def test_planner_failure_response_detection_matches_empty_parse_output():
+    assert ui_server._is_planner_failure_response("## Planner Parse Error\n\nEmpty model output.")
+    assert ui_server._is_planner_failure_response("(No response)")
+    assert not ui_server._is_planner_failure_response("Please provide the exact HGVS variant.")
+
+
 def test_transient_workflow_response_matches_current_retry_status_line():
     assert ui_server._is_transient_workflow_response(
         "_Rate limit hit from Google AI Studio — retry 1/5, waited 5s…_"
@@ -1056,6 +1062,132 @@ def test_generated_report_retention_is_bounded_by_report_group(runtime, tmp_path
     assert not (report_dir / "task_0.pdf").exists()
     assert (report_dir / "task_1.md").exists()
     assert (report_dir / "task_2.pdf").exists()
+
+
+@pytest.mark.asyncio
+async def test_run_new_query_retries_planner_parse_error_instead_of_completing_it(runtime):
+    calls = 0
+
+    async def fake_acquire_conversation_session(conversation_id: str):
+        return SimpleNamespace(app_name="test-app", session_id=conversation_id)
+
+    async def fake_turn(conversation_id: str, prompt: str, *, run_id: str):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "## Planner Parse Error\n\nEmpty model output.", "research_workflow"
+        return "## Research Plan\n\n1. Inspect labels.", "research_workflow"
+
+    async def fake_read_state(conversation_id: str):
+        if calls < 2:
+            return None
+        return {
+            "objective": "Compare two therapies",
+            "plan_status": "ready",
+            "steps": [{
+                "id": "S1",
+                "goal": "Inspect labels",
+                "status": "pending",
+                "tool_hint": "get_dailymed_drug_label",
+                "completion_condition": "Both labels inspected",
+            }],
+        }
+
+    async def fake_plan_pending(conversation_id: str) -> bool:
+        return calls >= 2
+
+    runtime._acquire_conversation_session = fake_acquire_conversation_session  # type: ignore[method-assign]
+    runtime._run_workflow_turn_filtered = fake_turn  # type: ignore[method-assign]
+    runtime._read_workflow_state = fake_read_state  # type: ignore[method-assign]
+    runtime._is_plan_pending_approval = fake_plan_pending  # type: ignore[method-assign]
+
+    run = await runtime._create_run("new_query", query="Compare two therapies")
+    await runtime._run_new_query(run.run_id, "Compare two therapies")
+
+    payload = await runtime.get_run(run.run_id)
+    task = runtime.store.get_task(payload["task_id"])
+    assert calls == 2
+    assert payload["status"] == "awaiting_hitl"
+    assert task["status"] == "in_progress"
+    assert not task.get("is_direct_response", False)
+    assert len(task["steps"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_feedback_task_retries_planner_parse_error_and_preserves_checkpoint(runtime):
+    task = ui_server._make_task(
+        "task_feedback_retry",
+        "Compare therapies",
+        "conv_feedback_retry",
+        title="Compare therapies",
+        user_query="Compare therapies",
+    )
+    task["status"] = "in_progress"
+    task["awaiting_hitl"] = True
+    task["steps"] = [{"id": "S1", "title": "Old step", "status": "pending"}]
+    runtime.store.save_task(task)
+
+    calls = 0
+    restore_calls = []
+    old_workflow = {
+        "objective": "Compare therapies",
+        "plan_status": "ready",
+        "steps": [{"id": "S1", "goal": "Old step", "status": "pending"}],
+    }
+    new_workflow = {
+        "objective": "Compare therapies",
+        "plan_status": "ready",
+        "steps": [{
+            "id": "S1",
+            "goal": "Revised step",
+            "status": "pending",
+            "tool_hint": "search_pubmed",
+            "completion_condition": "Evidence retrieved",
+        }],
+    }
+
+    async def fake_acquire_conversation_session(conversation_id: str):
+        return SimpleNamespace(app_name="test-app", session_id=conversation_id)
+
+    async def fake_read_persistable(conversation_id: str):
+        return {
+            ui_server.STATE_WORKFLOW_TASK: old_workflow,
+            ui_server.STATE_PLAN_PENDING_APPROVAL: True,
+        }
+
+    async def fake_restore(conversation_id: str, snapshot: dict | None):
+        restore_calls.append(snapshot)
+
+    async def fake_turn(conversation_id: str, prompt: str, *, run_id: str):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "## Planner Parse Error\n\nEmpty model output.", "research_workflow"
+        return "## Revised Research Plan", "research_workflow"
+
+    async def fake_read_state(conversation_id: str):
+        return None if calls < 2 else new_workflow
+
+    async def fake_plan_pending(conversation_id: str) -> bool:
+        return calls >= 2
+
+    runtime._acquire_conversation_session = fake_acquire_conversation_session  # type: ignore[method-assign]
+    runtime._read_persistable_session_state = fake_read_persistable  # type: ignore[method-assign]
+    runtime._restore_persistable_session_state = fake_restore  # type: ignore[method-assign]
+    runtime._run_workflow_turn_filtered = fake_turn  # type: ignore[method-assign]
+    runtime._read_workflow_state = fake_read_state  # type: ignore[method-assign]
+    runtime._is_plan_pending_approval = fake_plan_pending  # type: ignore[method-assign]
+
+    run = await runtime._create_run("feedback_task", task_id=task["task_id"])
+    await runtime._run_feedback_task(run.run_id, task["task_id"], "Use a shorter plan")
+
+    payload = await runtime.get_run(run.run_id)
+    saved = runtime.store.get_task(task["task_id"])
+    assert calls == 2
+    assert len(restore_calls) == 1
+    assert payload["status"] == "awaiting_hitl"
+    assert saved["awaiting_hitl"] is True
+    assert saved["steps"][0]["title"] == "Revised step"
 
 
 @pytest.mark.asyncio

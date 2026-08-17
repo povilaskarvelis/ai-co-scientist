@@ -9,6 +9,21 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
+import {
+  filterChEMBLTargetEntries,
+  formatChEMBLActivitySummary,
+  selectHumanChEMBLTargetIds,
+} from "./chembl_helpers.js";
+import {
+  filterNEMARByModalities,
+  normalizeNEMARDatasetRecord,
+  normalizeNEMARSearchPayload,
+} from "./archive_helpers.js";
+import { normalizeAllianceGeneSummaryPayload } from "./alliance_helpers.js";
+import {
+  getHpoSearchQueryVariants,
+  rankHpoSearchDocs,
+} from "./hpo_helpers.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -83,6 +98,8 @@ const GITHUB_API = "https://api.github.com";
 const CONP_GITHUB_ORG = "conpdatasets";
 const NEMAR_GITHUB_ORG = "nemarDatasets";
 const DBSNP_WEB_BASE = "https://www.ncbi.nlm.nih.gov/snp";
+const NEMAR_CATALOG_API = "https://api.nemar.org";
+const NEMAR_DATA_API = "https://data.nemar.org";
 const NEMAR_DATAEXPLORER_API = "https://nemar.org/dataexplorer";
 const NEMAR_DATAEXPLORER_VIEW_API = `${NEMAR_DATAEXPLORER_API}/viewapi`;
 const BRAINCODE_CONP_QUERY = "braincode";
@@ -2474,6 +2491,7 @@ function normalizeMyGeneIds(hit) {
     ensemblGenes: dedupeArray(ensemblGenes),
     swissProtIds: dedupeArray(swissProtIds.map((value) => normalizeWhitespace(value)).filter(Boolean)),
     tremblIds: dedupeArray(tremblIds.map((value) => normalizeWhitespace(value)).filter(Boolean)),
+    hgnc: normalizeWhitespace(hit?.HGNC || "").replace(/^HGNC:/i, ""),
   };
 }
 
@@ -2492,7 +2510,7 @@ async function resolveGeneWithMyGene(query, species = "human") {
   const data = await queryMyGene(query, {
     species,
     size: 8,
-    fields: "symbol,name,alias,entrezgene,ensembl.gene,uniprot.Swiss-Prot,uniprot.TrEMBL,taxid",
+    fields: "symbol,name,alias,entrezgene,ensembl.gene,uniprot.Swiss-Prot,uniprot.TrEMBL,taxid,HGNC",
   });
   const hits = Array.isArray(data?.hits) ? data.hits : [];
   return {
@@ -5314,14 +5332,15 @@ async function resolveAllianceGeneSelection(query, species = "human") {
   const directRecord = normalizedQuery.includes(":")
     ? await fetchAllianceGeneRecordById(normalizedQuery)
     : null;
-  if (directRecord?.data?.id) {
+  const normalizedDirectRecord = normalizeAllianceGeneSummaryPayload(directRecord?.data || {});
+  if (normalizedDirectRecord.id) {
     return {
       selected: {
-        id: normalizeWhitespace(directRecord.data.id || normalizedQuery),
-        symbol: normalizeWhitespace(directRecord.data.symbol || ""),
-        species: normalizeWhitespace(directRecord.data?.species?.name || ""),
+        id: normalizedDirectRecord.id,
+        symbol: normalizedDirectRecord.symbol,
+        species: normalizedDirectRecord.species.name,
       },
-      geneRecord: directRecord.data,
+      geneRecord: normalizedDirectRecord,
       searchUrl: "",
       candidates: [],
       targetTaxon,
@@ -5329,12 +5348,33 @@ async function resolveAllianceGeneSelection(query, species = "human") {
   }
 
   let resolvedSymbol = "";
+  let resolvedHgnc = "";
   if (!normalizedQuery.includes(":") && targetTaxon === "NCBITaxon:9606") {
     try {
       const resolved = await resolveGeneWithMyGene(normalizedQuery, "human");
-      resolvedSymbol = normalizeMyGeneIds(resolved?.bestHit || {}).symbol || "";
+      const resolvedIds = normalizeMyGeneIds(resolved?.bestHit || {});
+      resolvedSymbol = resolvedIds.symbol || "";
+      resolvedHgnc = resolvedIds.hgnc || "";
     } catch {
       // Continue with AGR search if MyGene resolution fails.
+    }
+  }
+
+  if (resolvedHgnc) {
+    const directHgncRecord = await fetchAllianceGeneRecordById(`HGNC:${resolvedHgnc}`);
+    const normalizedHgncRecord = normalizeAllianceGeneSummaryPayload(directHgncRecord?.data || {});
+    if (normalizedHgncRecord.id) {
+      return {
+        selected: {
+          id: normalizedHgncRecord.id,
+          symbol: normalizedHgncRecord.symbol,
+          species: normalizedHgncRecord.species.name,
+        },
+        geneRecord: normalizedHgncRecord,
+        searchUrl: directHgncRecord?.url || "",
+        candidates: [],
+        targetTaxon,
+      };
     }
   }
 
@@ -5381,7 +5421,7 @@ async function resolveAllianceGeneSelection(query, species = "human") {
   const geneRecord = await fetchAllianceGeneRecordById(selected.id);
   return {
     selected,
-    geneRecord: geneRecord?.data || null,
+    geneRecord: normalizeAllianceGeneSummaryPayload(geneRecord?.data || {}),
     searchUrl,
     candidates: dedupedCandidates.slice(0, 5),
     targetTaxon,
@@ -12373,8 +12413,13 @@ server.registerTool(
     }
 
     try {
-      const search = await searchOlsTerms(normalizedQuery, { ontology: "hp", exact, rows: boundedLimit });
-      const docs = (search?.docs || []).slice(0, boundedLimit);
+      const queryVariants = getHpoSearchQueryVariants(normalizedQuery);
+      const searches = await Promise.all(
+        queryVariants.map((queryVariant) => (
+          searchOlsTerms(queryVariant, { ontology: "hp", exact, rows: boundedLimit })
+        ))
+      );
+      const docs = rankHpoSearchDocs(searches, normalizedQuery).slice(0, boundedLimit);
       if (docs.length === 0) {
         return {
           content: [{
@@ -12382,7 +12427,7 @@ server.registerTool(
             text: renderStructuredResponse({
               summary: `No HPO terms matched "${normalizedQuery}".`,
               keyFields: [`Exact match: ${exact ? "yes" : "no"}`],
-              sources: [search?.url || `${OLS_API}/search?ontology=hp&q=${encodeURIComponent(normalizedQuery)}`],
+              sources: searches.map((search) => search?.url).filter(Boolean),
               limitations: ["Try a broader phenotype phrase or search without exact matching."],
             }),
           }],
@@ -12401,7 +12446,7 @@ server.registerTool(
       });
 
       const sources = [
-        search.url,
+        ...searches.map((search) => search?.url).filter(Boolean),
         ...docs
           .map((doc) => normalizeOntologyCurie(doc?.obo_id || ""))
           .filter(Boolean)
@@ -13858,10 +13903,8 @@ server.registerTool(
       }
 
       const resolvedId = normalizeWhitespace(gene?.id || selected?.id || "");
-      const [experimentDiseaseSummary, orthologyDiseaseSummary, phenotypeSummary, orthologPayload, modelPayload] = await Promise.all([
-        fetchAllianceJson(`/gene/${encodeURIComponent(resolvedId)}/disease-summary`, new URLSearchParams({ type: "experiment" }), { retries: 1, timeoutMs: 15000 }).catch(() => ({ url: "", data: {} })),
-        fetchAllianceJson(`/gene/${encodeURIComponent(resolvedId)}/disease-summary`, new URLSearchParams({ type: "orthology" }), { retries: 1, timeoutMs: 15000 }).catch(() => ({ url: "", data: {} })),
-        fetchAllianceJson(`/gene/${encodeURIComponent(resolvedId)}/phenotype-summary`, new URLSearchParams(), { retries: 1, timeoutMs: 15000 }).catch(() => ({ url: "", data: {} })),
+      const [phenotypePayload, orthologPayload, modelPayload] = await Promise.all([
+        fetchAllianceJson(`/gene/${encodeURIComponent(resolvedId)}/phenotypes`, new URLSearchParams({ limit: "1" }), { retries: 1, timeoutMs: 15000 }).catch(() => ({ url: "", data: {} })),
         fetchAllianceJson(`/gene/${encodeURIComponent(resolvedId)}/orthologs`, new URLSearchParams({ limit: "50" }), { retries: 1, timeoutMs: 20000 }).catch(() => ({ url: "", data: {} })),
         fetchAllianceJson(`/gene/${encodeURIComponent(resolvedId)}/models`, new URLSearchParams({ limit: String(Math.max(20, boundedModelLimit * 4)) }), { retries: 1, timeoutMs: 20000 }).catch(() => ({ url: "", data: {} })),
       ]);
@@ -13881,14 +13924,11 @@ server.registerTool(
         synopsis ? `Synopsis: ${compactErrorMessage(synopsis, 360)}` : "",
         secondaryIds.length > 0 ? `Secondary IDs: ${secondaryIds.join(", ")}` : "",
         synonyms.length > 0 ? `Synonyms: ${synonyms.join(", ")}` : "",
-        Number.isFinite(Number(experimentDiseaseSummary?.data?.numberOfEntities))
-          ? `Direct disease evidence: ${toNonNegativeInt(experimentDiseaseSummary.data.numberOfAnnotations)} annotation(s) across ${toNonNegativeInt(experimentDiseaseSummary.data.numberOfEntities)} disease entity(ies)`
+        Number.isFinite(Number(modelPayload?.data?.total))
+          ? `Disease-model evidence: ${toNonNegativeInt(modelPayload.data.total)} model annotation(s) reported`
           : "",
-        Number.isFinite(Number(orthologyDiseaseSummary?.data?.numberOfEntities))
-          ? `Orthology-transferred disease evidence: ${toNonNegativeInt(orthologyDiseaseSummary.data.numberOfAnnotations)} annotation(s) across ${toNonNegativeInt(orthologyDiseaseSummary.data.numberOfEntities)} disease entity(ies)`
-          : "",
-        Number.isFinite(Number(phenotypeSummary?.data?.numberOfEntities))
-          ? `Phenotype evidence: ${toNonNegativeInt(phenotypeSummary.data.numberOfAnnotations)} annotation(s) across ${toNonNegativeInt(phenotypeSummary.data.numberOfEntities)} phenotype entity(ies)`
+        Number.isFinite(Number(phenotypePayload?.data?.total))
+          ? `Phenotype evidence: ${toNonNegativeInt(phenotypePayload.data.total)} annotation(s) reported`
           : "",
       ].filter(Boolean);
 
@@ -13921,9 +13961,7 @@ server.registerTool(
       const sources = [
         resolution?.searchUrl || "",
         buildAllianceApiUrl(`/gene/${encodeURIComponent(resolvedId)}`),
-        experimentDiseaseSummary?.url || "",
-        orthologyDiseaseSummary?.url || "",
-        phenotypeSummary?.url || "",
+        phenotypePayload?.url || "",
         orthologPayload?.url || "",
         modelPayload?.url || "",
         `https://www.alliancegenome.org/gene/${encodeURIComponent(resolvedId)}`,
@@ -20354,21 +20392,31 @@ server.registerTool(
     const byTarget = {};
     for (const a of activities) {
       const tgt = a.target_pref_name || "Unknown";
+      const targetChemblId = a.target_chembl_id || "";
       const stype = a.standard_type || "?";
       const val = parseFloat(a.standard_value);
       const units = a.standard_units || "nM";
       if (isNaN(val)) continue;
 
-      const key = `${tgt} | ${stype}`;
-      if (!byTarget[key]) byTarget[key] = { target: tgt, type: stype, units, values: [] };
+      const key = `${targetChemblId || tgt} | ${stype}`;
+      if (!byTarget[key]) {
+        byTarget[key] = { target: tgt, targetChemblId, type: stype, units, values: [] };
+      }
       byTarget[key].values.push(val);
     }
 
     let entries = Object.values(byTarget);
+    let resolvedTargetIds = [];
 
     if (targetFilter) {
-      const filter = targetFilter.toLowerCase();
-      entries = entries.filter((e) => e.target.toLowerCase().includes(filter));
+      try {
+        const targetSearch = await fetchJsonWithRetry(
+          `${CHEMBL_API}/target/search.json?q=${encodeURIComponent(targetFilter)}&limit=20`,
+          { retries: 1, timeoutMs: 10000 }
+        );
+        resolvedTargetIds = selectHumanChEMBLTargetIds(targetSearch?.targets || []);
+      } catch (_) { /* retain target-name substring fallback */ }
+      entries = filterChEMBLTargetEntries(entries, targetFilter, resolvedTargetIds);
     }
 
     entries.sort((a, b) => Math.min(...a.values) - Math.min(...b.values));
@@ -20387,12 +20435,18 @@ server.registerTool(
         (e.values.length > 1 ? `  median=${med.toFixed(1)}` : "");
     });
 
+    const uniqueTargetCount = new Set(
+      entries.map((entry) => entry.targetChemblId || entry.target).filter(Boolean)
+    ).size;
     const keyFields = [
       `Drug: ${chemblId}`,
       `Activity types: ${types}`,
       `Total data points: ${activities.length}`,
-      `Unique targets: ${entries.length}${targetFilter ? ` (filtered by "${targetFilter}")` : ""}`,
+      `Unique targets: ${uniqueTargetCount}${targetFilter ? ` (filtered by "${targetFilter}")` : ""}`,
     ];
+    if (targetFilter && resolvedTargetIds.length > 0) {
+      keyFields.push(`Resolved ChEMBL target IDs: ${resolvedTargetIds.join(", ")}`);
+    }
 
     if (lines.length > 0) {
       keyFields.push(`\nBioactivity by target (sorted by potency):`);
@@ -20403,8 +20457,12 @@ server.registerTool(
       content: [{
         type: "text",
         text: renderStructuredResponse({
-          summary: `ChEMBL: ${activities.length} bioactivity records for ${chemblId} across ${entries.length} targets. ` +
-            `Most potent: ${entries[0]?.target} (${entries[0]?.type} min ${Math.min(...(entries[0]?.values || [0])).toFixed(1)} ${entries[0]?.units || "nM"}).`,
+          summary: formatChEMBLActivitySummary({
+            activityCount: activities.length,
+            chemblId,
+            entries,
+            targetFilter,
+          }),
           keyFields,
           sources: [`https://www.ebi.ac.uk/chembl/compound_report_card/${chemblId}/`],
           limitations: [
@@ -21910,6 +21968,19 @@ function normalizeNEMARPathPrefix(value) {
 }
 
 function parseNEMARFileTree(html) {
+  try {
+    const directory = JSON.parse(String(html || ""));
+    if (Array.isArray(directory?.children)) {
+      return directory.children.map((entry) => ({
+        kind: entry?.kind,
+        name: entry?.name,
+        size: entry?.size,
+        downloadUrl: entry?.url || "",
+      }));
+    }
+  } catch (_) {
+    // Fall through to the legacy embedded-tree parser.
+  }
   const payload = extractInlineJsonArrayAfterMarker(html, "$('#tree').treeview({data:");
   if (!payload) return [];
   try {
@@ -21921,6 +21992,7 @@ function parseNEMARFileTree(html) {
 }
 
 function cleanNEMARTreeNodeLabel(text) {
+  if (text && typeof text === "object" && text.name) return normalizeWhitespace(text.name);
   const rawText = String(text || "").replace(/<a\b[\s\S]*$/i, "");
   return normalizeWhitespace(stripHtmlToText(rawText));
 }
@@ -21941,16 +22013,17 @@ function getNEMARTreeChildren(nodes, pathPrefix) {
 function summarizeNEMARTreeEntries(nodes, parentPath = "") {
   const items = Array.isArray(nodes) ? nodes : [];
   return items.map((node) => {
-    const name = cleanNEMARTreeNodeLabel(node?.text);
+    const name = normalizeWhitespace(node?.name || cleanNEMARTreeNodeLabel(node?.text));
     const childNodes = Array.isArray(node?.nodes) ? node.nodes : [];
-    const isDirectory = childNodes.length > 0;
+    const isDirectory = node?.kind === "dir" || childNodes.length > 0;
     const path = parentPath ? `${parentPath}/${name}` : name;
     return {
       name,
       path,
       type: isDirectory ? "directory" : "file",
       childCount: isDirectory ? childNodes.length : null,
-      downloadUrl: isDirectory ? "" : extractNEMARDownloadUrl(node?.text),
+      size: Number.isFinite(Number(node?.size)) ? Number(node.size) : null,
+      downloadUrl: isDirectory ? "" : normalizeWhitespace(node?.downloadUrl || extractNEMARDownloadUrl(node?.text)),
     };
   }).filter((item) => item.name);
 }
@@ -21970,13 +22043,16 @@ server.registerTool(
     const limit = Math.min(Math.max(1, maxResults || 20), 50);
     const mode = String(sortBy || "updated").toLowerCase();
     const { rawQuery, keyword, modalities, modalityParam } = parseNEMARQuery(query || "");
-    const params = new URLSearchParams({ file_format: "all" });
-    if (keyword) params.set("search", keyword);
-    if (modalityParam) params.set("modality", modalityParam);
+    const params = keyword
+      ? new URLSearchParams({ q: keyword, limit: String(Math.max(limit, 100)) })
+      : new URLSearchParams({ limit: String(Math.max(limit, 100)), offset: "0" });
+    if (!keyword && modalities.length === 1) params.set("modality", modalities[0]);
+    const endpoint = keyword ? "datasets/search" : "datasets";
+    const searchUrl = `${NEMAR_CATALOG_API}/${endpoint}?${params.toString()}`;
 
     let data;
     try {
-      data = await fetchJsonWithRetry(`${NEMAR_DATAEXPLORER_VIEW_API}?${params.toString()}`, {
+      data = await fetchJsonWithRetry(searchUrl, {
         retries: 1,
         timeoutMs: 15000,
         headers: { Accept: "application/json", "User-Agent": "research-mcp" },
@@ -21998,12 +22074,13 @@ server.registerTool(
       };
     }
 
-    const rawItems = Array.isArray(data) ? data : [];
-    const total = rawItems.length;
-    const items = sortNEMARDatasets(rawItems, mode === "stars" ? "updated" : mode).slice(0, limit);
+    const normalized = normalizeNEMARSearchPayload(data);
+    const modalityFiltered = filterNEMARByModalities(normalized.items, modalities);
+    const total = modalityFiltered.length;
+    const items = sortNEMARDatasets(modalityFiltered, mode === "stars" ? "updated" : mode).slice(0, limit);
     const limitations = [
-      "NEMAR results are sourced from the public Data Explorer, which may rank matches using hidden metadata not visible in the summary card.",
-      "Use get_nemar_dataset_details for structured detail follow-up and list_nemar_files to browse the current public file tree for a known dataset id.",
+      `NEMAR results are sourced from the public catalog API (${normalized.method || "browse"} mode).`,
+      "Use get_nemar_dataset_details for structured detail follow-up and list_nemar_files to browse a published version for a known dataset id.",
     ];
     if (mode === "stars") {
       limitations.push("NEMAR's public explorer does not expose GitHub stars; results were ordered by recency instead.");
@@ -22035,7 +22112,9 @@ server.registerTool(
       const ageRange = parseNEMARAgeRange(dataset);
       const formats = normalizeWhitespace(dataset?.file_formats || "unknown");
       const publishedAt = String(dataset?.publishDate || dataset?.latestSnapshot_created || dataset?.created || "unknown").slice(0, 10);
-      return `  ${String(idx + 1).padStart(3)}. ${datasetId} — ${titlePreview} | modality: ${modalityText} | participants: ${participants} | ages: ${ageRange} | formats: ${formats} | published: ${publishedAt}`;
+      const doi = normalizeWhitespace(dataset?.doi || dataset?.concept_doi || "");
+      const hed = dataset?.hasHED ? "yes" : "unknown";
+      return `  ${String(idx + 1).padStart(3)}. ${datasetId} — ${titlePreview} | modality: ${modalityText} | participants: ${participants} | ages: ${ageRange} | formats: ${formats} | HED: ${hed} | published: ${publishedAt}${doi ? ` | DOI: ${doi}` : ""}`;
     });
 
     return {
@@ -22052,8 +22131,9 @@ server.registerTool(
             ...lines,
           ],
           sources: [
+            searchUrl,
             "https://nemar.org/discover",
-            "https://nemar.org/dataexplorer",
+            "https://api.nemar.org/",
           ],
           limitations,
         }),
@@ -22083,8 +22163,8 @@ server.registerTool(
     }
 
     if (/^(?:ds|nm|on)\d+$/i.test(repoName)) {
-      const detailUrl = `${NEMAR_DATAEXPLORER_API}/detail?dataset_id=${encodeURIComponent(repoName)}`;
-      const summaryUrl = `${NEMAR_DATAEXPLORER_VIEW_API}?${new URLSearchParams({ file_format: "all", search: repoName }).toString()}`;
+      const detailUrl = `${NEMAR_CATALOG_API}/datasets/${encodeURIComponent(repoName)}`;
+      const summaryUrl = detailUrl;
       let summaryRow = null;
       let parsed = null;
 
@@ -22094,15 +22174,16 @@ server.registerTool(
           timeoutMs: 15000,
           headers: { Accept: "application/json", "User-Agent": "research-mcp" },
         });
-        const loweredRepoName = repoName.toLowerCase();
-        const items = Array.isArray(summaryData) ? summaryData : [];
-        summaryRow = items.find((item) => String(item?.id || "").toLowerCase() === loweredRepoName) || null;
+        const rawSummary = summaryData?.dataset || summaryData;
+        summaryRow = rawSummary && typeof rawSummary === "object"
+          ? normalizeNEMARDatasetRecord(rawSummary)
+          : null;
       } catch (_) {
         // Structured NEMAR summary is best-effort only.
       }
 
       try {
-        const detailResponse = await fetchWithRetry(detailUrl, {
+        const detailResponse = await fetchWithRetry(`https://nemar.org/dataset/${encodeURIComponent(repoName)}`, {
           retries: 1,
           timeoutMs: 15000,
           headers: {
@@ -22117,7 +22198,7 @@ server.registerTool(
       }
 
       if (summaryRow || parsed) {
-        const title = parsed?.title || normalizeWhitespace(summaryRow?.description_name || summaryRow?.name || repoName);
+        const title = normalizeWhitespace(summaryRow?.description_name || summaryRow?.name || parsed?.title || repoName);
         const modalities = normalizeWhitespace(
           parsed?.modalities || summaryRow?.modalities || [summaryRow?.primaryModality, summaryRow?.secondaryModalities].filter(Boolean).join(", ")
         );
@@ -22131,7 +22212,7 @@ server.registerTool(
         const archiveSize = normalizeWhitespace(
           summaryRow?.byte_size_format || (Number.isFinite(Number(summaryRow?.file_size)) ? formatDataSize(Number(summaryRow.file_size)) : "")
         );
-        const formats = normalizeWhitespace(parsed?.formats || summaryRow?.file_formats || "");
+        const formats = normalizeWhitespace(parsed?.formats || summaryRow?.file_formats || (summaryRow?.bids_version ? "BIDS" : ""));
         const latestSnapshot = normalizeWhitespace(summaryRow?.latestSnapshot || "");
         const bidsVersion = normalizeWhitespace(parsed?.bidsVersion || summaryRow?.BIDSVersion || "");
         const hedVersion = normalizeWhitespace(summaryRow?.HEDVersion || "");
@@ -22167,7 +22248,14 @@ server.registerTool(
         if (uploadedBy) keyFields.push(`Uploader: ${uploadedBy}`);
         if (parsed?.eventFiles) keyFields.push(`Event files: ${parsed.eventFiles}`);
         if (parsed?.hedAnnotation) keyFields.push(`HED annotation: ${parsed.hedAnnotation}`);
-        if (parsed?.tasks) keyFields.push(`Tasks: ${parsed.tasks}`);
+        if (summaryRow?.hasHED) keyFields.push("HED annotation: present");
+        if (parsed?.tasks || summaryRow?.tasks) keyFields.push(`Tasks: ${parsed?.tasks || summaryRow.tasks}`);
+        if (summaryRow?.description) {
+          const description = normalizeWhitespace(summaryRow.description);
+          keyFields.push(`Description: ${description.length > 900 ? `${description.slice(0, 897)}...` : description}`);
+        }
+        if (summaryRow?.license) keyFields.push(`License: ${summaryRow.license}`);
+        if (summaryRow?.doi || summaryRow?.concept_doi) keyFields.push(`DOI: ${summaryRow.doi || summaryRow.concept_doi}`);
         if (bidsVersion) keyFields.push(`BIDS version: ${bidsVersion}`);
         if (hedVersion) keyFields.push(`HED version: ${hedVersion}`);
         if (publishedDate) keyFields.push(`Published: ${publishedDate}`);
@@ -22185,14 +22273,15 @@ ${parsed.readmePreview}`);
               keyFields,
               sources: Array.from(new Set([
                 summaryUrl,
-                detailUrl,
+                `https://nemar.org/dataset/${encodeURIComponent(repoName)}`,
+                `${NEMAR_DATA_API}/${encodeURIComponent(repoName)}/`,
                 ...(Array.isArray(parsed?.sources) ? parsed.sources : []),
               ].filter(Boolean))),
               limitations: [
                 summaryRow && parsed
-                  ? "Combined structured metadata from NEMAR's public Data Explorer with HTML detail-page and README fields when available."
+                  ? "Combined structured metadata from NEMAR's public catalog API with HTML detail-page fields when available."
                   : summaryRow
-                    ? "README-level task and anatomy details were unavailable from the public detail page at lookup time, so this response uses structured Data Explorer metadata only."
+                    ? "README-level task and anatomy details were unavailable from the public detail page at lookup time, so this response uses structured catalog metadata only."
                     : "Structured Data Explorer summary metadata was unavailable, so this response relies on the public HTML detail page and README rendering.",
                 "Some anatomy or electrode-localization details may only be fully available in sidecar files or accompanying publications.",
               ],
@@ -22295,8 +22384,10 @@ server.registerTool(
     }
     const normalizedPrefix = normalizeNEMARPathPrefix(pathPrefix || "");
     const limit = Math.min(Math.max(1, Math.round(maxResults || 100)), 300);
-    const detailUrl = `${NEMAR_DATAEXPLORER_API}/detail?dataset_id=${encodeURIComponent(normalizedId)}`;
-    const summaryUrl = `${NEMAR_DATAEXPLORER_VIEW_API}?${new URLSearchParams({ file_format: "all", search: normalizedId }).toString()}`;
+    const summaryUrl = `${NEMAR_CATALOG_API}/datasets/${encodeURIComponent(normalizedId)}`;
+    const landingUrl = `${NEMAR_DATA_API}/${encodeURIComponent(normalizedId)}/`;
+    let detailUrl = landingUrl;
+    let latestVersion = "";
 
     let summaryRow = null;
     try {
@@ -22305,11 +22396,41 @@ server.registerTool(
         timeoutMs: 15000,
         headers: { Accept: "application/json", "User-Agent": "research-mcp" },
       });
-      const items = Array.isArray(summaryData) ? summaryData : [];
-      summaryRow = items.find((item) => String(item?.id || "").toLowerCase() === normalizedId.toLowerCase()) || null;
+      const rawSummary = summaryData?.dataset || summaryData;
+      summaryRow = rawSummary && typeof rawSummary === "object"
+        ? normalizeNEMARDatasetRecord(rawSummary)
+        : null;
     } catch (_) {
       // Summary metadata is best-effort only.
     }
+
+    try {
+      const landing = await fetchJsonWithRetry(landingUrl, {
+        retries: 1,
+        timeoutMs: 15000,
+        headers: { Accept: "application/json", "User-Agent": "research-mcp" },
+      });
+      latestVersion = normalizeWhitespace(landing?.latest || summaryRow?.latestSnapshot || "");
+    } catch (_) {
+      latestVersion = normalizeWhitespace(summaryRow?.latestSnapshot || "");
+    }
+    if (!latestVersion) {
+      return {
+        content: [{
+          type: "text",
+          text: renderStructuredResponse({
+            summary: `NEMAR has no published file version available for ${normalizedId}.`,
+            keyFields: [`Dataset ID: ${normalizedId}`],
+            sources: [summaryUrl, landingUrl],
+            limitations: ["The dataset may still be a draft or its public data snapshot may not be ready."],
+          }),
+        }],
+      };
+    }
+    const encodedPrefix = normalizedPrefix
+      ? `${normalizedPrefix.split("/").map((part) => encodeURIComponent(part)).join("/")}/`
+      : "";
+    detailUrl = `${NEMAR_DATA_API}/${encodeURIComponent(normalizedId)}/${encodeURIComponent(latestVersion)}/${encodedPrefix}?format=json`;
 
     let html = "";
     try {
@@ -22332,8 +22453,8 @@ server.registerTool(
               `Dataset ID: ${normalizedId}`,
               normalizedPrefix ? `Path prefix: ${normalizedPrefix}` : "Path prefix: /",
             ],
-            sources: [detailUrl, summaryUrl],
-            limitations: ["File listings depend on the public NEMAR detail page embedding its tree view data."],
+            sources: [detailUrl, summaryUrl, landingUrl],
+            limitations: ["File listings depend on the published NEMAR data snapshot."],
           }),
         }],
       };
@@ -22360,7 +22481,7 @@ server.registerTool(
       };
     }
 
-    const childNodes = getNEMARTreeChildren(tree, normalizedPrefix);
+    const childNodes = tree;
     if (childNodes === null) {
       return {
         content: [{
@@ -22380,9 +22501,9 @@ server.registerTool(
 
     const entries = summarizeNEMARTreeEntries(childNodes, normalizedPrefix);
     const shown = entries.slice(0, limit);
-    const zipDownloadUrl = extractNEMARZipDownloadUrl(html);
+    const zipDownloadUrl = `${NEMAR_DATA_API}/${encodeURIComponent(normalizedId)}/${encodeURIComponent(latestVersion)}.zip`;
     const title = normalizeWhitespace(summaryRow?.description_name || summaryRow?.name || normalizedId);
-    const latestSnapshot = normalizeWhitespace(summaryRow?.latestSnapshot || "");
+    const latestSnapshot = latestVersion;
     const publishedDate = normalizeWhitespace(summaryRow?.publishDate || summaryRow?.latestSnapshot_created || "");
     const totalFiles = Number.isFinite(Number(summaryRow?.totalFiles)) ? Number(summaryRow.totalFiles) : null;
     const archiveSize = normalizeWhitespace(
@@ -22416,7 +22537,8 @@ server.registerTool(
       if (entry.type === "directory") {
         return `  ${String(index + 1).padStart(3)}. [dir] ${entry.path}${entry.childCount !== null ? ` | children: ${entry.childCount}` : ""}`;
       }
-      return `  ${String(index + 1).padStart(3)}. [file] ${entry.path}${entry.downloadUrl ? ` | download: ${entry.downloadUrl}` : ""}`;
+      const directUrl = entry.downloadUrl || `${NEMAR_DATA_API}/${encodeURIComponent(normalizedId)}/${encodeURIComponent(latestVersion)}/${entry.path.split("/").map((part) => encodeURIComponent(part)).join("/")}`;
+      return `  ${String(index + 1).padStart(3)}. [file] ${entry.path}${entry.size !== null ? ` | size: ${formatDataSize(entry.size)}` : ""} | download: ${directUrl}`;
     });
 
     return {
@@ -22440,7 +22562,7 @@ server.registerTool(
           ],
           sources: [detailUrl, summaryUrl, zipDownloadUrl].filter(Boolean),
           limitations: [
-            "This tool reads the current public NEMAR file tree embedded in the detail page rather than a separate historical snapshot API.",
+            "This tool reads one published NEMAR version through data.nemar.org; use the reported version when reproducing downloads.",
             "Directory browsing is prefix-based and exact; use a returned directory path as the next pathPrefix value to go deeper.",
           ],
         }),
@@ -23068,7 +23190,14 @@ server.registerTool(
 // OpenNeuro neuroimaging dataset tools
 // ---------------------------------------------------------------------------
 
-const OPENNEURO_MODALITIES = new Set(["MRI", "MEG", "EEG", "PET", "iEEG", "behavioral"]);
+const OPENNEURO_MODALITIES = new Map([
+  ["MRI", "mri"],
+  ["MEG", "meg"],
+  ["EEG", "eeg"],
+  ["PET", "pet"],
+  ["IEEG", "ieeg"],
+  ["BEHAVIORAL", "behavioral"],
+]);
 
 server.registerTool(
   "search_openneuro_datasets",
@@ -23087,42 +23216,20 @@ server.registerTool(
     const rawKeyword = normalizeWhitespace(query || "");
     const searchTerms = splitArchiveSearchTerms(rawKeyword);
     const afterCursor = normalizeWhitespace(after || "");
-    const modArg = modality && OPENNEURO_MODALITIES.has(String(modality).trim().toUpperCase())
-      ? String(modality).trim().toUpperCase()
+    const modArg = modality
+      ? OPENNEURO_MODALITIES.get(String(modality).trim().toUpperCase()) || null
       : null;
-    const modalityToken = modArg ? modArg.toLowerCase() : null;
-    const queryDsl = { match_all: {} };
-    if (rawKeyword || modalityToken) {
-      queryDsl.match_all = undefined;
-      queryDsl.bool = {};
-      if (rawKeyword) {
-        queryDsl.bool.must = [{
-          query_string: {
-            query: rawKeyword,
-          },
-        }];
-      }
-      if (modalityToken) {
-        queryDsl.bool.filter = [{
-          bool: {
-            should: [
-              { term: { "metadata.modalities": modalityToken } },
-              { term: { "latestSnapshot.summary.modalities": modalityToken } },
-            ],
-            minimum_should_match: 1,
-          },
-        }];
-      }
-    }
+    const queryDsl = { publicOnly: true };
+    if (rawKeyword) queryDsl.keywords = searchTerms.length > 0 ? searchTerms : [rawKeyword];
+    if (modArg) queryDsl.modality = modArg;
 
     const advancedSearchQuery = `
       query OpenNeuroAdvancedSearch(
-        $query: JSON!
+        $query: DatasetSearchInput!
         $cursor: String
         $allDatasets: Boolean
         $datasetType: String
         $datasetStatus: String
-        $sortBy: JSON
         $first: Int!
       ) {
         datasets: advancedSearch(
@@ -23130,7 +23237,6 @@ server.registerTool(
           allDatasets: $allDatasets
           datasetType: $datasetType
           datasetStatus: $datasetStatus
-          sortBy: $sortBy
           first: $first
           after: $cursor
         ) {
@@ -23164,7 +23270,6 @@ server.registerTool(
             allDatasets: false,
             datasetType: "All Public",
             datasetStatus: "All",
-            sortBy: null,
             first: limit,
           },
         }),

@@ -35,6 +35,19 @@ def test_open_targets_archive_tool_metadata_mentions_release_specific_lookup():
     assert "specific platform release" in preferred_for
 
 
+def test_evidence_contracts_define_source_semantics_separately_from_prompts():
+    trials = tool_registry.TOOL_EVIDENCE_CONTRACTS["search_clinical_trials"]
+    mutation = tool_registry.TOOL_EVIDENCE_CONTRACTS["get_cancer_mutation_profile"]
+    archive = tool_registry.TOOL_EVIDENCE_CONTRACTS["search_openneuro_datasets"]
+
+    assert trials["evidence_kind"] == "registry search records"
+    assert any("outcomes" in item for item in trials["interpretation_limits"])
+    assert mutation["evidence_kind"] == "aggregate single-gene mutation counts"
+    assert any("denominator" in item for item in mutation["interpretation_limits"])
+    assert archive["evidence_kind"] == "archive search results"
+    assert any("archive-wide absence" in item for item in archive["interpretation_limits"])
+
+
 def test_open_targets_l2g_tool_metadata_mentions_credible_sets():
     assert "data" in tool_registry.TOOL_TO_DOMAINS["get_open_targets_l2g"]
     desc = tool_registry.TOOL_DESCRIPTIONS["get_open_targets_l2g"]
@@ -181,6 +194,33 @@ def test_depmap_expression_subset_tool_metadata_mentions_subset_means():
     assert "mean log2(tpm+1)" in desc.lower()
     preferred_for = tool_registry.TOOL_ROUTING_METADATA["get_depmap_expression_subset_mean"]["preferred_for"]
     assert "model subset" in preferred_for
+
+
+def test_cancer_mutation_profile_metadata_states_output_limits():
+    assert "genomics" in tool_registry.TOOL_TO_DOMAINS["get_cancer_mutation_profile"]
+    assert tool_registry.TOOL_SOURCE_NAMES["get_cancer_mutation_profile"] == "cBioPortal"
+    desc = tool_registry.TOOL_DESCRIPTIONS["get_cancer_mutation_profile"]
+    assert "absolute mutation counts" in desc.lower()
+    assert "co-occurring alterations" in desc.lower()
+    preferred_for = tool_registry.TOOL_ROUTING_METADATA["get_cancer_mutation_profile"]["preferred_for"]
+    assert "not cohort-normalized frequencies" in preferred_for.lower()
+
+
+def test_core_planner_tools_have_catalog_descriptions():
+    tool_names = {
+        "get_alphafold_structure",
+        "search_protein_structures",
+        "search_drug_gene_interactions",
+        "annotate_variants_vep",
+        "search_civic_variants",
+        "search_civic_genes",
+        "search_gwas_associations",
+        "get_gene_tissue_expression",
+        "get_pubchem_compound",
+    }
+
+    assert all(tool_registry.TOOL_DESCRIPTIONS.get(name) for name in tool_names)
+    assert "does not return tumor prevalence" in tool_registry.TOOL_DESCRIPTIONS["search_civic_variants"].lower()
 
 
 def test_depmap_sample_top_expression_tool_metadata_mentions_named_samples():

@@ -125,6 +125,15 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "get_ena_experiment_profile": "Get ENA experiment metadata for one ERX accession, including technique, layout, and instrument model. Prefer this for ENA questions about sequencing technique and instrument.",
     "get_emdb_entry_metadata": "Get EMDB entry metadata for one EMD accession, including vitrification cryogen / cryopreservative fields when available",
     "get_alphafold_domain_plddt": "Compute AlphaFold domain-level mean pLDDT values from UniProt feature annotations and versioned AlphaFold models, including historical archive-backed releases such as v4",
+    "get_alphafold_structure": "Look up an AlphaFold predicted protein structure by UniProt accession, including confidence scores and PDB/CIF download URLs",
+    "search_protein_structures": "Search RCSB PDB for experimentally determined structures by UniProt accession or gene name, returning PDB IDs, resolution, method, deposition date, and ligands",
+    "search_drug_gene_interactions": "Query DGIdb for approved or experimental drug-gene interactions, interaction types, evidence scores, and druggability categories",
+    "annotate_variants_vep": "Predict functional effects of a specific human variant with Ensembl VEP, including consequence, SIFT, PolyPhen, and AlphaMissense. Requires variant-level HGVS or genomic coordinates; does not accept a bare gene symbol.",
+    "search_civic_variants": "Search CIViC for clinical interpretations of a gene or named cancer variant, returning evidence levels, significance, therapies, and diseases. Does not return tumor prevalence, cohort frequencies, or sample-level co-occurring alterations.",
+    "search_civic_genes": "Get a CIViC oncology gene summary with its description, associated variant count, diseases, and therapies. Does not return tumor prevalence, cohort frequencies, or sample-level co-occurring alterations.",
+    "search_gwas_associations": "Search GWAS Catalog for trait-variant associations by disease, trait, or rsID, returning mapped genes, p-values, odds ratios, and study metadata",
+    "get_gene_tissue_expression": "Get GTEx v8 median expression for one gene across about 54 human tissues, returning median TPM values for tissue specificity and target-safety assessment",
+    "get_pubchem_compound": "Look up a PubChem compound by name, CID, or SMILES, returning identity, molecular properties, description, and synonyms",
     "search_openalex_works": "Search OpenAlex for papers, preprints, and citations (returns DOIs)",
     "search_openalex_authors": "Find researchers and their publication profiles",
     "rank_researchers_by_activity": "Rank authors by recent publication activity",
@@ -148,6 +157,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "get_depmap_expression_subset_mean": "Compute the mean log2(TPM+1) expression for one gene across a named DepMap model subset or molecular subtype from a public release using subtype codes or common lineage aliases (for example RB1Loss / RB1_LoF or colorectal / COADREAD in Expression Public 25Q3)",
     "get_depmap_sample_top_expression_gene": "Find the highest-expressed gene for one named DepMap sample / stripped cell-line name in a public expression release using OmicsProfiles plus the public expression matrix",
     "get_biogrid_orcs_gene_summary": "Summarize BioGRID ORCS published CRISPR screen evidence for a gene, including hit status, phenotypes, cell lines, and representative screens",
+    "get_cancer_mutation_profile": "Summarize mutation counts by TCGA Pan-Cancer Atlas cancer type, frequent protein changes, and mutation classes for one gene. Returns absolute mutation counts, not cohort-normalized frequencies, sample-level co-mutations, or co-occurring alterations.",
     "get_gdsc_drug_sensitivity": "Summarize GDSC / CancerRxGene compound sensitivity profiles for a named drug across cell lines and tissues using IC50/AUC pharmacogenomic screens. Requires a named compound or drug ID; not for model-first drug discovery.",
     "get_prism_repurposing_response": "Summarize Broad PRISM repurposing primary-screen response for a named compound using single-dose log2-fold-change viability across pooled cancer cell lines. Requires a named compound or BRD identifier; not for model-first drug discovery.",
     "get_pharmacodb_compound_response": "Summarize PharmacoDB cross-dataset compound-response evidence for a named compound across public pharmacogenomic screens such as GDSC, PRISM, and CTRPv2. Requires a named compound or PharmacoDB UID; not for model-first drug discovery.",
@@ -326,12 +336,12 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
     },
     "search_civic_variants": {
         "overlap_group": "variant_evidence",
-        "preferred_for": "oncology-specific clinical variant interpretations",
+        "preferred_for": "oncology-specific clinical variant interpretations and actionability, not tumor prevalence, cohort frequency, or sample-level co-mutation analysis",
         "fallback_tools": ["search_civic_genes", "get_variant_annotations", "get_clingen_gene_curation"],
     },
     "search_civic_genes": {
         "overlap_group": "variant_evidence",
-        "preferred_for": "oncology gene-level CIViC context when the exact variant is not yet known",
+        "preferred_for": "oncology gene-level clinical significance context when the exact variant is not yet known, not tumor prevalence, cohort frequency, or sample-level co-mutation analysis",
         "fallback_tools": ["search_civic_variants", "search_variants_by_gene", "get_variant_annotations"],
     },
     "search_variants_by_gene": {
@@ -413,6 +423,11 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
         "overlap_group": "target_vulnerability",
         "preferred_for": "cross-dataset compound-response context for one named compound across PharmacoDB datasets such as PRISM, GDSC, CTRPv2, and related public screens, not model-first drug discovery",
         "fallback_tools": ["get_gdsc_drug_sensitivity", "get_prism_repurposing_response", "get_guidetopharmacology_target"],
+    },
+    "get_cancer_mutation_profile": {
+        "overlap_group": "tumor_genomics",
+        "preferred_for": "absolute mutation counts by TCGA Pan-Cancer Atlas cancer type plus recurrent protein changes and mutation classes for one named gene, not cohort-normalized frequencies or sample-level co-mutation analysis",
+        "fallback_tools": ["search_civic_genes", "search_civic_variants", "search_pubmed"],
     },
     "search_hpo_terms": {
         "overlap_group": "phenotype_rare_disease",
@@ -526,7 +541,7 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
     "search_openneuro_datasets": {
         "overlap_group": "neuroscience_dataset_discovery",
         "preferred_for": "public BIDS neuroimaging discovery when modality filters, dataset metadata, and OpenNeuro dataset IDs matter",
-        "fallback_tools": ["search_nemar_datasets", "search_dandi_datasets", "search_braincode_datasets", "search_conp_datasets"],
+        "fallback_tools": [],
     },
     "list_openneuro_snapshots": {
         "overlap_group": "neuroscience_dataset_detail",
@@ -541,22 +556,22 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
     "search_nemar_datasets": {
         "overlap_group": "neuroscience_dataset_discovery",
         "preferred_for": "EEG/MEG/iEEG dataset discovery, especially BIDS electrophysiology and epilepsy-related public archive search",
-        "fallback_tools": ["search_openneuro_datasets", "search_dandi_datasets", "search_braincode_datasets", "search_conp_datasets"],
+        "fallback_tools": [],
     },
     "get_nemar_dataset_details": {
         "overlap_group": "neuroscience_dataset_detail",
         "preferred_for": "NEMAR follow-up once a dataset identifier is known and you need structured Data Explorer metadata plus README/detail-page task context",
-        "fallback_tools": ["list_nemar_files", "search_nemar_datasets", "search_openneuro_datasets", "search_dandi_datasets"],
+        "fallback_tools": ["list_nemar_files", "search_nemar_datasets"],
     },
     "list_nemar_files": {
         "overlap_group": "neuroscience_dataset_detail",
         "preferred_for": "file-level NEMAR follow-up for a known dataset when you need to browse the current public tree, inspect subdirectories, or collect direct download URLs",
-        "fallback_tools": ["get_nemar_dataset_details", "search_nemar_datasets", "list_openneuro_files"],
+        "fallback_tools": ["get_nemar_dataset_details", "search_nemar_datasets"],
     },
     "search_dandi_datasets": {
         "overlap_group": "neuroscience_dataset_discovery",
         "preferred_for": "NWB/BIDS neurophysiology discovery when the signal is more about task, assay, or neurophysiology modality than a disease label",
-        "fallback_tools": ["search_openneuro_datasets", "search_nemar_datasets", "search_braincode_datasets", "search_conp_datasets"],
+        "fallback_tools": [],
     },
     "list_dandi_versions": {
         "overlap_group": "neuroscience_dataset_detail",
@@ -571,14 +586,125 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
     "search_braincode_datasets": {
         "overlap_group": "neuroscience_dataset_discovery",
         "preferred_for": "Brain-CODE public-release discovery through the CONP GitHub mirror when Ontario Brain Institute datasets or Brain-CODE-specific releases are requested",
-        "fallback_tools": ["search_conp_datasets", "search_openneuro_datasets", "search_nemar_datasets", "search_dandi_datasets"],
+        "fallback_tools": ["search_conp_datasets", "get_braincode_dataset_details", "get_conp_dataset_details"],
     },
     "search_conp_datasets": {
         "overlap_group": "neuroscience_dataset_discovery",
         "preferred_for": "broader CONP repository discovery by modality, method, or study name when disease labels are sparse or archive-specific search is too narrow; treat results as GitHub-backed catalog hits rather than canonical archive metadata",
-        "fallback_tools": ["search_braincode_datasets", "search_openneuro_datasets", "search_nemar_datasets", "search_dandi_datasets"],
+        "fallback_tools": ["search_braincode_datasets", "get_conp_dataset_details", "get_braincode_dataset_details"],
     },
 }
+
+# Evidence semantics are source-level contracts, not query-specific prompt fixes.
+# They describe the strongest interpretation supported by each tool's output.
+TOOL_EVIDENCE_CONTRACTS: dict[str, dict[str, Any]] = {
+    "search_clinical_trials": {
+        "evidence_kind": "registry search records",
+        "supports": ["study identity", "registered intervention", "phase", "status", "enrollment metadata"],
+        "interpretation_limits": [
+            "Treat returned counts as the retrieved query set unless the response includes a source total.",
+            "Comparative efficacy and safety require posted outcomes or a results publication.",
+        ],
+    },
+    "summarize_clinical_trials_landscape": {
+        "evidence_kind": "aggregated registry metadata",
+        "supports": ["registered development activity", "phase and status distribution", "named representative studies"],
+        "interpretation_limits": [
+            "Registry activity is a development descriptor; efficacy, safety, adoption, and pipeline quality require outcome evidence.",
+        ],
+    },
+    "get_clinical_trial": {
+        "evidence_kind": "individual registry record",
+        "supports": ["registered design", "eligibility", "outcomes", "posted result fields when present"],
+        "interpretation_limits": [
+            "Outcome claims require populated posted-result fields or a cited results publication; planned outcomes are not observed results.",
+        ],
+    },
+    "get_cancer_mutation_profile": {
+        "evidence_kind": "aggregate single-gene mutation counts",
+        "supports": ["absolute mutation counts", "recurrent protein changes", "mutation classes"],
+        "interpretation_limits": [
+            "Frequency or prevalence requires a cohort denominator, and co-mutation claims require sample-level records.",
+        ],
+    },
+    "search_civic_variants": {
+        "evidence_kind": "curated oncology variant interpretations",
+        "supports": ["clinical significance", "evidence level", "linked disease and therapy records"],
+        "interpretation_limits": [
+            "Tumor prevalence, cohort frequency, and sample-level co-occurrence require a cohort source.",
+        ],
+    },
+    "search_civic_genes": {
+        "evidence_kind": "curated oncology gene summary",
+        "supports": ["gene-level interpretation context", "linked diseases", "linked therapies"],
+        "interpretation_limits": [
+            "Catalog record counts are not tumor prevalence or cohort frequency.",
+        ],
+    },
+    "get_depmap_gene_dependency": {
+        "evidence_kind": "release-level named-gene dependency summary",
+        "supports": ["pan-dependency", "selectivity summary", "release-level predictive features"],
+        "interpretation_limits": [
+            "Lineage-, mutation-, cohort-, and cell-line-specific comparisons require a source that returns those slices.",
+        ],
+    },
+    "get_chembl_bioactivities": {
+        "evidence_kind": "assay-level quantitative bioactivity",
+        "supports": ["named compound identity", "reported potency", "assay and target context"],
+        "interpretation_limits": [
+            "A compound name and potency value do not by themselves establish a chemical scaffold, binding mode, selectivity, or clinical efficacy.",
+        ],
+    },
+    "search_protein_structures": {
+        "evidence_kind": "experimentally determined structure records",
+        "supports": ["PDB identity", "method", "resolution", "returned bound components and titles"],
+        "interpretation_limits": [
+            "Binding-mode or scaffold comparisons require record-level structural details, not a structure count alone.",
+        ],
+    },
+}
+
+_ARCHIVE_SEARCH_TOOLS = (
+    "search_openneuro_datasets",
+    "search_nemar_datasets",
+    "search_dandi_datasets",
+    "search_braincode_datasets",
+    "search_conp_datasets",
+    "search_zenodo_records",
+)
+for _tool_name in _ARCHIVE_SEARCH_TOOLS:
+    TOOL_EVIDENCE_CONTRACTS[_tool_name] = {
+        "evidence_kind": "archive search results",
+        "supports": ["candidate record identity", "explicitly returned search metadata"],
+        "interpretation_limits": [
+            "Confirm ranking criteria from the individual record; a search hit is not a relevance judgment.",
+            "Zero indexed matches describe the executed query, not archive-wide absence, unless coverage is exhaustive.",
+        ],
+    }
+
+_ARCHIVE_DETAIL_TOOLS = (
+    "get_openneuro_dataset",
+    "list_openneuro_snapshots",
+    "list_openneuro_files",
+    "get_nemar_dataset_details",
+    "list_nemar_files",
+    "get_dandi_dataset",
+    "list_dandi_versions",
+    "list_dandi_assets",
+    "get_braincode_dataset_details",
+    "get_conp_dataset_details",
+    "get_zenodo_record",
+)
+for _tool_name in _ARCHIVE_DETAIL_TOOLS:
+    TOOL_EVIDENCE_CONTRACTS[_tool_name] = {
+        "evidence_kind": "record-level archive metadata",
+        "supports": ["fields explicitly returned for the inspected record"],
+        "interpretation_limits": [
+            "Annotations, modality, license, access, subject counts, and file readiness remain record-specific and unknown when absent.",
+        ],
+    }
+
+del _tool_name
 
 SOURCE_PRECEDENCE_RULES: list[dict[str, Any]] = [
     {

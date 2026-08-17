@@ -3,6 +3,7 @@ import json
 import re
 from pathlib import Path
 
+import pytest
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 from google.adk.models.llm_request import LlmRequest
 from google.adk.tools import McpToolset
@@ -156,6 +157,8 @@ def test_report_assistant_mcp_toolset_is_not_active_step_gated():
 
     assert report_mcp.tool_filter == ["get_paper_fulltext"]
     assert isinstance(executor_mcp.tool_filter, workflow._ActiveStepToolPredicate)
+    assert executor_mcp._use_invocation_cache is False
+    assert report_mcp._use_invocation_cache is True
 
 
 def test_create_workflow_agent_manages_executor_and_report_assistant_mcp_toolsets():
@@ -545,13 +548,14 @@ def test_planner_instruction_preserves_core_rules_but_trims_large_playbooks():
 
     assert '"schema": "plan_internal.v1"' in instruction
     assert '"coverage": {' in instruction
-    assert "Coverage contract:" in instruction
+    assert "Planning criteria" in instruction
     assert "target_validation" in instruction
-    assert "dependency_selectivity" in instruction
-    assert "Preserve specific entities supplied by the user" in instruction
-    assert "target gene" in instruction
-    assert "Real user-provided entities" in instruction
-    assert "Every plan MUST include at least one step" in instruction
+    assert "covered_dimensions" in instruction
+    assert "Preserve every user-supplied entity" in instruction
+    assert '"depends_on": []' in instruction
+    assert '"handoff": null' in instruction
+    assert "never insert a universal shortlist size" in instruction
+    assert "Stable database accessions" in instruction
     assert "structured-data-planning" in instruction
     assert "archive-dataset-discovery-planning" in instruction
     assert "clinical-trials-planning" in instruction
@@ -560,7 +564,7 @@ def test_planner_instruction_preserves_core_rules_but_trims_large_playbooks():
     assert "comparative-assessment-planning" in instruction
     assert "entity-resolution-planning" in instruction
     assert "safety-risk-interpretation-planning" in instruction
-    assert "Do not write completion conditions that require lineage-, mutation-, cell-line-, or cohort-filtered" in instruction
+    assert "Tool descriptions and evidence contracts define what each source can establish" in instruction
     assert "Available BigQuery datasets" not in instruction
     assert "open_targets_platform.target" not in instruction
     assert "Avoid boolean strings like `A OR B`" not in instruction
@@ -610,8 +614,23 @@ def test_trimmed_tool_registry_descriptions_remove_strategy_prose():
 
 
 def test_synthesizer_instruction_prefers_claim_local_citations():
-    assert "Attach citations to the smallest sensible claim unit" in workflow.SYNTHESIZER_INSTRUCTION
-    assert "Prefer claim-local citations over paragraph-end citation bundles" in workflow.SYNTHESIZER_INSTRUCTION
+    assert "Attach citations to the smallest claim they support" in workflow.SYNTHESIZER_INSTRUCTION
+    assert "Associate an identifier with an entity only when the context links them" in workflow.SYNTHESIZER_INSTRUCTION
+
+
+def test_core_workflow_prompts_do_not_embed_test_query_entities_or_fixed_shortlists():
+    prompts = "\n".join([
+        workflow.PLANNER_INSTRUCTION_TEMPLATE,
+        workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE,
+        workflow.SYNTHESIZER_INSTRUCTION,
+        workflow.ROUTER_INSTRUCTION,
+        workflow.CLARIFIER_INSTRUCTION,
+    ]).lower()
+
+    for query_specific_term in ("rett", "mecp2", "shp2", "scn2a", "hfo"):
+        assert query_specific_term not in prompts
+    assert "top 5" not in prompts
+    assert "up to 10" not in prompts
 
 
 def test_planner_before_model_callback_does_not_force_json_mime_type():
@@ -1000,6 +1019,124 @@ def test_target_validation_plan_with_coverage_contract_has_no_warnings():
     assert task_state["planning_warnings"] == []
 
 
+def test_plan_blocks_tool_capability_mismatches_for_depmap_and_cbioportal():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Explain differences between KRAS G12C lung and colorectal cancer",
+        "success_criteria": ["Compare tumor contexts with cited evidence"],
+        "coverage": {
+            "archetype": "comparative_assessment",
+            "selected_skills": [],
+            "covered_dimensions": ["tumor_context"],
+            "omitted_dimensions": [],
+            "notes": "Comparative mechanism plan.",
+        },
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Compare KRAS dependency across lung and colorectal cancer cell lines",
+                "tool_hint": "get_depmap_gene_dependency",
+                "domains": ["genomics"],
+                "completion_condition": "A differential dependency comparison between both cancer cell-line groups is recorded",
+            },
+            {
+                "id": "S2",
+                "goal": "Identify co-occurring alterations with KRAS in lung and colorectal cancer",
+                "tool_hint": "get_cancer_mutation_profile",
+                "domains": ["genomics"],
+                "completion_condition": "The most common co-mutations in each cancer are reported",
+            },
+        ],
+    }
+
+    validated = workflow._validate_plan_internal(plan)
+
+    assert len(validated["planning_blockers"]) == 2
+    assert any("release-level named-gene summaries" in blocker for blocker in validated["planning_blockers"])
+    assert any("no sample-level co-mutation output" in blocker for blocker in validated["planning_blockers"])
+
+
+def test_compound_response_plan_warns_when_no_coverage_is_not_accepted():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Compare Sotorasib sensitivity in lung and colorectal cancer",
+        "success_criteria": ["Compare available response evidence"],
+        "coverage": {
+            "archetype": "comparative_assessment",
+            "selected_skills": [],
+            "covered_dimensions": ["drug_response"],
+            "omitted_dimensions": [],
+            "notes": "Compound response plan.",
+        },
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Compare Sotorasib GDSC response in lung and colorectal cancer",
+                "tool_hint": "get_gdsc_drug_sensitivity",
+                "domains": ["chemistry", "genomics"],
+                "completion_condition": "Tissue-level IC50 or AUC results are compared",
+            }
+        ],
+    }
+
+    validated = workflow._validate_plan_internal(plan)
+
+    assert validated["planning_blockers"] == []
+    assert any("Source coverage risk" in warning for warning in validated["planning_warnings"])
+
+    plan["steps"][0]["completion_condition"] = (
+        "Tissue-level results are compared, or a no-coverage result is documented with a literature fallback"
+    )
+    validated_with_fallback = workflow._validate_plan_internal(plan)
+    assert not any("Source coverage risk" in warning for warning in validated_with_fallback["planning_warnings"])
+
+
+def test_plan_blocks_civic_prevalence_and_redundant_synthesis_steps():
+    plan = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Explain differential KRAS G12C inhibitor efficacy",
+        "success_criteria": ["Explain the difference with cited evidence"],
+        "coverage": {
+            "archetype": "comparative_assessment",
+            "selected_skills": [],
+            "covered_dimensions": ["tumor_context", "literature_corroboration"],
+            "omitted_dimensions": [],
+            "notes": "Regression plan.",
+        },
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Compare KRAS G12C prevalence and co-occurring mutations in lung and colorectal cancer",
+                "tool_hint": "search_civic_variants",
+                "domains": ["genomics"],
+                "completion_condition": "Prevalence and common co-mutations are reported",
+            },
+            {
+                "id": "S2",
+                "goal": "Synthesize all gathered evidence from the previous steps",
+                "tool_hint": "search_pubmed",
+                "domains": ["literature"],
+                "completion_condition": "Evidence from the preceding steps is integrated into a final explanation",
+            },
+        ],
+    }
+
+    validated = workflow._validate_plan_internal(plan)
+
+    assert len(validated["planning_blockers"]) == 2
+    assert any("CIViC returns clinical interpretations" in blocker for blocker in validated["planning_blockers"])
+    assert any("Redundant workflow step" in blocker for blocker in validated["planning_blockers"])
+
+
+def test_compact_tool_description_preserves_capability_constraints():
+    compact = workflow._compact_tool_description(
+        workflow.tool_registry.TOOL_DESCRIPTIONS["get_depmap_gene_dependency"]
+    )
+
+    assert "Does not directly slice by lineage" in compact
+    assert len(compact) <= 240
+
+
 def test_resolve_active_step_tool_allowlist_scopes_to_current_step():
     task_state = {
         "plan_status": "ready",
@@ -1094,7 +1231,7 @@ def test_explicit_bigquery_variant_dataset_step_keeps_bigquery_tools():
     assert "run_bigquery_select_query" in scoped_tools
 
 
-def test_variant_step_context_warns_against_gnomad_bigquery_detour():
+def test_variant_step_context_uses_the_same_scoped_tools_as_execution():
     task_state = {
         "objective": "Assess an SCN2A missense variant",
         "steps": [
@@ -1113,7 +1250,8 @@ def test_variant_step_context_warns_against_gnomad_bigquery_detour():
     text = "\n".join(instructions)
 
     assert "Routing guidance for this step's tool_hint `get_variant_annotations`" in text
-    assert "Do not query `gnomad_public`" in text
+    assert "`get_variant_annotations`" in text
+    assert "`run_bigquery_select_query`" not in text
 
 
 def test_coverage_status_complete_vs_partial():
@@ -1916,6 +2054,273 @@ def test_react_step_context_instructions_include_routing_guidance():
     assert "Start with `get_intact_interactions`" in text
 
 
+def test_react_step_context_uses_structure_source_evidence_contract():
+    task_state = {
+        "objective": "Compare SHP2 inhibitor chemotypes using co-crystal structures",
+        "steps": [{
+            "id": "S1",
+            "status": "pending",
+            "goal": "Compare SHP2 inhibitor co-crystal structures and binding modes",
+            "tool_hint": "search_protein_structures",
+            "domains": ["protein"],
+            "completion_condition": "Representative PDB IDs and chemotype distinctions are reported",
+        }],
+    }
+
+    text = "\n".join(workflow._react_step_context_instructions(task_state, task_state["steps"][0]))
+
+    assert "Evidence contract for `search_protein_structures`" in text
+    assert "experimentally determined structure records" in text
+    assert "Binding-mode or scaffold comparisons require record-level structural details" in text
+
+
+def test_literature_step_context_uses_generic_retrieval_scope():
+    task_state = {
+        "objective": "Compare SHP2 chemotypes and liabilities",
+        "steps": [{
+            "id": "S1",
+            "status": "pending",
+            "goal": "Find leading SHP2 inhibitor series and the main liability for each",
+            "tool_hint": "search_pubmed",
+            "domains": ["literature", "chemistry"],
+            "completion_condition": "Named chemotype and series-specific liability pairs are supported by literature",
+        }],
+    }
+
+    text = "\n".join(workflow._react_step_context_instructions(task_state, task_state["steps"][0]))
+
+    assert "Evidence contract for `search_pubmed`" in text
+    assert "retrieved records" in text
+    assert "A zero-result query does not establish source-wide absence" in text
+    assert "chemotype" not in workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE.lower()
+
+
+def test_archive_step_is_scoped_to_its_own_archive_family():
+    task_state = {
+        "objective": "Find epilepsy datasets in NEMAR and compare archives",
+        "steps": [{
+            "id": "S1",
+            "status": "pending",
+            "goal": "Search NEMAR and inspect matching dataset details",
+            "tool_hint": "search_nemar_datasets",
+            "domains": ["neuroscience"],
+            "completion_condition": "NEMAR records or a NEMAR-specific gap are reported",
+        }],
+    }
+
+    allowed = workflow._resolve_step_tool_allowlist(
+        task_state["steps"][0],
+        available_tools=workflow.KNOWN_MCP_TOOLS,
+    )
+    text = "\n".join(workflow._react_step_context_instructions(task_state, task_state["steps"][0]))
+
+    assert allowed == ["search_nemar_datasets", "get_nemar_dataset_details", "list_nemar_files"]
+    assert "Do not substitute results from a different archive" in text
+    assert "Evidence contract for `search_nemar_datasets`" in text
+    assert "a search hit is not a relevance judgment" in text.lower()
+    assert "seizure" not in workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE.lower()
+    assert "`search_dandi_datasets`" not in text
+
+
+def test_react_after_model_does_not_force_query_specific_fulltext_follow_up():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {
+                workflow.STATE_WORKFLOW_TASK: {
+                    "objective": "Compare SHP2 chemotypes and liabilities",
+                    "plan_status": "ready",
+                    "current_step_id": "S1",
+                    "steps": [{
+                        "id": "S1",
+                        "status": "in_progress",
+                        "goal": "Find leading SHP2 inhibitor series and the main liability for each",
+                        "tool_hint": "search_pubmed",
+                        "domains": ["literature", "chemistry"],
+                        "completion_condition": "Named series-specific liabilities are supported",
+                    }],
+                },
+                workflow.STATE_EXECUTOR_ACTIVE_STEP_ID: "S1",
+                workflow.STATE_EXECUTOR_TOOL_LOG: json.dumps([
+                    {"raw_tool": "search_pubmed", "status": "done"},
+                    {"raw_tool": "get_pubmed_abstract", "status": "done"},
+                ]),
+            }
+
+    callback_context = DummyCallbackContext()
+    response = workflow._react_after_model_callback(
+        callback_context=callback_context,
+        llm_response=workflow._make_text_response("The reviews are expected to discuss several series."),
+    )
+
+    assert "completed" in workflow._llm_response_text(response)
+    assert callback_context.state.get(workflow.STATE_EXECUTOR_EVIDENCE_RETRY_FEEDBACK, "") == ""
+    assert callback_context.state[workflow.STATE_WORKFLOW_TASK]["steps"][0]["status"] == "completed"
+
+
+def test_react_after_model_enforces_one_primary_tool_call_when_model_skips_tools():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {
+                workflow.STATE_WORKFLOW_TASK: {
+                    "objective": "Search Brain-CODE",
+                    "plan_status": "ready",
+                    "current_step_id": "S1",
+                    "steps": [{
+                        "id": "S1",
+                        "status": "in_progress",
+                        "goal": "Search Brain-CODE for epilepsy datasets",
+                        "tool_hint": "search_braincode_datasets",
+                        "domains": ["neuroscience"],
+                        "completion_condition": "Report Brain-CODE matches or a source-specific gap",
+                    }],
+                },
+                workflow.STATE_EXECUTOR_ACTIVE_STEP_ID: "S1",
+                workflow.STATE_EXECUTOR_TOOL_LOG: "[]",
+            }
+
+    callback_context = DummyCallbackContext()
+    response = workflow._react_after_model_callback(
+        callback_context=callback_context,
+        llm_response=workflow._make_text_response("No Brain-CODE results were found."),
+    )
+
+    assert workflow._llm_response_text(response) == ""
+    assert callback_context.state[workflow.STATE_EXECUTOR_TOOL_RETRY_COUNT] == 1
+    assert "Call the current step's primary tool `search_braincode_datasets`" in callback_context.state[
+        workflow.STATE_EXECUTOR_EVIDENCE_RETRY_FEEDBACK
+    ]
+    assert callback_context.state[workflow.STATE_WORKFLOW_TASK]["steps"][0]["status"] == "in_progress"
+
+
+def test_react_after_model_terminal_blocked_step_still_triggers_partial_synthesis():
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {
+                workflow.STATE_WORKFLOW_TASK: {
+                    "objective": "Search one archive",
+                    "plan_status": "ready",
+                    "current_step_id": "S1",
+                    "steps": [{
+                        "id": "S1",
+                        "status": "in_progress",
+                        "goal": "Search unavailable archive",
+                        "tool_hint": "search_nemar_datasets",
+                        "domains": ["neuroscience"],
+                        "completion_condition": "Report records or a source-specific gap",
+                    }],
+                    "evidence_store": workflow._new_evidence_store(),
+                    "execution_metrics": workflow._new_execution_metrics_bundle(),
+                },
+                workflow.STATE_EXECUTOR_ACTIVE_STEP_ID: "S1",
+                workflow.STATE_EXECUTOR_TOOL_LOG: json.dumps([
+                    {"raw_tool": "search_nemar_datasets", "tool": "NEMAR", "status": "done", "result": "API unavailable"},
+                ]),
+            }
+
+    callback_context = DummyCallbackContext()
+    payload = {
+        "schema": workflow.STEP_RESULT_SCHEMA,
+        "step_id": "S1",
+        "status": "blocked",
+        "step_progress_note": "NEMAR was unavailable.",
+        "result_summary": "NEMAR could not be queried.",
+        "evidence_ids": [],
+        "open_gaps": ["NEMAR metadata unavailable"],
+        "suggested_next_searches": [],
+        "tools_called": ["search_nemar_datasets"],
+        "data_sources_queried": ["NEMAR"],
+        "structured_observations": [],
+    }
+
+    workflow._react_after_model_callback(
+        callback_context=callback_context,
+        llm_response=workflow._make_text_response(json.dumps(payload)),
+    )
+
+    task_state = callback_context.state[workflow.STATE_WORKFLOW_TASK]
+    assert task_state["steps"][0]["status"] == "blocked"
+    assert task_state["plan_status"] == "completed"
+    assert task_state["current_step_id"] is None
+    assert callback_context.state[workflow.STATE_AUTO_SYNTH_REQUESTED] is True
+
+
+def test_tool_evidence_contracts_replace_query_specific_report_rewrites():
+    activity_contract = workflow._tool_evidence_contract("get_chembl_bioactivities")
+    archive_contract = workflow._tool_evidence_contract("search_dandi_datasets")
+
+    assert activity_contract["evidence_kind"] == "assay-level quantitative bioactivity"
+    assert any("chemical scaffold" in item for item in activity_contract["interpretation_limits"])
+    assert archive_contract["evidence_kind"] == "archive search results"
+    assert any("not a relevance judgment" in item for item in archive_contract["interpretation_limits"])
+    assert any("not archive-wide absence" in item for item in archive_contract["interpretation_limits"])
+
+
+def test_synthesis_context_propagates_source_contracts_without_disease_specific_phrases():
+    task_state = {
+        "objective": "Rank public longitudinal imaging datasets for a biomarker analysis",
+        "steps": [{
+            "id": "S1",
+            "tool_hint": "search_openneuro_datasets",
+            "tools_called": ["search_openneuro_datasets"],
+            "status": "completed",
+            "result_summary": "Three records were returned.",
+        }],
+        "evidence_store": workflow._new_evidence_store(),
+        "execution_metrics": workflow._new_execution_metrics_bundle(),
+    }
+
+    instructions = "\n".join(workflow._synth_context_instructions(task_state))
+    constraints = workflow._synthesis_step_interpretation_constraints(task_state["steps"][0])
+
+    assert "interpretation_constraints" in instructions
+    assert any("search hit is not a relevance judgment" in item for item in constraints)
+    assert any("not archive-wide absence" in item for item in constraints)
+    assert "HFO" not in instructions
+    assert "seizure onset" not in instructions
+
+
+
+def test_generated_archive_ranking_table_and_nested_lists_are_repaired():
+    raw = (
+        "* **NEMAR:** * `on1`: first. * `on2`: second.\n\n"
+        "| Archive | Dataset ID | Subjects | | :-- | :-- | --: | | NEMAR | on1 | 30 | | OpenNeuro | ds1 | 30 |"
+    )
+
+    repaired = workflow._repair_generated_markdown_layout(raw)
+
+    assert "* **NEMAR:**\n  * `on1`: first.\n  * `on2`: second." in repaired
+    assert "| Archive | Dataset ID | Subjects |\n| :-- | :-- | --: |\n| NEMAR | on1 | 30 |" in repaired
+    assert "\n| OpenNeuro | ds1 | 30 |" in repaired
+
+
+def test_compact_archive_detail_observation_retains_record_fields():
+    observations = workflow._compact_synthesis_tool_observations({
+        "tool_log": [{
+            "tool": "NEMAR",
+            "raw_tool": "get_nemar_dataset_details",
+            "status": "done",
+            "result": "NEMAR dataset: Epilepsy-iEEG-Interictal-Multicenter-Dataset (on003876).",
+            "evidence_text": (
+                "Key Fields:\n- Dataset ID: on003876\n- Modalities: ieeg\n- Participants: 39\n"
+                "- BIDS version: 1.6.0\n- License: CC0\n- DOI: 10.82901/nemar.on003876\n"
+                "- Description: Interictal iEEG with sleep and awake annotations.\n"
+                "Sources:\n- https://example.invalid/ignored\n"
+            ),
+        }]
+    })
+
+    assert observations[0]["record_fields"] == {
+        "Dataset ID": "on003876",
+        "Modalities": "ieeg",
+        "Participants": "39",
+        "BIDS version": "1.6.0",
+        "License": "CC0",
+        "DOI": "10.82901/nemar.on003876",
+        "Description": "Interictal iEEG with sleep and awake annotations.",
+    }
+    assert observations[0]["identifiers"] == ["DOI:10.82901/nemar.on003876"]
+
+
 def test_react_step_context_instructions_include_phenotype_routing_guidance():
     task_state = {
         "objective": "Prioritize a rare-disease phenotype route",
@@ -1946,22 +2351,25 @@ def test_monarch_tool_description_mentions_entity_id_and_supported_modes():
     assert "unsupported gene-to-disease" in desc
 
 
-def test_step_executor_instruction_mentions_monarch_entity_id_guidance():
-    assert "For `query_monarch_associations`" in workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
-    assert "entityId" in workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
-    assert "supported association modes" in workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
-
-
-def test_step_executor_instruction_mentions_representative_compounds_and_trials():
-    assert "do not stop at interaction counts" in workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
-    assert "do not stop at study counts" in workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
-
-
-def test_step_executor_instruction_limits_bigquery_fallbacks_to_explicit_structured_steps():
+def test_step_executor_instruction_is_source_agnostic_and_field_grounded():
     text = workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
-    assert "first try an alternative query or another tool in the same evidence family" in text
-    assert "Switch to generic BigQuery tools only when the current step is explicitly BigQuery-backed" in text
-    assert "fall back to run_bigquery_select_query" not in text
+    assert "Match every claim to the strongest returned field" in text
+    assert "Metadata establishes only its explicit fields" in text
+    assert "Distinct names or identifiers establish distinct records" in text
+    assert "query_monarch_associations" not in text
+
+
+def test_step_executor_instruction_defines_generic_count_and_registry_semantics():
+    text = workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "returned record count describes the retrieved set" in text
+    assert "efficacy or safety comparisons require outcome evidence" in text
+
+
+def test_step_executor_instruction_limits_fallbacks_by_evidence_type():
+    text = workflow.STEP_EXECUTOR_INSTRUCTION_TEMPLATE
+    assert "primary tool whose documented evidence type matches" in text
+    assert "another call can resolve a specific missing field or identifier" in text
+    assert "fall back to run_bigquery_select_query" not in text.lower()
 
 
 def test_bigquery_executor_policy_is_a_pointer_to_skill_playbook():
@@ -2001,7 +2409,8 @@ def test_react_step_context_instructions_warn_against_bigquery_detours_for_targe
     instructions = workflow._react_step_context_instructions(task_state, active_step)
     text = "\n".join(instructions)
     assert "Routing guidance for this step's tool_hint `get_depmap_gene_dependency`" in text
-    assert "Keep target-vulnerability work inside specialized screening and dependency tools" in text
+    assert "release-level named-gene dependency summary" in text
+    assert "Lineage-, mutation-, cohort-, and cell-line-specific comparisons" in text
     assert "`get_biogrid_orcs_gene_summary` (BioGRID ORCS)" in text
 
 
@@ -2166,15 +2575,231 @@ def test_react_step_context_instructions_include_pharmacodb_routing_guidance():
     assert "`get_gdsc_drug_sensitivity` (GDSC / CancerRxGene)" in text
     assert "`get_prism_repurposing_response` (PRISM Repurposing)" in text
     assert "Start with `get_pharmacodb_compound_response`" in text
-    assert "compound-first tool" in text
-    assert "named drug/compound query" in text
+    assert "Requires a named compound" in text
+    assert "not model-first drug discovery" in text
 
 
-def test_planner_instruction_warns_about_model_first_compound_discovery_steps():
-    assert "model-first or cohort-first drug-discovery steps" in workflow.PLANNER_INSTRUCTION_TEMPLATE
-    assert "`get_gdsc_drug_sensitivity`" in workflow.PLANNER_INSTRUCTION_TEMPLATE
-    assert "`get_prism_repurposing_response`" in workflow.PLANNER_INSTRUCTION_TEMPLATE
-    assert "`get_pharmacodb_compound_response`" in workflow.PLANNER_INSTRUCTION_TEMPLATE
+def test_planner_receives_tool_input_requirements_from_catalog_not_static_prompt_rules():
+    instruction = workflow._build_planner_instruction(
+        ["get_gdsc_drug_sensitivity", "get_prism_repurposing_response", "get_pharmacodb_compound_response"],
+        prefer_bigquery=False,
+        planner_skills_enabled=False,
+    )
+
+    assert "requires a named compound" in instruction.lower()
+    assert "model-first or cohort-first drug-discovery steps" not in workflow.PLANNER_INSTRUCTION_TEMPLATE
+
+
+def test_planner_keeps_archive_search_and_metadata_inspection_in_one_step():
+    instruction = workflow.PLANNER_INSTRUCTION_TEMPLATE
+
+    assert "Treat source search, record inspection, and lightweight pagination as one step" in instruction
+    assert "Stable database accessions and record URLs" in instruction
+    assert "Preserve the original scientific scope" in instruction
+
+
+def test_planner_groups_named_comparison_items_by_shared_source():
+    instruction = workflow.PLANNER_INSTRUCTION_TEMPLATE
+
+    assert "Keep repeated work together when one source and one evidence criterion" in instruction
+    assert "Keep work separate when sources answer different evidence dimensions" in instruction
+    assert "API return order is not a ranking" in instruction
+    assert "never insert a universal shortlist size" in instruction
+    assert "top 5" not in instruction.lower()
+
+
+def test_plan_normalization_preserves_scientific_scope_and_source_steps():
+    raw_steps = [
+        {
+            "id": "discovery",
+            "goal": "Identify phenotype-linked candidate genes using the requested exclusion criteria",
+            "tool_hint": "query_monarch_associations",
+            "domains": ["genomics"],
+            "depends_on": [],
+            "completion_condition": "Candidate identities and supporting phenotype links are recorded",
+            "handoff": {
+                "entity_type": "gene",
+                "selection_mode": "ranked",
+                "selection_criteria": ["number of requested phenotype matches", "curated causal association"],
+                "max_items": None,
+            },
+        },
+        {
+            "id": "curation",
+            "goal": "Retrieve expert human gene-disease validity for the discovered candidates",
+            "tool_hint": "get_clingen_gene_curation",
+            "domains": ["genomics"],
+            "depends_on": ["S1"],
+            "completion_condition": "Curations are recorded for the candidate set supplied by S1",
+            "handoff": None,
+        },
+        {
+            "id": "models",
+            "goal": "Retrieve model-organism evidence for the discovered candidates",
+            "tool_hint": "get_alliance_genome_gene_profile",
+            "domains": ["genomics"],
+            "depends_on": ["S1"],
+            "completion_condition": "Model evidence is recorded for the candidate set supplied by S1",
+            "handoff": None,
+        },
+    ]
+    validated = workflow._validate_plan_internal({
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Prioritize genes for a multi-system neurodevelopmental phenotype while applying the stated exclusions",
+        "success_criteria": ["Return a supported ranking"],
+        "coverage": {"archetype": "entity_resolution"},
+        "steps": raw_steps,
+    })
+
+    assert len(validated["steps"]) == 3
+    assert [step["id"] for step in validated["steps"]] == ["S1", "S2", "S3"]
+    assert [step["goal"] for step in validated["steps"]] == [step["goal"] for step in raw_steps]
+    assert validated["steps"][0]["handoff"]["max_items"] is None
+    assert validated["steps"][1]["depends_on"] == ["S1"]
+    assert validated["steps"][2]["depends_on"] == ["S1"]
+
+
+def test_react_context_uses_structured_handoff_and_dependencies():
+    task_state = {
+        "objective": "Prioritize perturbagens for a cellular phenotype",
+        "steps": [
+            {
+                "id": "S1",
+                "status": "pending",
+                "goal": "Identify perturbagens associated with phenotype reversal",
+                "tool_hint": "run_bigquery_select_query",
+                "domains": ["data", "chemistry"],
+                "depends_on": [],
+                "completion_condition": "Perturbagens and measured reversal scores are recorded",
+                "handoff": {
+                    "entity_type": "perturbagen",
+                    "selection_mode": "ranked",
+                    "selection_criteria": ["measured reversal score"],
+                    "max_items": 7,
+                },
+            },
+            {
+                "id": "S2",
+                "status": "pending",
+                "goal": "Inspect pharmacology for the selected perturbagens",
+                "tool_hint": "get_chembl_bioactivities",
+                "domains": ["chemistry"],
+                "depends_on": ["S1"],
+                "completion_condition": "Target and potency evidence is recorded",
+                "handoff": None,
+            },
+        ],
+    }
+
+    discovery_context = "\n".join(
+        workflow._react_step_context_instructions(task_state, task_state["steps"][0])
+    )
+    validation_context = "\n".join(
+        workflow._react_step_context_instructions(task_state, task_state["steps"][1])
+    )
+
+    assert "Structured handoff contract" in discovery_context
+    assert '"max_items": 7' in discovery_context
+    assert "measured reversal score" in discovery_context
+    assert "Dependency contract" in validation_context
+    assert "Required upstream steps: S1" in validation_context
+
+
+def test_plan_validation_repairs_tool_name_without_rewriting_goal():
+    goal = "Summarize expert gene-disease validity for the supplied candidate genes"
+    validated = workflow._validate_plan_internal({
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Validate supplied candidate genes",
+        "success_criteria": ["Return curated validity evidence"],
+        "coverage": {"archetype": "entity_resolution"},
+        "steps": [{
+            "id": "S1",
+            "goal": goal,
+            "tool_hint": "get_clingen_gene_curands_dosage_sensitivity_for_candidates",
+            "domains": ["genomics"],
+            "completion_condition": "Curations are retrieved for the supplied candidate genes",
+        }],
+    })
+
+    assert validated["steps"][0]["tool_hint"] == "get_clingen_gene_curation"
+    assert validated["steps"][0]["goal"] == goal
+    assert "top 5" not in validated["steps"][0]["goal"].lower()
+
+
+def test_plan_preserves_explicit_handoff_bound_without_merging_sources():
+    validated = workflow._validate_plan_internal({
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Prioritize three compounds for orthogonal validation",
+        "success_criteria": ["Return three supported candidates"],
+        "coverage": {"archetype": "comparative_assessment"},
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Rank compounds using quantitative activity",
+                "tool_hint": "get_chembl_bioactivities",
+                "domains": ["chemistry"],
+                "completion_condition": "Three compounds are ranked by returned activity evidence",
+                "handoff": {
+                    "entity_type": "compound",
+                    "selection_mode": "ranked",
+                    "selection_criteria": ["reported potency"],
+                    "max_items": 3,
+                },
+            },
+            {
+                "id": "S2",
+                "goal": "Inspect curated target-ligand context for the three selected compounds",
+                "tool_hint": "get_guidetopharmacology_target",
+                "domains": ["chemistry"],
+                "depends_on": ["S1"],
+                "completion_condition": "Curated interaction context is recorded",
+            },
+        ],
+    })
+
+    assert len(validated["steps"]) == 2
+    assert validated["steps"][0]["handoff"]["max_items"] == 3
+    assert validated["steps"][1]["depends_on"] == ["S1"]
+
+
+def test_plan_rejects_forward_dependencies_and_invalid_ranked_handoffs():
+    base = {
+        "schema": workflow.PLAN_SCHEMA,
+        "objective": "Compare biospecimen resources",
+        "success_criteria": ["Return source-grounded records"],
+        "coverage": {"archetype": "dataset_discovery"},
+    }
+    with pytest.raises(ValueError, match="reference only earlier steps"):
+        workflow._validate_plan_internal({
+            **base,
+            "steps": [{
+                "id": "S1",
+                "goal": "Inspect records",
+                "tool_hint": "search_zenodo_records",
+                "domains": ["data"],
+                "depends_on": ["S2"],
+                "completion_condition": "Records are retrieved",
+            }],
+        })
+
+    with pytest.raises(ValueError, match="selection_criteria is required"):
+        workflow._validate_plan_internal({
+            **base,
+            "steps": [{
+                "id": "S1",
+                "goal": "Rank records",
+                "tool_hint": "search_zenodo_records",
+                "domains": ["data"],
+                "completion_condition": "Records are ranked",
+                "handoff": {
+                    "entity_type": "biospecimen_resource",
+                    "selection_mode": "ranked",
+                    "selection_criteria": [],
+                    "max_items": None,
+                },
+            }],
+        })
+
 
 
 def test_apply_step_execution_result_populates_v1_evidence_store_and_metrics():
@@ -3443,6 +4068,16 @@ def test_extract_evidence_ids_from_text_empty():
     assert workflow._extract_evidence_ids_from_text("no identifiers here") == []
 
 
+def test_extract_evidence_ids_preserves_balanced_parentheses_in_doi():
+    ids = workflow._extract_evidence_ids_from_text(
+        "PMID:34919824 | DOI:10.1016/S1470-2045(21)00477-5."
+    )
+
+    assert ids == ["PMID:34919824", "DOI:10.1016/S1470-2045(21)00477-5"]
+    assert workflow._is_valid_evidence_id(ids[1])
+    assert not workflow._is_valid_evidence_id("DOI:10.1016/S1470-2045(21")
+
+
 def test_reference_section_keeps_papers_but_links_trials_inline(monkeypatch):
     assert workflow._is_literature_id("PMID:12345678")
     assert not workflow._is_literature_id("NCT03710707")
@@ -3476,6 +4111,17 @@ def test_hyperlink_inline_ids_links_common_database_and_ontology_ids():
     assert "[UniProt ID: Q5S007](https://www.uniprot.org/uniprotkb/Q5S007)" in linked
     assert "[HGNC:18618](https://www.genenames.org/data/gene-symbol-report/#!/hgnc_id/HGNC:18618)" in linked
     assert "[MONDO:0005180](https://monarchinitiative.org/disease/MONDO:0005180)" in linked
+
+
+def test_hyperlink_inline_doi_keeps_sentence_parenthesis_outside_url():
+    linked = workflow._hyperlink_inline_ids(
+        "Evidence (DOI:10.1080/13543776.2024.2365410).",
+        ref_map={},
+    )
+
+    assert "[DOI:10.1080/13543776.2024.2365410](https://doi.org/10.1080/13543776.2024.2365410)" in linked
+    assert "2365410).](" not in linked
+    assert linked.endswith(").")
 
 
 def test_apa_intext_citation_uses_author_year_when_metadata_available(monkeypatch):
@@ -3674,13 +4320,136 @@ def test_collect_final_report_literature_ids_merges_rendered_model_and_task_stat
         "Body mentions PMID:55555555.",
     )
 
-    assert ids == [
-        "PMID:55555555",
-        "PMID:11111111",
-        "PMID:44444444",
-        "PMID:22222222",
-        "PMID:33333333",
-    ]
+    assert ids == ["PMID:55555555"]
+
+
+def test_collect_final_report_literature_ids_dedupes_pmid_doi_aliases(monkeypatch):
+    monkeypatch.setattr(
+        workflow,
+        "_fetch_reference_meta",
+        lambda eid: {
+            "title": "Same paper",
+            "doi": "10.1000/example",
+            "pmid": "12345678",
+        } if eid.lower() == "pmid:12345678" else None,
+    )
+    task_state = {
+        "steps": [{"evidence_ids": ["DOI:10.1000/example", "PMID:12345678"]}]
+    }
+
+    ids = workflow._collect_final_report_literature_ids(
+        task_state,
+        {"model_references_text": "", "claim_synthesis_summary": {}},
+        "",
+    )
+
+    assert ids == ["PMID:12345678"]
+    assert workflow._build_ref_map(ids)["doi:10.1000/example"] == 1
+
+
+def test_compact_synthesis_tool_observations_preserves_identifier_mapping():
+    observations = workflow._compact_synthesis_tool_observations({
+        "tool_log": [
+            {
+                "tool": "ClinicalTrials.gov",
+                "raw_tool": "search_clinical_trials",
+                "status": "done",
+                "result": "NCT06497556 | PHASE3 | Divarasib (DRUG), Sotorasib (DRUG)",
+            }
+        ]
+    })
+
+    assert observations == [{
+        "source": "ClinicalTrials.gov",
+        "tool": "search_clinical_trials",
+        "result": "NCT06497556 | PHASE3 | Divarasib (DRUG), Sotorasib (DRUG)",
+        "identifiers": ["NCT06497556"],
+    }]
+
+
+def test_synthesis_constraints_come_from_source_evidence_contracts():
+    trial_constraints = workflow._synthesis_step_interpretation_constraints({
+        "tools_called": ["search_clinical_trials"]
+    })
+    mutation_constraints = workflow._synthesis_step_interpretation_constraints({
+        "tools_called": ["get_cancer_mutation_profile"]
+    })
+
+    assert any("registry search records" in item for item in trial_constraints)
+    assert any("Comparative efficacy and safety require posted outcomes" in item for item in trial_constraints)
+    assert any("aggregate single-gene mutation counts" in item for item in mutation_constraints)
+    assert any("Frequency or prevalence requires a cohort denominator" in item for item in mutation_constraints)
+
+
+def test_final_synthesis_adds_contract_limitations_without_rewriting_prose():
+    task_state = {
+        "objective": "Compare two molecular contexts",
+        "plan_status": "completed",
+        "steps": [
+            {
+                "id": "S1",
+                "status": "completed",
+                "tool_hint": "search_clinical_trials",
+                "tools_called": ["search_clinical_trials"],
+                "result_summary": "A registry sample was returned.",
+            },
+            {
+                "id": "S2",
+                "status": "completed",
+                "tool_hint": "get_cancer_mutation_profile",
+                "tools_called": ["get_cancer_mutation_profile"],
+                "result_summary": "Absolute mutation counts were returned.",
+            },
+        ],
+        "evidence_store": workflow._new_evidence_store(),
+        "execution_metrics": workflow._new_execution_metrics_bundle(),
+    }
+    raw = (
+        "## TLDR\n\nThe retrieved registry and mutation summaries cover different evidence types.\n\n"
+        "## Evidence Breakdown\n\n### Source scope\n\nRegistry records and absolute mutation counts were returned."
+    )
+
+    synthesis = workflow._build_structured_final_synthesis(task_state, raw)
+
+    assert synthesis["model_findings_text"].endswith("Registry records and absolute mutation counts were returned.")
+    assert any("posted outcomes" in item for item in synthesis["limitations"])
+    assert any("cohort denominator" in item for item in synthesis["limitations"])
+
+
+def test_generic_search_contract_covers_retrieval_counts_and_absence():
+    contract = workflow._tool_evidence_contract("search_uniprot_proteins")
+
+    assert contract["evidence_kind"] == "retrieved records"
+    assert any("retrieved set" in item for item in contract["interpretation_limits"])
+    assert any("zero-result query" in item.lower() for item in contract["interpretation_limits"])
+
+
+def test_contract_based_synthesis_does_not_depend_on_generated_sentence_wording():
+    step = {
+        "tool_hint": "get_chembl_bioactivities",
+        "tools_called": ["get_chembl_bioactivities"],
+    }
+    constraints = workflow._synthesis_step_interpretation_constraints(step)
+
+    assert any("assay-level quantitative bioactivity" in item for item in constraints)
+    assert any("chemical scaffold" in item for item in constraints)
+    assert any("clinical efficacy" in item for item in constraints)
+
+
+
+def test_unscored_synthesis_downgrades_unsupported_strong_evidence_claim():
+    answer = workflow._build_structured_answer_markdown(
+        {"objective": "Does treatment A work better than treatment B?", "steps": []},
+        {"top_supported_claims": [], "mixed_evidence_claims": []},
+        model_answer=(
+            "Strong evidence supports that treatment A works better than treatment B in the evaluated population. "
+            "The available observations consistently favor treatment A, although important uncertainty remains. "
+            "Therefore, strong evidence supports continued investigation."
+        ),
+    )
+
+    assert answer.startswith("The available evidence supports that")
+    assert "strong evidence supports" not in answer.lower()
 
 
 def test_build_deterministic_step_result_extracts_pmids_from_tool_log_evidence_text():
@@ -3915,6 +4684,41 @@ def test_router_before_model_callback_forces_research_workflow_for_all_landing_p
         call = workflow._extract_function_calls(response)[0]
         assert call["name"] == "transfer_to_agent", query
         assert call["args"]["agent_name"] == "research_workflow", query
+
+
+def test_router_requests_variant_identity_before_individual_variant_classification():
+    query = (
+        "For a de novo SCN2A missense variant in a child with seizures and developmental delay, "
+        "does the evidence support pathogenicity, and is it gain-of-function or loss-of-function?"
+    )
+
+    class DummyCallbackContext:
+        def __init__(self, text: str) -> None:
+            self.state = {}
+            self.user_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=text)],
+            )
+
+    response = workflow._router_before_model_callback(
+        callback_context=DummyCallbackContext(query),
+        llm_request=LlmRequest(),
+    )
+
+    call = workflow._extract_function_calls(response)[0]
+    assert call["args"]["agent_name"] == "clarifier"
+
+    for identified_query in (
+        "Is the de novo SCN2A variant NM_021007.3:c.4766A>G pathogenic and gain-of-function?",
+        "Is the de novo SCN2A p.R1882Q variant pathogenic and gain-of-function?",
+        "Is the rs123456 SCN2A variant pathogenic or loss-of-function?",
+    ):
+        identified_response = workflow._router_before_model_callback(
+            callback_context=DummyCallbackContext(identified_query),
+            llm_request=LlmRequest(),
+        )
+        identified_call = workflow._extract_function_calls(identified_response)[0]
+        assert identified_call["args"]["agent_name"] == "research_workflow"
 
 
 def test_router_before_model_callback_forces_research_workflow_for_paraphrased_research_queries():

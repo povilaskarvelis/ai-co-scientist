@@ -122,6 +122,24 @@ BIGQUERY_DATASET_TOOL_HINTS = {
     "ebi_surechembl",
 }
 
+ARCHIVE_STEP_TOOL_ALLOWLISTS: dict[str, tuple[str, ...]] = {
+    "search_nemar_datasets": (
+        "search_nemar_datasets", "get_nemar_dataset_details", "list_nemar_files",
+    ),
+    "search_openneuro_datasets": (
+        "search_openneuro_datasets", "get_openneuro_dataset", "list_openneuro_snapshots", "list_openneuro_files",
+    ),
+    "search_dandi_datasets": (
+        "search_dandi_datasets", "get_dandi_dataset", "list_dandi_versions", "list_dandi_assets",
+    ),
+    "search_braincode_datasets": (
+        "search_braincode_datasets", "get_braincode_dataset_details", "search_conp_datasets", "get_conp_dataset_details",
+    ),
+    "search_conp_datasets": (
+        "search_conp_datasets", "get_conp_dataset_details", "search_braincode_datasets", "get_braincode_dataset_details",
+    ),
+}
+
 STATE_WORKFLOW_TASK = "workflow_task_state"
 STATE_WORKFLOW_TASK_LEGACY_APP = "app:workflow_task_state"
 STATE_PRIOR_RESEARCH = "co_scientist_prior_research"
@@ -139,6 +157,8 @@ STATE_EXECUTOR_LAST_ERROR = "temp:co_scientist_executor_last_error"
 STATE_EXECUTOR_PREV_STEP_STATUS = "temp:co_scientist_executor_prev_step_status"
 STATE_EXECUTOR_REASONING_TRACE = "temp:co_scientist_executor_reasoning_trace"
 STATE_EXECUTOR_TOOL_LOG = "temp:co_scientist_executor_tool_log"
+STATE_EXECUTOR_TOOL_RETRY_COUNT = "temp:co_scientist_executor_tool_retry_count"
+STATE_EXECUTOR_EVIDENCE_RETRY_FEEDBACK = "temp:co_scientist_executor_evidence_retry_feedback"
 STATE_PLAN_PENDING_APPROVAL = "co_scientist_plan_pending_approval"
 STATE_MODEL_ERROR_PASSTHROUGH = "temp:co_scientist_model_error_passthrough"
 STATE_BENCHMARK_LOOP_COUNT = "temp:co_scientist_benchmark_loop_count"
@@ -654,77 +674,41 @@ COMPOUND_QUERY_REQUIRED_TOOLS = {
 
 
 PLANNER_INSTRUCTION_TEMPLATE = """
-You are the internal planner for biomedical investigation.
+Task
+Create an executable evidence-collection plan for the user's biomedical research objective. Planning ends before evidence collection; a separate component synthesizes the final report.
 
-Available MCP tools:
+Inputs
+- The user's objective and any revision feedback. Preserve the original scientific scope unless the user changes it.
+- The MCP tool catalog below. Tool descriptions and evidence contracts define what each source can establish.
+- Tool domains, source-routing policy, and optional planning skills.
+
+Available MCP tools
 __TOOL_CATALOG__
 
-Tool domains (used to focus the executor on the most relevant tools for each step):
+Tool domains
 __DOMAIN_CATALOG__
 
-Source precedence rules for overlapping tools:
+Source routing
 __ROUTING_POLICY__
 
-Specialized planning skills:
+Specialized planning skills
 __SKILL_POLICY__
 
-Rules:
-- Build a concrete execution plan before any evidence collection begins.
-- Break the objective into ordered, atomic subtasks.
-- Preserve specific entities supplied by the user (genes, diseases, drugs, cohorts, variants, datasets)
-  in the objective and relevant step goals. Do not replace real entities with placeholders like
-  "target gene", "the gene", "target disease", or "the compound".
-- Do not invent example values or IDs. If an entity is missing and the plan cannot be executed without it,
-  ask for clarification instead of emitting placeholder-based steps.
-- Prioritize high-signal subtasks that reduce uncertainty first.
-- When the objective is centered on clinical trials, GEO datasets, or oncology target validation, load the matching planning skill before finalizing the step sequence.
-- For archive-style dataset discovery (for example OpenNeuro, NEMAR, DANDI, Brain-CODE, CONP), prefer one archive per step and plan around simple keyword or modality checks rather than compound boolean expressions.
-- When archive metadata is likely sparse, add a fallback browse/inspection step instead of assuming a zero-hit disease keyword search proves absence.
-- Choose the number of steps needed for the objective. Avoid unnecessary fragmentation.
-- Match each step to real tool capability. Do not write completion conditions that require lineage-, mutation-, cell-line-, or cohort-filtered
-  results from a tool that only returns release-level or aggregate summaries.
-- Do not assign model-first or cohort-first drug-discovery steps to compound-response tools that require a named drug/compound query
-  (`get_gdsc_drug_sensitivity`, `get_prism_repurposing_response`, `get_pharmacodb_compound_response`). Use those only after a
-  candidate compound is already named, or rewrite the step so the completion condition matches what the tool can actually return.
-- Do not create standalone schema-inspection or table-discovery steps unless the user explicitly asked about schemas
-  or the BigQuery lookup is already identifier-ready and schema inspection is unavoidable. In most cases, schema
-  inspection should happen inline inside an evidence-gathering step, not as a reportable deliverable.
-- Each step must include: id, goal, tool_hint, domains, completion_condition.
-- Every step must call at least one tool. Pick tool_hint from the catalog above.
-- Pick domains from the domain list above. Include 1-3 domains most relevant to the step.
-  The executor will always have access to 'data' and 'literature' tools in addition to
-  the domains you specify. Choose domains that match the step's investigation area.
-- NEVER put invented example values or IDs in the goal or completion_condition. Real user-provided entities
-  are not examples; keep them.
-- Use step ids S1, S2, S3, ... in order.
+Planning criteria
+1. Preserve every user-supplied entity, comparison, exclusion, cohort, date, release, and requested output. Resolve missing identifiers with an appropriate source when possible; never substitute an invented placeholder or identifier for a required entity.
+2. Decompose the objective into the smallest useful sequence of evidence dimensions. Each step must gather new external evidence and have a completion condition that its selected source can satisfy.
+3. Select tools by their documented inputs, output scope, and evidence type. Prefer direct structured sources for measurable facts and literature for scientific interpretation or corroboration. Do not add a report-writing step.
+4. Keep repeated work together when one source and one evidence criterion can cover multiple named entities. Keep work separate when sources answer different evidence dimensions or require different acceptance criteria.
+5. Order steps by dependency and information value. Resolve identifiers before tools that require them. Represent dependencies explicitly with `depends_on`.
+6. When a step produces entities for later steps, describe the handoff structurally. Use the user's requested number when one is given. Otherwise choose `max_items` only when the scientific method or source scope provides a defensible bound; never insert a universal shortlist size. Ranking criteria must be observable in the planned evidence, and API return order is not a ranking unless the source documents it as one.
+7. Design citation coverage appropriate to the claim. Stable database accessions and record URLs can support record-level claims. Add literature when the objective requires scientific interpretation that those records cannot establish.
+8. Choose only the relevant coverage archetype and evidence dimensions. Record material omissions with a reason instead of adding low-value steps to fill a template.
 
-Coverage contract:
-- Before writing steps, choose one coverage.archetype: target_validation, dataset_discovery, clinical_trials,
-  comparative_assessment, structured_data, entity_resolution, safety_risk, literature_review, or other.
-- Record the planning skills you actually used in coverage.selected_skills.
-- For target-validation objectives, coverage.covered_dimensions should reflect the evidence families actually represented
-  by steps: human_disease_association, tumor_context, dependency_selectivity, tractability_pharmacology,
-  clinical_translation, model_organism_context, and literature_corroboration.
-- If an expected evidence family is intentionally skipped, add it to coverage.omitted_dimensions with a short reason.
-- Prefer steps whose completion condition matches one primary evidence dimension. Pair complementary sources in one step
-  only when they answer the same dimension and the completion condition names both.
-
-Citation requirement:
-- A final report without citations is incomplete. Every plan MUST include at least one step
-  whose tool_hint is a source that returns individual citable identifiers:
-  search_pubmed, search_pubmed_advanced, get_pubmed_abstract, get_paper_fulltext, search_openalex_works,
-  search_clinical_trials.
-- If ALL steps use only aggregate or structured-data tools (run_bigquery_select_query,
-  list_bigquery_tables, summarize_clinical_trials_landscape, search_reactome_pathways,
-  get_string_interactions, search_uniprot_proteins, get_uniprot_protein_profile,
-  search_openalex_authors, rank_researchers_by_activity), you MUST append a dedicated
-  literature corroboration step:
-    - tool_hint: search_pubmed (or search_openalex_works or search_clinical_trials)
-    - goal: "Find and record PMIDs / DOIs / NCT numbers for the key claims from the preceding steps."
-    - completion_condition: "At least 3 specific identifiers (PMID, DOI, or NCT) are recorded."
-- Place the literature step AFTER the aggregate steps so it can incorporate their findings.
-- For compare / rank / prioritize questions about named mechanisms, targets, or modalities, do NOT make a literature-only plan unless the user explicitly asked for literature-only review. Use at least one structured evidence source (for example Open Targets or GWAS), at least one clinical / pharmacology / tractability source (for example ClinicalTrials.gov, Guide to Pharmacology, DGIdb, or DailyMed when relevant), and literature for caveats or synthesis.
-- When the query names mechanism classes rather than canonical targets or genes (for example amylin, glucagon, MC4R, or GDF15-based approaches), add an explicit mapping step first so later steps can query structured sources against the correct targets, receptors, or lead programs.
+Clarifications
+- Use one to three domains per step. The executor also receives the always-available data and literature domains.
+- Treat source search, record inspection, and lightweight pagination as one step when they serve one completion condition.
+- Schema discovery is an execution detail unless the user asks about schemas or it is itself the evidence objective.
+- Use step IDs S1, S2, S3, ... in order. Every dependency must point to an earlier step.
 
 __BQ_POLICY__
 
@@ -732,7 +716,7 @@ Output requirements:
 - Return ONLY valid JSON (no markdown, no prose) matching this shape:
   {
     "schema": "plan_internal.v1",
-    "objective": "<restated objective — a single clear research question; if this is a revision, synthesize the original query and revision feedback into one coherent question>",
+    "objective": "<restated objective — a single clear research question; on revision, preserve the original scientific objective and incorporate only feedback that changes research scope, not workflow-only feedback>",
     "success_criteria": ["..."],
     "coverage": {
       "archetype": "<target_validation | dataset_discovery | clinical_trials | comparative_assessment | structured_data | entity_resolution | safety_risk | literature_review | other>",
@@ -747,201 +731,116 @@ Output requirements:
       {
         "id": "S1",
         "goal": "...",
-        "tool_hint": "<tool name or BigQuery dataset from the catalog, e.g. open_targets_platform, search_pubmed, search_clinical_trials, gnomad>",
+        "tool_hint": "<exact tool name or BigQuery dataset from the catalog>",
         "domains": ["<domain1>", "<domain2>"],
-        "completion_condition": "..."
+        "depends_on": [],
+        "completion_condition": "...",
+        "handoff": null
       }
     ]
+  }
+
+For a step whose outputs are consumed later, replace `handoff: null` with:
+  {
+    "entity_type": "<gene | variant | compound | dataset | trial | paper | disease | phenotype | protein | pathway | other>",
+    "selection_mode": "<ranked | unranked | all_matching>",
+    "selection_criteria": ["<observable criterion>"],
+    "max_items": null
   }
 """
 
 
 STEP_EXECUTOR_INSTRUCTION_TEMPLATE = """
-You execute ONE plan step at a time using biomedical research tools.
-Follow a strict Reason-Act-Observe cycle:
+Task
+Execute exactly one plan step with the biomedical tools supplied in the current execution context. Finish with a grounded result that later steps and the report synthesizer can consume.
 
-1. REASON: Read the current step goal and think about what information you need and which tool/query is best.
-2. ACT: Call the appropriate MCP tool.
-3. OBSERVE: Review the tool results. If insufficient or the completion condition is not met, reason again and try a different query or tool.
-4. CONCLUDE: When the step's completion condition is met (or the step is blocked), write your findings summary.
+Process
+1. Read the objective, current step, dependencies, handoff contract, completion condition, and tool evidence contracts.
+2. Choose the primary tool whose documented evidence type matches the completion condition.
+3. Call at least one evidence tool and inspect the returned fields. Continue only when another call can resolve a specific missing field or identifier.
+4. Mark the step completed when the evidence satisfies the completion condition. Mark it blocked when the required evidence or input is unavailable or the available sources cannot support the requested claim.
 
-The tool list for the current step is provided in the execution context below.
-
-Source precedence rules for overlapping tools:
+Source routing
 __ROUTING_POLICY__
 
-Rules:
-- Focus ONLY on the current step provided in the execution context.
-- You MUST call at least one tool before returning a result.
-- Load a relevant specialized skill when the step depends on citation grounding, clinical-trial heuristics, variant interpretation, GEO dataset triage, or oncology target-validation reasoning.
-- If a tool call fails or returns insufficient data, first try an alternative query or another tool in the same evidence family
-  (e.g. search_pubmed <-> search_openalex_works).
-- Switch to generic BigQuery tools only when the current step is explicitly BigQuery-backed or clearly requires structured SQL
-  against a named BigQuery dataset. Do not substitute BigQuery for specialized screening, dependency, or pharmacogenomic tools
-  just because the first query was incomplete.
-- For `query_monarch_associations`, use only the supported association modes from the tool schema, and pass a normalized `entityId` CURIE when you already resolved the gene, disease, or phenotype.
-- For Ensembl canonical-transcript or TSS questions, prefer `get_ensembl_canonical_transcript` instead of inferring the TSS from a broad gene span or generic search hit.
-- For SCREEN cCRE questions, prefer the dedicated SCREEN tools over generic genome browsing: use `get_screen_nearest_ccre_assay` for nearest enhancer/promoter score lookups around a gene and `get_screen_ccre_top_celltype_assay` for highest assay-Z-score cell-type lookups on an EH38 cCRE accession.
-- For archive/search tools that do literal metadata matching (for example OpenNeuro, DANDI, NEMAR, Brain-CODE, CONP), avoid boolean query strings like `A OR B` unless the tool explicitly supports them; run separate simple searches instead.
-- For dataset archives with sparse disorder labels, a zero-hit disease query is not enough to conclude the archive has no relevant data; retry with modality, task, study name, or archive browsing before blocking the step.
-- If no tool can satisfy the step after trying alternatives, state clearly that the step is BLOCKED and why.
-- For search_clinical_trials and summarize_clinical_trials_landscape, the `status` argument must be a
-  single registry enum such as `RECRUITING`, `COMPLETED`, `ACTIVE_NOT_RECRUITING`, or `TERMINATED`.
-  Never pass boolean expressions like `RECRUITING OR ACTIVE_NOT_RECRUITING` as the `status` value.
-- If the goal or completion_condition contains an example value (marked with "e.g." or similar),
-  treat it as illustrative — accept any valid result that fulfills the intent, not the exact example value.
-- Prioritize high-signal evidence before broad expansion.
-- Surface contradictions and unresolved gaps explicitly.
+Evidence criteria
+- Match every claim to the strongest returned field that directly supports it. Preserve units, denominators, query or cohort scope, source version, and uncertainty when present.
+- A returned record count describes the retrieved set unless the source explicitly provides a total. A zero-result search describes that query, not source-wide absence, unless coverage is demonstrably exhaustive.
+- Metadata establishes only its explicit fields. Related properties, annotations, mechanisms, outcomes, access terms, or chemical classes require their own returned evidence.
+- Aggregate counts become rates, frequencies, or prevalence only when a valid denominator is available. Associations become causal or mechanistic claims only when the source supplies that evidence.
+- Registry phase, status, enrollment, or activity establishes development metadata; efficacy or safety comparisons require outcome evidence.
+- Distinct names or identifiers establish distinct records, not distinct biological mechanisms, chemical scaffolds, or therapeutic classes.
+- Keep entity-to-identifier associations local. Connect an identifier to an entity or claim only when the same returned record or structured observation connects them.
+- Preserve contradictions and missing fields as explicit gaps. Include stable identifiers returned by tools in canonical form; never create one.
 
-Evidence identifiers:
-- Always include real identifiers returned by tool calls in your summary. Never fabricate identifiers.
-  Use canonical formats:
-  Literature: PMID:XXXXXXXX, DOI:10.xxxx/..., NCT########, OpenAlex:WXXXXXXX, PMC########
-  Databases:  UniProt:XXXXXX, PubChem:NNNN, PDB:XXXX, rsNNNNNN, CHEMBLNNNN,
-              Reactome:R-HSA-NNNNNNN, GCSTNNNNNN
-- When a tool returns a database record identifier (UniProt accession, PubChem CID, PDB code,
-  rsID, ChEMBL ID, Reactome stable ID, GWAS Catalog study ID), always mention it in your summary.
-- If the primary tool for this step does not return individual document IDs (e.g. BigQuery
-  aggregate queries), make a secondary call to search_pubmed or search_openalex_works using
-  key terms from the findings to harvest supporting PMIDs or DOIs.
+Dependency and handoff criteria
+- Use prior steps listed in `depends_on` as required upstream inputs. Other prior results may provide context but cannot replace current-step evidence.
+- If the step has a `handoff`, return selected entities by name and stable identifier when available. Apply its selection mode, criteria, and optional limit, and give a concise evidence-based reason for each selection.
+- A count without entity identities is not a usable handoff. When no defensible ranking is available, preserve the set as unranked.
 __BQ_POLICY__
 
-Output guidance:
-After completing your tool calls, write a clear findings summary. Your summary should:
-- State the key findings from this step in concrete terms (gene names, scores, trial phases, etc.)
-- Include all evidence identifiers inline (PMID, DOI, NCT, UniProt, etc.)
-- Explicitly describe key claims as atomic statements (e.g. "LRRK2 is associated with Parkinson disease
-  with an overall association score of 0.815 per Open Targets Platform")
-- For result-limited or paginated search tools, treat the number returned by the tool as a retrieval count, not as the full source count, unless the tool explicitly reports a source total. Prefer wording like "returned", "showing", or "sample of X" over "there are X" when the universe total is unknown.
-- For DGIdb, Guide to Pharmacology, or ChEMBL evidence, do not stop at interaction counts. Name representative compounds and include interaction type, approval/experimental status, potency/score, or PMIDs when available.
-- For ClinicalTrials.gov evidence, do not stop at study counts. Include representative NCT IDs, named interventions, statuses, phases, and note when counts reflect only fetched studies rather than the full registry.
-- When a tool returns an exact DNA/RNA/protein sequence, copy it character-for-character from the source result. Preserve the first base/residue, preserve order, and normalize to plain uppercase sequence text.
-- Do not convert decimal fractions into percentages unless the step or user explicitly asks for a percent. If a tool returns a fraction like `gc_fraction`, keep it as a fraction.
-- Note any contradictions, gaps, or limitations discovered
-- State whether this step is COMPLETED or BLOCKED (and why if blocked)
-- Do NOT embed raw tool response envelopes or large payload objects; summarize tool results in
-  plain sentences instead
-- Keep the summary concise but thorough — capture the full richness of findings without padding
+Output
+Return a concise findings summary or the requested step JSON. State atomic findings with the evidence values and identifiers that support them, list unresolved gaps, and state whether the step is COMPLETED or BLOCKED. Do not reproduce raw response envelopes or large payloads.
 """
 
 
 SYNTHESIZER_INSTRUCTION = """
-You are the final biomedical report synthesizer.
-You will receive structured state context (objective, plan steps, step results, coverage status, and a source_reference mapping).
+Task
+Answer the biomedical research objective by synthesizing the supplied evidence context. The context contains normalized claims, source-linked observations, execution coverage, and source-specific interpretation limits.
 
-Your report MUST follow this exact section structure:
+Evidence criteria
+1. Use `claim_synthesis_summary` to identify supported and mixed claims. Use `tool_observations` and `structured_observations` to connect each entity, value, and identifier to its source.
+2. Match claim strength to evidence strength and independence. Preserve disagreements, missing fields, partial coverage, units, denominators, cohorts, query scope, and source versions.
+3. Apply each step's `interpretation_constraints`. More generally, a search result is not an exhaustive census without a source total; metadata proves only its explicit fields; aggregate counts are not rates without denominators; associations are not causal mechanisms; registry activity is not an outcome; and different names are not proof of different classes or structures.
+4. Attach citations to the smallest claim they support. Use human-readable source names and canonical identifiers. Associate an identifier with an entity only when the context links them in the same observation or record.
+5. Answer from the collected evidence. State an unresolved question as unresolved instead of filling it from general knowledge.
+
+Output
+Return user-facing Markdown with this structure:
 
 ## TLDR
-A direct, synthesized answer to the research question written as a comprehensive passage (2-4 paragraphs) that a biomedical researcher can read and act on. This is NOT a summary of the process — it is THE ANSWER.
-- Lead with the most important conclusion. Be specific: include gene names, drug names, magnitudes, effect sizes, trial phases, or other concrete details.
-- Frame confidence based on evidence strength: use "strong evidence supports…" when multiple independent high-quality sources agree, "preliminary data indicate…" when evidence is thin, and "evidence is divided…" when sources conflict.
-- After the lead conclusion, expand with supporting context: mention key data points, notable caveats, and the overall weight of evidence across the dimensions investigated.
-- When the answer naturally involves multiple items, categories, or dimensions, use bullet points.
-- If the plan is incomplete, note that the answer is based on partial evidence.
+A direct answer led by the main conclusion, its confidence, and the most decision-relevant evidence. Note partial coverage when applicable.
 
 ## Evidence Breakdown
-Within this section, organize findings by THEME (use ### subsections with descriptive headings, e.g. "### Human Genetics Support" not "### Step 1"). Write each subsection as information-dense prose with inline evidence citations:
-- State the finding clearly, then provide the supporting data with source names and identifiers (PMID, DOI, NCT, UniProt, etc.) inline.
-- Attach citations to the smallest sensible claim unit. Do not end a long paragraph with one bulk citation dump if the sources support different claims or different named datasets.
-- When naming multiple datasets, trials, variants, or papers in one sentence or paragraph, connect each named item to its own supporting citation when available.
-- Within each theme subsection, write 1-3 connected paragraphs with a clear topic sentence, supporting detail, and brief interpretation of what the combined evidence means.
-- Include specific numbers, scores, measurements, and identifiers rather than vague summaries.
-- Note the confidence level (high, moderate, low, or mixed) and number of independent sources.
-- If evidence on a finding is contradictory, briefly note the disagreement (details go in Conflicting Evidence).
-- Aim for substantive prose paragraphs — avoid sparse bullet-only lists or large tables when prose conveys the same information more clearly.
-- Weave evidence into continuous narrative prose; do not present the subsection as disconnected claim snippets or a field-by-field dump of the evidence context.
-- Cover each relevant theme reflected in the provided evidence context; do not collapse multiple evidence themes into one short paragraph.
-- This section should usually be materially longer and more detailed than the TLDR when multiple themes, sources, or datasets were collected.
+Organize by scientific theme rather than plan-step order. Use descriptive `###` headings, cohesive analysis, concrete values, claim-local citations, confidence, and material caveats. Use a compact table only when it makes a multi-item comparison clearer.
 
 ### Conflicting & Uncertain Evidence
-For each area where sources disagree or evidence is equivocal:
-- State the disagreement clearly.
-- List which sources support each side, with identifiers.
-- Note the current lean (if any) and why, based on source quality/weight.
-- Suggest what would resolve it (e.g. an orthogonal assay, a larger cohort, etc.).
-Omit this section entirely if there are no mixed-evidence findings.
+Include only when evidence is mixed or a material claim remains uncertain. Describe each side, the supporting sources, the current lean if justified, and what evidence would resolve it.
 
 ## Limitations
-Bullet list of:
-- Overall caveats (source coverage, data recency, methodology limitations).
-- Open gaps the investigation could not fill.
-- Planned analyses that could not be executed and why.
+List source, method, recency, coverage, and execution limitations that materially affect interpretation.
 
 ## Recommended Next Steps
-Numbered list of 3+ actionable follow-ups framed as a researcher would think about them: experimental validations, confirmatory literature searches, clinical data checks, risk reduction strategies, or monitoring recommendations. Each with a brief rationale.
+List actionable follow-ups justified by unresolved decisions or evidence gaps. Do not pad the list to reach an arbitrary count.
 
-Rules:
-- Ground every claim in the provided evidence. Do not invent unsupported claims.
-- Use `claim_synthesis_summary` as the primary arbitration layer for substantive findings. It already consolidates overlapping claims, weights sources by evidence type, and flags mixed-evidence findings.
-- Use `evidence_briefs` to ensure the Evidence Breakdown covers the main themes, claims, source counts, and identifiers present in the collected evidence.
-- Treat `evidence_briefs` as scaffolding for synthesis, not as an output template. Convert them into readable analysis rather than mirroring their fields.
-- Do not treat all sources as equal. When claims disagree, prefer the interpretation backed by higher-weighted sources and stronger claim support, but still surface the disagreement explicitly.
-- If `mixed_evidence_claims` are present, address them in Conflicting & Uncertain Evidence instead of silently choosing one side.
-- Be specific and thorough — avoid terse output.
-- NEVER organize findings by step execution order. Group by theme/topic.
-- Use ONLY human-readable database/source names (e.g. "PubMed", "ClinicalTrials.gov"). NEVER mention tool names (like run_bigquery_select_query, search_clinical_trials, etc.).
-- Never reproduce raw ontology predicates or internal mode names such as `biolink:...`, `predicate: ...`, `disease_to_gene_causal`, or `disease_to_gene_correlated`. Translate them into plain English or omit them if they do not help the reader.
-- When citing database counts (e.g. clinical trials, PubMed results): use the total reported by the source when available (e.g. "X of Y total"). If the source says "total not provided" or "more may exist" or "X returned (registry total unknown)", do NOT state "a total of X" or "X total studies" — instead say "at least X" or "X studies (sample; full registry count not determined)".
-- For result-limited search tools more generally, treat raw returned counts as retrieval counts, not universe counts. Unless the source explicitly reports a total, phrase them as "X returned", "X shown", or "sample of X fetched records", and avoid using those counts as primary evidence of breadth or validation.
-- Do not use DGIdb or ClinicalTrials.gov count-only statements as standalone evidence when richer detail was collected. If named compounds or trials are available, include representative compounds, interaction types, approval/experimental status, NCT IDs, interventions, phases, or statuses instead of only reporting totals.
-- For DGIdb specifically, interaction counts are contextual catalog metadata, not target-validation evidence by themselves. Prefer named compounds, interaction types, and supporting PMIDs over raw interaction totals.
-- For ClinicalTrials.gov specifically, make clear when study counts reflect fetched subsets, paginated samples, or query-limited matches rather than the entire registry or only direct target-modulating intervention trials.
-- Include specific identifiers inline when available (PMID, DOI, NCT numbers).
-- Use APA-style author-year citations for literature references in prose when paper metadata is available; keep trial and database identifiers inline as linked identifiers rather than moving them into paper-style parenthetical citations.
-- Prefer claim-local citations over paragraph-end citation bundles. If a sentence contains several distinct findings, place citations immediately after the supported clause or item.
-- For database records, include identifiers with their canonical prefix so they can be linked: UniProt:P00533, PubChem:2244, PDB:1ABC, rs7903146, CHEMBL25, Reactome:R-HSA-1234567, GCST000001.
-- NEVER include raw URLs, API endpoints, or links to JSON output.
-- Return user-facing Markdown only (not JSON).
+Writing criteria
+- Be specific, concise, and useful to a biomedical researcher.
+- Translate internal predicates and tool names into plain scientific language.
+- Keep stable database URLs only when they are the source's citable record identifier; omit API endpoints and raw JSON links.
+- Return Markdown only.
 """
 
 
-ROUTER_INSTRUCTION = """You are the intent router for the AI Co-Scientist, a biomedical research assistant.
-Your ONLY job is to read the user's message and the session context below, then IMMEDIATELY transfer
-to the correct specialist agent. Never answer questions yourself — always transfer.
+ROUTER_INSTRUCTION = """Task
+Classify the user's message into exactly one destination and immediately transfer to that agent. Do not answer the biomedical question yourself.
 
-Available agents:
+Destinations
+- `research_workflow`: A request that needs current external evidence, database or literature retrieval, comparison, ranking, evaluation, safety or efficacy assessment, variant interpretation, dataset discovery, target validation, or management of an active research workflow.
+- `report_assistant`: A question or edit about an existing report, or one narrowly scoped follow-up lookup, when `report_exists` is true.
+- `general_qa`: A stable textbook-style biomedical explanation that can be answered without current evidence retrieval, comparison, ranking, or evaluation.
+- `clarifier`: A request whose missing entity, scope, comparison, or identifier prevents a meaningful answer. An individual variant-classification request needs a specific variant identity such as HGVS, genomic coordinates with build, rsID, or protein change.
 
-1. **general_qa** — Answers factual biomedical questions directly from knowledge (no database lookups).
-   Examples: "What is CRISPR?", "Explain the MAPK signaling pathway", "What are common side effects of metformin?"
+Routing criteria
+1. Preserve active workflow continuity: pending approval, workflow commands, pending steps, and new comprehensive investigations go to `research_workflow`.
+2. Use `report_assistant` only for work grounded in an existing report. Batch evidence collection belongs to `research_workflow`.
+3. Use `general_qa` only when external evidence is unnecessary.
+4. Use `clarifier` only when the missing information blocks every reasonable interpretation.
+5. When evidence needs are uncertain, choose `research_workflow`.
 
-2. **clarifier** — Asks the user to clarify vague, incomplete, or nonsensical queries.
-   Examples: "evaluate the thing", "compare them", random characters, overly broad requests with no focus
-
-3. **research_workflow** — Full evidence-gathering research pipeline: plans an investigation, searches
-   biomedical databases and APIs, and produces a formal report with citations. Also handles all workflow
-   commands and plan management.
-   Examples: "Evaluate LRRK2 as a therapeutic target for Parkinson disease",
-   "Compare the safety profiles of SGLT2 inhibitors vs DPP-4 inhibitors",
-   "Among amylin, glucagon, MC4R, and GDF15-based approaches, which obesity mechanisms look strongest beyond GLP-1?",
-   "Are TYK2 inhibitors safer than JAK inhibitors in psoriasis and psoriatic arthritis?",
-   "Why is KRAS G12C monotherapy more effective in NSCLC than colorectal cancer, and which combination strategies have the best biological and clinical support in colorectal cancer?",
-   any command (approve, continue, finalize, revise:, history, rollback, switch)
-
-4. **report_assistant** — Interacts with an existing research report: answers questions about findings,
-   restructures sections, and performs SINGLE-ITEM follow-up lookups using tools.
-   ONLY available when report_exists is True.
-   Examples: "What does this p-value mean?", "Expand the limitations section",
-   "Get the abstract for PMID:38912345", "Restructure the evidence section"
-
-Routing priority rules (check in order):
-1. If plan_pending_approval is True → transfer to research_workflow
-2. Workflow commands (approve, continue, finalize, revise:, history, rollback, switch) → research_workflow
-3. If has_pending_steps is True and user sends a continuation-like message → research_workflow
-4. If report_exists AND the user asks about the report, wants restructuring, or a single-item lookup → report_assistant
-5. If report_exists AND the user wants batch/comprehensive work (e.g. "find full text for all cited papers",
-   "retrieve full text for every reference", "fetch abstracts for all PMIDs in the report") → research_workflow
-6. If report_exists AND the user wants a NEW comprehensive investigation → research_workflow
-7. If the query is a clear research question requiring evidence from databases → research_workflow
-8. If the query is a straightforward biomedical knowledge question → general_qa
-9. If the query is ambiguous, incomplete, or doesn't make sense → clarifier
-
-Important routing bias:
-- Use **general_qa** ONLY for obvious textbook-style questions that can be answered from stable background knowledge without comparing options, ranking candidates, or weighing external evidence.
-- If the user is asking to evaluate, compare, rank, prioritize, assess safety/efficacy/selectivity/pathogenicity, judge tractability, identify datasets, or analyze a named set of options, route to **research_workflow** even if they did not name sources explicitly.
-- If you are unsure between **general_qa** and **research_workflow**, choose **research_workflow**.
-
-You MUST always transfer. Never respond with text yourself.
+Output
+Always call the transfer function for the selected destination. Return no explanatory text.
 """
+
 
 
 GENERAL_QA_INSTRUCTION = """You are a knowledgeable biomedical expert within the AI Co-Scientist platform.
@@ -1078,30 +977,19 @@ __ROUTING_POLICY__
 """
 
 
-CLARIFIER_INSTRUCTION = """You are a helpful query assistant for the AI Co-Scientist, a biomedical research platform.
-The user's query is unclear, ambiguous, or incomplete. Help them formulate a clear request.
+CLARIFIER_INSTRUCTION = """Task
+Help the user supply the minimum missing information needed for a meaningful biomedical answer or investigation.
 
-Your approach:
-1. Identify specifically what is unclear or missing (target, scope, comparison, outcome).
-2. Ask focused clarifying questions (1-3 questions, not a long list).
-3. Suggest 2-3 well-formed example queries that might match what the user intended.
+Criteria
+- Identify the specific missing entity, identifier, comparison, population, outcome, timeframe, or evidence scope.
+- Ask one to three focused questions. Ask only questions whose answers would materially change or unblock the work.
+- For an individual variant interpretation, request a unique variant identity: genomic or transcript HGVS, protein change, rsID, or genomic coordinate with reference build.
+- When useful, offer a compact query template with labeled placeholders rather than suggesting unrelated named diseases, genes, or drugs.
 
-Be friendly, specific, and helpful. Don't just say "please clarify" — explain WHAT needs clarifying.
-
-Examples:
-- Vague: "evaluate the thing" → "Could you specify what you'd like me to evaluate? For example:
-  • 'Evaluate LRRK2 as a therapeutic target for Parkinson disease'
-  • 'Evaluate the efficacy of pembrolizumab in NSCLC'
-  • 'Evaluate the safety profile of SGLT2 inhibitors'"
-
-- Missing context: "compare them" → "I'd be happy to run a comparison. Could you specify which
-  entities to compare? For instance, two drugs, two gene targets, or two treatment approaches?"
-
-- Too broad: "cancer" → "That's a very broad topic. Could you narrow it down? For example:
-  • A specific cancer type (e.g. 'triple-negative breast cancer')
-  • A specific gene or target (e.g. 'BRAF V600E in melanoma')
-  • A specific therapeutic question (e.g. 'emerging immunotherapy combinations for NSCLC')"
+Output
+Respond directly to the user in plain language. Explain what is missing and why it matters, without starting the investigation or inventing an example answer.
 """
+
 
 
 REPORT_ASSISTANT_INSTRUCTION = """You are the report assistant for the AI Co-Scientist.
@@ -1193,12 +1081,17 @@ def _extract_revision_feedback(text: str) -> str | None:
     return None
 
 
-def _render_plan_approval_prompt() -> str:
+def _render_plan_approval_prompt(*, has_blockers: bool = False) -> str:
+    blocker_note = (
+        "\n- This plan has tool-capability blockers. `approve` will revise it first; evidence execution will remain paused."
+        if has_blockers else ""
+    )
     return (
         "\n\n---\n"
         "**Please review the plan above.** Respond with:\n"
         "- `approve` \u2014 proceed with execution\n"
         "- `revise: <your feedback>` \u2014 request changes to the plan"
+        f"{blocker_note}"
     )
 
 
@@ -1647,8 +1540,8 @@ def _is_obvious_research_workflow_query(user_text: str) -> bool:
         return True
 
     if (
-        stripped.startswith(("for ", "how should ", "does "))
-        and " variant " in normalized
+        stripped.startswith(("for ", "how should ", "does ", "is ", "across "))
+        and any(term in normalized for term in (" variant ", " variants "))
         and any(term in normalized for term in (" pathogenic ", " pathogenicity ", " gain-of-function ", " loss-of-function "))
     ):
         return True
@@ -1662,6 +1555,40 @@ def _is_obvious_research_workflow_query(user_text: str) -> bool:
         return True
 
     return False
+
+
+def _needs_specific_variant_clarification(user_text: str) -> bool:
+    """Return True when an individual variant-classification request lacks its identity."""
+    normalized = _normalize_user_text(user_text)
+    if "variant" not in normalized:
+        return False
+    if not any(
+        term in normalized
+        for term in ("pathogenic", "pathogenicity", "gain-of-function", "loss-of-function")
+    ):
+        return False
+
+    # Requests about variant classes or multiple known variants are answerable
+    # as gene-/mechanism-level reviews; this guard is only for one unspecified
+    # individual variant.
+    if "variants" in normalized and not re.search(r"\b(?:the|this|that) variant\b", normalized):
+        return False
+    if not re.search(r"\b(?:a|an|the|this|that)\b[^?.,;]{0,100}\bvariant\b", normalized):
+        return False
+
+    identifier_patterns = (
+        r"\brs\d+\b",
+        r"\b(?:NM|NC|NR|NP|ENST|ENSP)_?\d+(?:\.\d+)?:[cgmnpr]\.\S+",
+        r"\b(?:c|g|m|n|p|r)\.[A-Za-z0-9_+*?>=\-]+",
+        r"\bchr(?:[0-9]{1,2}|x|y|m):\d+(?:[-:]\d+)?\b",
+        r"\b\d+[ACGT]>[ACGT]\b",
+    )
+    if any(re.search(pattern, user_text, re.IGNORECASE) for pattern in identifier_patterns):
+        return False
+    # Keep amino-acid shorthand case-sensitive so alphanumeric gene symbols
+    # are not mistaken for protein substitutions.
+    protein_change_re = r"\b(?:[A-Z][a-z]{2}|[A-Z])\d+(?:[A-Z][a-z]{2}|[A-Z*])\b"
+    return re.search(protein_change_re, user_text) is None
 
 
 def _render_lookup_provenance_scope(entry: Mapping[str, Any]) -> str:
@@ -3760,6 +3687,100 @@ def _build_plan_entity_binding_warnings(objective: str, steps: list[dict[str, An
     return _dedupe_str_list(warnings, limit=8)
 
 
+def _build_plan_tool_capability_blockers(steps: list[dict[str, Any]]) -> list[str]:
+    """Find completion conditions that the selected MCP tool cannot satisfy.
+
+    These checks intentionally cover only hard schema/output mismatches. Dynamic
+    source coverage (for example, whether a named drug exists in GDSC) remains a
+    warning rather than a blocker.
+    """
+    blockers: list[str] = []
+    comparison_re = re.compile(
+        r"\b(?:compar(?:e|ed|ing|ison)|versus|vs\.?|between|differential|differ(?:s|ence|ences)?|across)\b",
+        re.IGNORECASE,
+    )
+    subgroup_re = re.compile(
+        r"\b(?:lineages?|tissues?|cancer types?|tumou?r types?|cell lines?|models?|cohorts?|subtypes?|mutation[- ]defined|molecular subsets?)\b",
+        re.IGNORECASE,
+    )
+    co_mutation_re = re.compile(
+        r"\b(?:co[- ]?occurr(?:ing|ence|ences)?|co[- ]?mutations?|comutations?|concurrent (?:alterations?|mutations?))\b",
+        re.IGNORECASE,
+    )
+    normalized_frequency_re = re.compile(
+        r"\b(?:cohort[- ]normalized|mutation (?:frequency|frequencies|rate|rates)|percent(?:age)?s?|prevalence)\b",
+        re.IGNORECASE,
+    )
+    synthesis_action_re = re.compile(
+        r"\b(?:synthesi[sz](?:e|es|ed|ing)|integrat(?:e|es|ed|ing)|combine(?:s|d|ing)?)\b",
+        re.IGNORECASE,
+    )
+    preceding_evidence_re = re.compile(
+        r"\b(?:preceding|previous|prior) steps?\b|\ball (?:gathered|collected) evidence\b|\bevidence from (?:the )?(?:preceding|previous|prior) steps?\b",
+        re.IGNORECASE,
+    )
+
+    for step in steps:
+        step_id = str(step.get("id", "S?") or "S?")
+        tool_hint = str(step.get("tool_hint", "") or "").strip()
+        text = _plan_match_text(step.get("goal"), step.get("completion_condition"))
+        if (
+            tool_hint == "get_depmap_gene_dependency"
+            and comparison_re.search(text)
+            and subgroup_re.search(text)
+        ):
+            blockers.append(
+                f"Tool capability mismatch: {step_id} asks `get_depmap_gene_dependency` for a subgroup comparison, "
+                "but that tool only returns release-level named-gene summaries. Use a source that supports the requested "
+                "comparison or rewrite the step around aggregate dependency evidence."
+            )
+        if tool_hint == "get_cancer_mutation_profile" and co_mutation_re.search(text):
+            blockers.append(
+                f"Tool capability mismatch: {step_id} asks `get_cancer_mutation_profile` for co-occurring alterations, "
+                "but that tool has no sample-level co-mutation output. Use a capable source or change the requested evidence."
+            )
+        if tool_hint == "get_cancer_mutation_profile" and normalized_frequency_re.search(text):
+            blockers.append(
+                f"Tool capability mismatch: {step_id} asks `get_cancer_mutation_profile` for normalized mutation "
+                "frequencies, but it returns absolute counts without cohort denominators. Use a capable source or ask only "
+                "for counts and recurrent protein changes."
+            )
+        if tool_hint in {"search_civic_variants", "search_civic_genes"} and (
+            co_mutation_re.search(text) or normalized_frequency_re.search(text)
+        ):
+            blockers.append(
+                f"Tool capability mismatch: {step_id} asks `{tool_hint}` for tumor prevalence or co-occurring "
+                "alterations, but CIViC returns clinical interpretations and actionability rather than cohort-level "
+                "frequency or sample-level co-mutation data."
+            )
+        if synthesis_action_re.search(text) and preceding_evidence_re.search(text):
+            blockers.append(
+                f"Redundant workflow step: {step_id} only synthesizes evidence from preceding steps. The report "
+                "synthesizer already performs this work after execution, so replace this with new evidence collection "
+                "or remove it."
+            )
+    return _dedupe_str_list(blockers, limit=8)
+
+
+def _build_plan_source_coverage_warnings(steps: list[dict[str, Any]]) -> list[str]:
+    warnings: list[str] = []
+    for step in steps:
+        tool_hint = str(step.get("tool_hint", "") or "").strip()
+        if tool_hint not in COMPOUND_QUERY_REQUIRED_TOOLS:
+            continue
+        completion = _plan_match_text(step.get("completion_condition"))
+        accepts_no_coverage = bool(
+            re.search(r"\b(?:no[- ]coverage|not (?:covered|available|found|present)|absent|unavailable|coverage gap|fallback)\b", completion)
+        )
+        if accepts_no_coverage:
+            continue
+        warnings.append(
+            f"Source coverage risk: {step.get('id', 'S?')} assumes the named compound exists in "
+            f"`{tool_hint}`. Make the completion condition accept a documented no-coverage result and a literature fallback."
+        )
+    return _dedupe_str_list(warnings, limit=8)
+
+
 def _required_target_validation_dimensions(objective: str) -> list[str]:
     text = _plan_match_text(objective)
     required = [
@@ -3779,6 +3800,7 @@ def _build_plan_quality_warnings(validated_plan: dict[str, Any]) -> list[str]:
     objective = str(validated_plan.get("objective", "") or "")
     steps = list(validated_plan.get("steps", []) or [])
     warnings: list[str] = _build_plan_entity_binding_warnings(objective, steps)
+    warnings.extend(_build_plan_source_coverage_warnings(steps))
     coverage = validated_plan.get("coverage") if isinstance(validated_plan.get("coverage"), dict) else {}
     if coverage.get("archetype") != "target_validation":
         return _dedupe_str_list(warnings, limit=8)
@@ -3838,7 +3860,7 @@ def _canonicalize_tool_hint_candidate(value: Any) -> str:
         if base in KNOWN_MCP_TOOLS or base in tool_registry.TOOL_SOURCE_NAMES:
             return base
     mapped = DEFAULT_TOOL_HINT_BY_SOURCE_LABEL.get(lookup_key) or DEFAULT_TOOL_HINT_BY_DOMAIN.get(lookup_key)
-    return mapped or text
+    return mapped or ""
 
 
 def _infer_plan_step_tool_hint(step: dict[str, Any], domains: list[str]) -> str:
@@ -3864,6 +3886,87 @@ def _infer_plan_step_tool_hint(step: dict[str, Any], domains: list[str]) -> str:
         if default_tool:
             return default_tool
     return "search_pubmed"
+
+
+def _normalize_plan_step_dependencies(value: Any, *, step_index: int) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"steps[{step_index - 1}].depends_on must be a list")
+
+    dependencies: list[str] = []
+    for raw_dependency in value:
+        dependency = re.sub(r"\s+", "", str(raw_dependency or "").upper())
+        match = re.fullmatch(r"S(\d+)", dependency)
+        if not match:
+            raise ValueError(
+                f"steps[{step_index - 1}].depends_on contains invalid step id {raw_dependency!r}"
+            )
+        dependency_index = int(match.group(1))
+        if dependency_index >= step_index:
+            raise ValueError(
+                f"steps[{step_index - 1}].depends_on must reference only earlier steps"
+            )
+        canonical = f"S{dependency_index}"
+        if canonical not in dependencies:
+            dependencies.append(canonical)
+    return dependencies
+
+
+def _normalize_plan_step_handoff(value: Any, *, step_index: int) -> dict[str, Any] | None:
+    if value in (None, "", {}):
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"steps[{step_index - 1}].handoff must be an object or null")
+
+    entity_type = _canonicalize_plan_label(value.get("entity_type"))
+    if not entity_type:
+        raise ValueError(f"steps[{step_index - 1}].handoff.entity_type must be non-empty")
+
+    selection_mode = _canonicalize_plan_label(value.get("selection_mode"))
+    allowed_modes = {"ranked", "unranked", "all_matching"}
+    if selection_mode not in allowed_modes:
+        raise ValueError(
+            f"steps[{step_index - 1}].handoff.selection_mode must be one of "
+            f"{', '.join(sorted(allowed_modes))}"
+        )
+
+    criteria = _as_string_list(
+        value.get("selection_criteria"),
+        f"steps[{step_index - 1}].handoff.selection_criteria",
+        limit=12,
+    )
+    if selection_mode == "ranked" and not criteria:
+        raise ValueError(
+            f"steps[{step_index - 1}].handoff.selection_criteria is required for ranked handoffs"
+        )
+
+    raw_max_items = value.get("max_items")
+    if raw_max_items is None:
+        max_items = None
+    elif isinstance(raw_max_items, bool) or not isinstance(raw_max_items, int):
+        raise ValueError(f"steps[{step_index - 1}].handoff.max_items must be an integer or null")
+    elif raw_max_items < 1 or raw_max_items > 1000:
+        raise ValueError(f"steps[{step_index - 1}].handoff.max_items must be between 1 and 1000")
+    else:
+        max_items = raw_max_items
+
+    return {
+        "entity_type": entity_type,
+        "selection_mode": selection_mode,
+        "selection_criteria": criteria,
+        "max_items": max_items,
+    }
+
+
+def _normalize_plan_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize step IDs without rewriting the planner's scientific scope."""
+    normalized: list[dict[str, Any]] = []
+    for step_index, source_step in enumerate(steps, start=1):
+        step = dict(source_step)
+        step["id"] = f"S{step_index}"
+        normalized.append(step)
+    return normalized
 
 
 def _validate_plan_internal(raw: dict[str, Any]) -> dict[str, Any]:
@@ -3901,14 +4004,24 @@ def _validate_plan_internal(raw: dict[str, Any]) -> dict[str, Any]:
                 "goal": _as_nonempty_str(step.get("goal"), f"steps[{idx - 1}].goal"),
                 "tool_hint": _as_nonempty_str(tool_hint, f"steps[{idx - 1}].tool_hint"),
                 "domains": domains,
+                "depends_on": _normalize_plan_step_dependencies(
+                    step.get("depends_on"),
+                    step_index=idx,
+                ),
                 "completion_condition": _as_nonempty_str(
                     step.get("completion_condition"),
                     f"steps[{idx - 1}].completion_condition",
                 ),
+                "handoff": _normalize_plan_step_handoff(
+                    step.get("handoff"),
+                    step_index=idx,
+                ),
             }
         )
 
+    steps = _normalize_plan_steps(steps)
     coverage = _normalize_plan_coverage(raw.get("coverage"), objective=objective, steps=steps)
+    planning_blockers = _build_plan_tool_capability_blockers(steps)
     planning_warnings = _build_plan_quality_warnings(
         {
             "schema": PLAN_SCHEMA,
@@ -3925,6 +4038,7 @@ def _validate_plan_internal(raw: dict[str, Any]) -> dict[str, Any]:
         "success_criteria": success_criteria,
         "steps": steps,
         "coverage": coverage,
+        "planning_blockers": planning_blockers,
         "planning_warnings": planning_warnings,
     }
 
@@ -3937,7 +4051,9 @@ def _initialize_task_state_from_plan(plan: dict[str, Any], *, objective_text: st
             "goal": step["goal"],
             "tool_hint": step["tool_hint"],
             "domains": step.get("domains", []),
+            "depends_on": list(step.get("depends_on", []) or []),
             "completion_condition": step["completion_condition"],
+            "handoff": dict(step["handoff"]) if isinstance(step.get("handoff"), dict) else None,
             "status": "pending",
             "result_summary": "",
             "evidence_ids": [],
@@ -3970,6 +4086,7 @@ def _initialize_task_state_from_plan(plan: dict[str, Any], *, objective_text: st
         "steps": steps,
         "success_criteria": validated["success_criteria"],
         "planning_coverage": validated.get("coverage", {}),
+        "planning_blockers": validated.get("planning_blockers", []),
         "planning_warnings": validated.get("planning_warnings", []),
         "latest_synthesis": None,
         "evidence_store": _new_evidence_store(),
@@ -4484,21 +4601,6 @@ STRUCTURED_OBSERVATION_GUIDANCE_BY_OVERLAP_GROUP: dict[str, dict[str, Any]] = {
             "Use `associated_with` only when the evidence is landscape-level and cannot be tied to a specific named intervention.",
             "Do not emit count-only observations from paginated searches; pair counts with representative NCT IDs, interventions, and note when the count reflects only fetched studies.",
         ],
-        "example": {
-            "observation_type": "clinical_trial",
-            "subject": {"type": "compound", "label": "BIIB122"},
-            "predicate": "tested_in",
-            "object": {"type": "disease", "label": "Parkinson disease", "id": "MONDO:0005180"},
-            "supporting_ids": ["NCT04557800"],
-            "source_tool": "search_clinical_trials",
-            "confidence": "medium",
-            "qualifiers": {
-                "nct_id": "NCT04557800",
-                "status": "RECRUITING",
-                "phase": "Phase 2",
-                "sponsor": "Biogen",
-            },
-        },
     },
     "compound_pharmacology": {
         "label": "compound pharmacology and druggability evidence",
@@ -4513,20 +4615,6 @@ STRUCTURED_OBSERVATION_GUIDANCE_BY_OVERLAP_GROUP: dict[str, dict[str, Any]] = {
             "Prefer `inhibits` or `activates` when the interaction type or mechanism is explicit; otherwise use `associated_with` for broader druggability support.",
             "Do not reduce DGIdb or target-ligand output to count-only claims; emit representative named compounds and store approval status, interaction score, potency, selectivity, and PMIDs in qualifiers when available.",
         ],
-        "example": {
-            "observation_type": "compound_pharmacology",
-            "subject": {"type": "compound", "label": "GSK2646264"},
-            "predicate": "inhibits",
-            "object": {"type": "gene", "label": "LRRK2", "id": "HGNC:18618"},
-            "supporting_ids": ["PMID:30998356"],
-            "source_tool": "search_drug_gene_interactions",
-            "confidence": "medium",
-            "qualifiers": {
-                "approval_status": "experimental",
-                "interaction_type": "inhibitor",
-                "interaction_score": "12.3",
-            },
-        },
     },
     "target_vulnerability": {
         "label": "drug-response and screening evidence",
@@ -4541,16 +4629,6 @@ STRUCTURED_OBSERVATION_GUIDANCE_BY_OVERLAP_GROUP: dict[str, dict[str, Any]] = {
             "Prefer `sensitive_in` or `resistant_in` for compound response; prefer `depends_on` or `screen_hit_in` for gene-centric screening evidence.",
             "Capture screening context in qualifiers such as dataset, metric, direction, tissue, or screen name.",
         ],
-        "example": {
-            "observation_type": "drug_response",
-            "subject": {"type": "compound", "label": "Paclitaxel", "id": "CHEMBL3658657"},
-            "predicate": "sensitive_in",
-            "object": {"type": "cell_line", "label": "A549"},
-            "supporting_ids": ["CHEMBL3658657"],
-            "source_tool": "get_pharmacodb_compound_response",
-            "confidence": "high",
-            "qualifiers": {"dataset": "PharmacoDB", "metric": "AAC", "direction": "more_sensitive", "tissue": "lung"},
-        },
     },
     "phenotype_rare_disease": {
         "label": "phenotype and rare-disease evidence",
@@ -4565,16 +4643,6 @@ STRUCTURED_OBSERVATION_GUIDANCE_BY_OVERLAP_GROUP: dict[str, dict[str, Any]] = {
             "Prefer `causal_gene_for` for curated disease-causing links, `associated_with` for broader phenotype/disease links, and `has_phenotype` for disease-to-phenotype statements.",
             "Capture query mode, association type, and evidence-count style fields in qualifiers instead of overloading the predicate.",
         ],
-        "example": {
-            "observation_type": "phenotype_association",
-            "subject": {"type": "disease", "label": "Rett syndrome", "id": "ORPHA:778"},
-            "predicate": "causal_gene_for",
-            "object": {"type": "gene", "label": "MECP2"},
-            "supporting_ids": ["ORPHA:778"],
-            "source_tool": "get_orphanet_disease_profile",
-            "confidence": "high",
-            "qualifiers": {"association_type": "disease-causing germline mutation", "mode": "disease_to_gene"},
-        },
     },
     "translational_model_evidence": {
         "label": "translational model-organism evidence",
@@ -4588,16 +4656,6 @@ STRUCTURED_OBSERVATION_GUIDANCE_BY_OVERLAP_GROUP: dict[str, dict[str, Any]] = {
             "Prefer `has_ortholog` for ortholog rows and `has_model` for disease-model rows; use qualifiers for species, provider, or disease labels.",
             "Only emit observations for the top orthologs or models that are actually summarized in the tool output.",
         ],
-        "example": {
-            "observation_type": "translational_model",
-            "subject": {"type": "gene", "label": "TP53", "id": "HGNC:11998"},
-            "predicate": "has_ortholog",
-            "object": {"type": "gene", "label": "Trp53", "id": "MGI:98834"},
-            "supporting_ids": ["HGNC:11998"],
-            "source_tool": "get_alliance_genome_gene_profile",
-            "confidence": "high",
-            "qualifiers": {"species": "Mus musculus", "has_disease_annotations": True},
-        },
     },
     "molecular_interactions": {
         "label": "molecular interaction evidence",
@@ -4611,16 +4669,6 @@ STRUCTURED_OBSERVATION_GUIDANCE_BY_OVERLAP_GROUP: dict[str, dict[str, Any]] = {
             "Use `interacts_with` as the predicate and store detection methods, interaction types, species, or miscore values in qualifiers.",
             "Include PMIDs in supporting_ids when the source reports them directly.",
         ],
-        "example": {
-            "observation_type": "interaction",
-            "subject": {"type": "gene", "label": "TP53"},
-            "predicate": "interacts_with",
-            "object": {"type": "gene", "label": "MDM2"},
-            "supporting_ids": ["PMID:10722742"],
-            "source_tool": "get_intact_interactions",
-            "confidence": "high",
-            "qualifiers": {"detection_method": "anti bait coimmunoprecipitation", "interaction_type": "physical association", "species": "human"},
-        },
     },
     "pathway_context": {
         "label": "pathway and network context",
@@ -4634,16 +4682,6 @@ STRUCTURED_OBSERVATION_GUIDANCE_BY_OVERLAP_GROUP: dict[str, dict[str, Any]] = {
             "Prefer `participates_in` for explicit pathway membership and reserve `associated_with` for broader network context.",
             "Store provider, rank, or score information in qualifiers rather than the predicate.",
         ],
-        "example": {
-            "observation_type": "pathway_context",
-            "subject": {"type": "gene", "label": "EGFR"},
-            "predicate": "participates_in",
-            "object": {"type": "pathway", "label": "EGFR signaling pathway", "id": "Reactome:R-HSA-177929"},
-            "supporting_ids": ["Reactome:R-HSA-177929"],
-            "source_tool": "search_pathway_commons_top_pathways",
-            "confidence": "medium",
-            "qualifiers": {"provider": "Reactome", "rank": 1},
-        },
     },
 }
 
@@ -6844,6 +6882,7 @@ def _compact_completed_step_summaries(task_state: dict[str, Any]) -> list[dict[s
             {
                 "id": step.get("id"),
                 "goal": step.get("goal"),
+                "handoff": step.get("handoff"),
                 "result_summary": step.get("result_summary", ""),
                 "evidence_ids": list(step.get("evidence_ids", []) or [])[:20],
                 "open_gaps": list(step.get("open_gaps", []) or [])[:10],
@@ -6852,60 +6891,47 @@ def _compact_completed_step_summaries(task_state: dict[str, Any]) -> list[dict[s
     return summaries
 
 
-_STEP_FOCUS_STOPWORDS = {
-    "AND", "ARE", "ASSAY", "ASSAYS", "BUILD", "CANDIDATE", "CANDIDATES", "COMPARE", "COMPARES",
-    "COMPLETION", "CONDITION", "DATA", "DATASET", "DATASETS", "DERIVED", "EVIDENCE", "EXACT",
-    "EXISTING", "FIND", "FINDINGS", "FROM", "GOAL", "HUMAN", "IDENTIFIED", "IDENTIFY", "IN",
-    "LITERATURE", "MODEL", "MUTANT", "MUTATION", "MUTATIONS", "OF", "OR", "PEPTIDE", "PEPTIDES",
-    "PRESENTATION", "PUBLIC", "QUERY", "RANK", "RECOGNITION", "RETRIEVE", "RETURN", "SEARCH",
-    "SEQUENCE", "SEQUENCES", "STEP", "SUPPORT", "THE", "THIS", "USE", "USING", "VALIDATE",
-}
+def _candidate_handoff_context_instructions(
+    task_state: dict[str, Any],
+    active_step: dict[str, Any],
+) -> list[str]:
+    """Translate structured plan dependencies and handoffs into execution guidance."""
+    active_id = str(active_step.get("id", "") or "").strip()
+    handoff = active_step.get("handoff")
+    depends_on = [
+        str(step_id).strip()
+        for step_id in list(active_step.get("depends_on", []) or [])
+        if str(step_id).strip()
+    ]
 
+    instructions: list[str] = []
+    if isinstance(handoff, dict):
+        dependent_steps = [
+            str(step.get("id", "") or "").strip()
+            for step in list(task_state.get("steps", []) or [])
+            if active_id in list(step.get("depends_on", []) or [])
+        ]
+        handoff_payload = {
+            "consumed_by": dependent_steps,
+            **handoff,
+        }
+        instructions.append(
+            "Structured handoff contract:\n"
+            f"{_serialize_pretty_json(handoff_payload)}\n"
+            "Return the entity identities and directly observed selection evidence required by this contract. "
+            "Apply max_items only when it is an integer; null means the plan did not impose a numeric cap. "
+            "Use source-defined scores or the listed criteria for ranking, and label the output unranked when "
+            "the evidence does not support an ordering."
+        )
 
-def _extract_step_focus_terms(step: dict[str, Any], *, limit: int = 12) -> list[str]:
-    text = " ".join(
-        str(step.get(field, "") or "").strip()
-        for field in ("goal", "completion_condition")
-    )
-    if not text:
-        return []
-
-    ordered_terms: list[str] = []
-    seen: set[str] = set()
-
-    def _add_term(raw: str) -> None:
-        term = re.sub(r"\s+", " ", str(raw or "").strip())
-        if not term:
-            return
-        key = term.upper()
-        if key in seen:
-            return
-        seen.add(key)
-        ordered_terms.append(term)
-
-    for match in re.finditer(r"\b([A-Z0-9-]{2,12})\s+([A-Z]\d{1,5}[A-Z*])\b", text):
-        gene = match.group(1).strip()
-        if gene not in _STEP_FOCUS_STOPWORDS:
-            _add_term(f"{gene} {match.group(2).strip()}")
-
-    for match in re.finditer(r"\bHLA-[A-Z]\*\d{2}:\d{2}\b", text):
-        _add_term(match.group(0))
-
-    for match in re.finditer(r"\b[A-Z]\d{1,5}[A-Z*]\b", text):
-        _add_term(match.group(0))
-
-    for match in re.finditer(r"\b[ACDEFGHIKLMNPQRSTVWY]{8,}\b", text):
-        _add_term(match.group(0))
-
-    for match in re.finditer(r"\b[A-Z0-9-]{2,12}\b", text):
-        token = match.group(0).strip()
-        if token in _STEP_FOCUS_STOPWORDS:
-            continue
-        if token.isdigit():
-            continue
-        _add_term(token)
-
-    return ordered_terms[:limit]
+    if depends_on:
+        instructions.append(
+            "Dependency contract:\n"
+            f"- Required upstream steps: {', '.join(depends_on)}.\n"
+            "- Use the named entities and evidence from those steps as inputs to this step. Apply the current "
+            "completion condition independently; upstream success does not count as current-step evidence."
+        )
+    return instructions
 
 
 def _serialize_pretty_json(data: Any) -> str:
@@ -6917,6 +6943,17 @@ def _render_plan_markdown(task_state: dict[str, Any]) -> str:
     objective = str(task_state.get("objective", "")).strip()
     if objective:
         lines.append(f"**Objective:** {objective}")
+        lines.append("")
+    planning_blockers = [
+        re.sub(r"\s+", " ", str(blocker or "").strip())
+        for blocker in task_state.get("planning_blockers", [])
+        if str(blocker or "").strip()
+    ]
+    if planning_blockers:
+        lines.append("**Execution blockers:**")
+        lines.append("")
+        for blocker in planning_blockers:
+            lines.append(f"- {blocker}")
         lines.append("")
     planning_warnings = [
         re.sub(r"\s+", " ", str(warning or "").strip())
@@ -6940,6 +6977,18 @@ def _render_plan_markdown(task_state: dict[str, Any]) -> str:
             f"*(source: {source_display}{domain_tag})*"
         )
         lines.append(f"Completion: {step.get('completion_condition', '').strip()}")
+        dependencies = list(step.get("depends_on", []) or [])
+        if dependencies:
+            lines.append(f"Depends on: {', '.join(str(item) for item in dependencies)}")
+        handoff = step.get("handoff")
+        if isinstance(handoff, dict):
+            limit = handoff.get("max_items")
+            limit_text = f", maximum {limit}" if isinstance(limit, int) else ""
+            lines.append(
+                "Handoff: "
+                f"{handoff.get('selection_mode', 'unranked')} {handoff.get('entity_type', 'entities')}"
+                f"{limit_text}"
+            )
     return "\n".join(lines).strip()
 
 
@@ -7102,7 +7151,7 @@ def _render_react_step_progress(
 
 _INLINE_ID_RE = re.compile(
     r"\bPMID\s*:?\s*(?P<pmid>\d{6,8})\b"
-    r"|\bDOI\s*:?\s*(?P<doi>10\.\S+?)(?=[,;\s\)\]>]|$)"
+    r"|\bDOI\s*:?\s*(?P<doi>10\.[^\s,;\]>]+)"
     r"|\b(?P<nct>NCT\d{8})\b"
     r"|\bOpenAlex\s*:?\s*(?P<openalex>W\d+)\b"
     r"|\b(?P<pmc>PMC\d+)\b"
@@ -7122,6 +7171,14 @@ _INLINE_ID_RE = re.compile(
     r"|\b(?P<gcst>GCST\d{4,})\b",
     re.IGNORECASE,
 )
+
+
+def _normalize_doi_candidate(value: Any) -> str:
+    doi = str(value or "").strip().strip("<>")
+    doi = doi.rstrip(".,;:'\"")
+    while doi.endswith(")") and doi.count(")") > doi.count("("):
+        doi = doi[:-1].rstrip()
+    return doi
 
 
 def _evidence_id_to_url(eid: str) -> str | None:
@@ -7198,7 +7255,7 @@ def _extract_inline_ids_from_text(text: str) -> list[str]:
         if m.group("pmid"):
             normalized = f"PMID:{m.group('pmid')}"
         elif m.group("doi"):
-            normalized = f"DOI:{m.group('doi')}"
+            normalized = f"DOI:{_normalize_doi_candidate(m.group('doi'))}"
         elif m.group("nct"):
             normalized = m.group("nct").upper()
         elif m.group("openalex"):
@@ -7255,7 +7312,7 @@ def _is_literature_id(eid: str) -> bool:
 _VALID_EVIDENCE_ID_RE = re.compile(
     r"(?i)^("
     r"PMID:\d{4,9}"
-    r"|DOI:10\..+"
+    r"|DOI:10\.\d{4,9}/\S+"
     r"|NCT\d{8}"
     r"|OpenAlex:W\d+"
     r"|PMC\d+"
@@ -7268,6 +7325,17 @@ _VALID_EVIDENCE_ID_RE = re.compile(
     r"|GCST\d{4,}"
     r")$"
 )
+
+
+def _is_valid_evidence_id(value: str) -> bool:
+    normalized = re.sub(r"\s*:\s*", ":", str(value or "").strip())
+    if not _VALID_EVIDENCE_ID_RE.match(normalized):
+        return False
+    if normalized.upper().startswith("DOI:"):
+        doi = normalized[4:]
+        if doi.count("(") != doi.count(")"):
+            return False
+    return True
 
 
 def _collect_all_evidence_ids(task_state: dict[str, Any]) -> list[str]:
@@ -7283,7 +7351,7 @@ def _collect_all_evidence_ids(task_state: dict[str, Any]) -> list[str]:
             normalized = re.sub(r"\s*:\s*", ":", str(eid).strip())
             if not normalized:
                 continue
-            if not _VALID_EVIDENCE_ID_RE.match(normalized):
+            if not _is_valid_evidence_id(normalized):
                 logger.debug("Skipping non-standard evidence_id from references: %r", normalized)
                 continue
             if normalized.lower() not in seen:
@@ -7294,10 +7362,18 @@ def _collect_all_evidence_ids(task_state: dict[str, Any]) -> list[str]:
 
 def _build_ref_map(ids: list[str]) -> dict[str, int]:
     """Map colon-normalised lowercase EID → 1-based reference number."""
-    return {
+    ref_map = {
         re.sub(r"\s*:\s*", ":", eid.strip()).lower(): i
         for i, eid in enumerate(ids, start=1)
     }
+    for i, eid in enumerate(ids, start=1):
+        if not re.fullmatch(r"(?i)PMID:\d{4,9}", re.sub(r"\s*:\s*", ":", eid.strip())):
+            continue
+        meta = _fetch_reference_meta(eid) or {}
+        doi = _normalize_doi_candidate(meta.get("doi", ""))
+        if doi:
+            ref_map[f"doi:{doi.lower()}"] = i
+    return ref_map
 
 
 # ---------------------------------------------------------------------------
@@ -7733,6 +7809,93 @@ def _collect_claim_summary_literature_ids(claim_summary: dict[str, Any], limit: 
     ]
 
 
+def _dedupe_literature_work_ids(ids: list[str], *, limit: int) -> list[str]:
+    """Collapse PMID/DOI aliases for the same paper, preferring the PMID record."""
+    exact = [
+        eid for eid in _dedupe_preserve_order(ids, limit=max(limit * 2, limit))
+        if _is_literature_id(eid) and _is_valid_evidence_id(eid)
+    ]
+    if not any(eid.upper().startswith("DOI:") for eid in exact):
+        return exact[:limit]
+
+    identity_by_pmid: dict[str, str] = {}
+    for eid in exact:
+        if not eid.upper().startswith("PMID:"):
+            continue
+        meta = _fetch_reference_meta(eid) or {}
+        doi = _normalize_doi_candidate(meta.get("doi", ""))
+        if doi:
+            identity_by_pmid[eid.lower()] = f"doi:{doi.lower()}"
+
+    deduped: list[str] = []
+    index_by_identity: dict[str, int] = {}
+    for eid in exact:
+        normalized = re.sub(r"\s*:\s*", ":", eid.strip())
+        lowered = normalized.lower()
+        if lowered.startswith("doi:"):
+            identity = f"doi:{_normalize_doi_candidate(normalized[4:]).lower()}"
+        else:
+            identity = identity_by_pmid.get(lowered, lowered)
+
+        prior_index = index_by_identity.get(identity)
+        if prior_index is None:
+            index_by_identity[identity] = len(deduped)
+            deduped.append(normalized)
+        elif normalized.upper().startswith("PMID:") and not deduped[prior_index].upper().startswith("PMID:"):
+            deduped[prior_index] = normalized
+
+    return deduped[:limit]
+
+
+def _select_literature_ids_cited_in_body(ids: list[str], body_text: str, *, limit: int) -> list[str]:
+    body = str(body_text or "")
+    body_lower = body.lower()
+    direct_ids = {
+        re.sub(r"\s*:\s*", ":", eid.strip()).lower()
+        for eid in _extract_inline_ids_from_text(body)
+        if _is_literature_id(eid)
+    }
+    has_author_year_signal = bool(re.search(r"\b(?:19|20)\d{2}\b", body))
+    selected: list[str] = []
+    for eid in ids:
+        normalized = re.sub(r"\s*:\s*", ":", eid.strip())
+        lowered = normalized.lower()
+        if lowered in direct_ids:
+            selected.append(normalized)
+            if len(selected) >= limit:
+                break
+            continue
+        if not has_author_year_signal:
+            continue
+
+        meta = _fetch_reference_meta(normalized) or {}
+        doi = _normalize_doi_candidate(meta.get("doi", ""))
+        directly_cited = bool(doi and f"doi:{doi.lower()}" in direct_ids)
+
+        author_year_cited = False
+        authors = list(meta.get("authors", []) or [])
+        year = str(meta.get("year", "") or "").strip()
+        author_label = _format_apa_intext_author(authors)
+        if author_label and year:
+            label = f"{author_label}, {year}".lower()
+            author_year_cited = label in body_lower
+            if not author_year_cited:
+                family = author_label.split(" et al.", 1)[0].split(" & ", 1)[0].strip()
+                if family:
+                    author_year_cited = bool(
+                        re.search(rf"\b{re.escape(family)}\b.{{0,40}}\b{re.escape(year)}\b", body, re.IGNORECASE)
+                    )
+
+        if directly_cited or author_year_cited:
+            selected.append(normalized)
+            if len(selected) >= limit:
+                break
+
+    # If the model emitted no usable citation markers, retain a small key-
+    # literature set so the existing fallback can cite representative papers.
+    return selected or ids[: min(3, limit)]
+
+
 def _collect_final_report_literature_ids(
     task_state: dict[str, Any],
     synthesis: dict[str, Any],
@@ -7751,10 +7914,8 @@ def _collect_final_report_literature_ids(
     candidates.extend(_collect_claim_summary_literature_ids(claim_summary, limit=limit))
     candidates.extend(_collect_all_evidence_ids(task_state))
 
-    return [
-        eid for eid in _dedupe_preserve_order(candidates, limit=limit)
-        if _is_literature_id(eid)
-    ]
+    deduped = _dedupe_literature_work_ids(candidates, limit=limit)
+    return _select_literature_ids_cited_in_body(deduped, rendered_text, limit=limit)
 
 
 def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> str:
@@ -7783,10 +7944,15 @@ def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> s
 
     def _replace_id(m: re.Match) -> str:  # type: ignore[type-arg]
         display = m.group(0)
+        trailing_punctuation = ""
         if m.group("pmid"):
             normalized = f"PMID:{m.group('pmid')}"
         elif m.group("doi"):
-            normalized = f"DOI:{m.group('doi')}"
+            raw_doi = m.group("doi")
+            clean_doi = _normalize_doi_candidate(raw_doi)
+            trailing_punctuation = raw_doi[len(clean_doi):]
+            normalized = f"DOI:{clean_doi}"
+            display = f"DOI:{clean_doi}"
         elif m.group("nct"):
             normalized = m.group("nct").upper()
         elif m.group("openalex"):
@@ -7826,11 +7992,11 @@ def _hyperlink_inline_ids(text: str, ref_map: dict[str, int] | None = None) -> s
         ref_key = re.sub(r"\s*:\s*", ":", normalized).lower()
         if ref_map and ref_key in ref_map:
             n = ref_map[ref_key]
-            return _format_apa_intext_citation(n, normalized)
+            return _format_apa_intext_citation(n, normalized) + trailing_punctuation
         url = _evidence_id_to_url(normalized)
         if not url:
             return m.group(0)
-        return f"[{display}]({url})"
+        return f"[{display}]({url}){trailing_punctuation}"
 
     linked = _INLINE_ID_RE.sub(_replace_id, protected)
 
@@ -8107,7 +8273,14 @@ def _build_structured_answer_markdown(
 
     if not top_claims:
         if _is_informative_model_summary(objective, model_answer):
-            lines.append(model_answer_text or model_answer_first)
+            unscored_answer = model_answer_text or model_answer_first
+            unscored_answer = re.sub(
+                r"\bStrong evidence(?: from multiple independent sources)? supports\b",
+                "The available evidence supports",
+                unscored_answer,
+                flags=re.IGNORECASE,
+            )
+            lines.append(unscored_answer)
             if source_context:
                 lines.append(source_context.strip())
         else:
@@ -8495,6 +8668,18 @@ def _build_structured_limitations(
         else:
             items.append(f"Only {completed} of {total} planned steps completed before synthesis, so coverage is still partial.")
 
+    for step in task_state.get("steps", []):
+        tool_names = _dedupe_str_list(
+            [*list(step.get("tools_called", []) or []), step.get("tool_hint", "")],
+            limit=24,
+        )
+        for tool_name in tool_names:
+            contract = _tool_evidence_contract(tool_name)
+            items.extend(
+                f"Source scope ({_resolve_source_label(tool_name) or tool_name}): {limit_text}"
+                for limit_text in list(contract.get("interpretation_limits", []) or [])
+            )
+
     for conflict in list(claim_summary.get("mixed_evidence_claims", []) or [])[:3]:
         preferred = str(conflict.get("preferred_interpretation", "")).strip()
         subject = str(conflict.get("subject", "")).strip()
@@ -8623,6 +8808,25 @@ def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -
     return _render_final_synthesis_markdown(task_state, synthesis)
 
 
+def _repair_generated_markdown_layout(text: str) -> str:
+    """Repair common inline-list/table collapse in model-authored report text."""
+    repaired = str(text or "")
+    if "| |" in repaired and re.search(r"\|\s*[^|\n]{2,80}\s*\|", repaired):
+        repaired = re.sub(r"\|\s+\|\s+", "|\n| ", repaired)
+    repaired = re.sub(
+        r"\* \*\*([^*\n:]{1,80}):\*\* \* ",
+        r"* **\1:**\n  * ",
+        repaired,
+    )
+    repaired = re.sub(
+        r"\. \* \*\*([^*\n:]{1,80}):\*\*\n",
+        r".\n* **\1:**\n",
+        repaired,
+    )
+    repaired = re.sub(r"\. \* (?=`)", ".\n  * ", repaired)
+    return repaired.strip()
+
+
 def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict[str, Any]) -> str:
     """Render the final report from structured synthesis fields."""
     objective = str(task_state.get("objective", "")).strip()
@@ -8636,6 +8840,7 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
     # TLDR
     lines += ["## TLDR", ""]
     answer = str(synthesis.get("answer", "")).strip()
+    answer = _repair_generated_markdown_layout(answer)
     if answer:
         lines.append(answer)
         lines.append("")
@@ -8645,6 +8850,7 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
 
     # Detailed Findings (model-authored thematic prose)
     model_findings = str(synthesis.get("model_findings_text", "")).strip()
+    model_findings = _repair_generated_markdown_layout(model_findings)
     if model_findings:
         lines.append(model_findings)
         lines.append("")
@@ -8714,7 +8920,7 @@ def _planner_json_instruction_suffix() -> str:
     return (
         "Return ONLY valid JSON matching `plan_internal.v1` for this objective. "
         "Preserve concrete entities from the user's objective in the objective and step goals; "
-        "do not replace TP53, glioblastoma, named drugs, diseases, datasets, or variants with placeholders like "
+        "do not replace named genes, diseases, drugs, datasets, cohorts, or variants with generic placeholders like "
         "`target gene`, `the gene`, or `the disease`. "
         "Include a `coverage` object with `archetype`, `selected_skills`, `covered_dimensions`, "
         "`omitted_dimensions`, and `notes`; for target-validation plans, use the evidence dimensions "
@@ -8722,6 +8928,7 @@ def _planner_json_instruction_suffix() -> str:
         "clinical_translation, model_organism_context, and literature_corroboration. "
         "Each step MUST include a \"domains\" array with 1-3 domain names from: "
         f"{', '.join(tool_registry.ALL_DOMAIN_NAMES)}. "
+        "Each step MUST include `depends_on` and `handoff`; use an empty dependency list and null handoff when neither applies. "
         "If you are unsure which tool fits a step, choose the closest valid tool from the catalog instead of leaving "
         "\"tool_hint\" blank. "
         "Do not include markdown fences or commentary."
@@ -8739,10 +8946,9 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
     step_domains = active_step.get("domains") or []
     tool_hint = str(active_step.get("tool_hint", "")).strip()
     goal_text = str(active_step.get("goal", "") or "")
-    focus_terms = _extract_step_focus_terms(active_step)
-    focused_tools = _prioritize_tools_for_step(
-        _resolve_step_tools(step_domains),
-        tool_hint,
+    focused_tools = _resolve_step_tool_allowlist(
+        active_step,
+        available_tools=KNOWN_MCP_TOOLS,
     )
 
     focused_catalog = _format_tool_catalog(focused_tools)
@@ -8757,8 +8963,9 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
             "goal": active_step.get("goal"),
             "tool_hint": active_step.get("tool_hint"),
             "domains": step_domains,
+            "depends_on": list(active_step.get("depends_on", []) or []),
             "completion_condition": active_step.get("completion_condition"),
-            "focus_terms": focus_terms,
+            "handoff": active_step.get("handoff"),
         },
         "remaining_steps_after_this": remaining_count - 1,
         "prior_completed_steps": prior_completed,
@@ -8768,6 +8975,7 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
         "Execution context (authoritative; use this instead of inferring from prior prose):",
         _serialize_pretty_json(payload),
     ]
+    instructions.extend(_candidate_handoff_context_instructions(task_state, active_step))
 
     tools_header = (
         f"Tools for this step (domains: {', '.join(step_domains)}):" if step_domains
@@ -8775,8 +8983,8 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
     )
     instructions.append(
         f"{tools_header}\n{focused_catalog}\n"
-        "Prefer tools from this list. You may use other available tools "
-        "if the focused set is insufficient, but start here."
+        "Use this step-scoped tool set. Select a documented fallback from the list only when it can supply "
+        "the evidence required by the completion condition."
     )
     if routing_guidance:
         instructions.append(routing_guidance)
@@ -8800,24 +9008,16 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
             "- Do not report a step as completed when the finding is only that more input is needed."
         )
 
-    if focus_terms:
+    archive_tools = ARCHIVE_STEP_TOOL_ALLOWLISTS.get(tool_hint)
+    if archive_tools:
+        archive_label = _resolve_source_label(tool_hint) or tool_hint
         instructions.append(
-            "Scope guardrails for this step:\n"
-            f"- In-scope anchors: {', '.join(focus_terms)}.\n"
-            "- Reuse prior_completed_steps only when they directly support these anchors.\n"
-            "- Ignore sibling genes, mutations, alleles, datasets, or diseases from other plan steps unless this step explicitly requires them.\n"
-            "- In result_summary, describe only what this step established. Do not narrate that a previous step already succeeded or that the completion condition was fulfilled."
-        )
-
-    is_mutation_epitope_step = bool(
-        re.search(r"\b[A-Z]\d{1,5}[A-Z*]\b", goal_text)
-        and re.search(r"\b(epitope|neoepitope|neoantigen|peptide)\b", goal_text, flags=re.IGNORECASE)
-    )
-    if is_mutation_epitope_step:
-        instructions.append(
-            "Mutation-specific peptide guardrails:\n"
-            "- Do not invent or reverse-engineer an exact mutant peptide from a generic protein sequence unless the residue position and substituted amino acid are explicitly verified in the cited source.\n"
-            "- If the source only supports a peptide span, residue range, or long-peptide construct without an exact sequence, state that the exact sequence remains unresolved instead of fabricating one."
+            "Source-family scope:\n"
+            f"- This step is specifically about {archive_label}; use only these archive-family tools: "
+            f"{', '.join(f'`{name}`' for name in archive_tools)}.\n"
+            "- Do not substitute results from a different archive or reuse a sibling archive step's findings. "
+            "If this archive is unavailable or has no matches after a simple fallback query, mark this step blocked "
+            "with that source-specific limitation."
         )
 
     instructions.append(
@@ -8965,6 +9165,89 @@ def _format_step_source_display(step: dict[str, Any]) -> str:
     return "; ".join(_derive_step_data_sources(step))
 
 
+def _compact_synthesis_tool_observations(step: dict[str, Any]) -> list[dict[str, Any]]:
+    observations: list[dict[str, Any]] = []
+    for entry in list(step.get("tool_log", []) or []):
+        if str(entry.get("status", "")).strip().lower() != "done":
+            continue
+        result = _sanitize_internal_report_text(
+            re.sub(r"\s+", " ", str(entry.get("result", "") or "").strip())
+        )
+        if not result:
+            continue
+        observation = {
+            "source": str(entry.get("tool", "") or "").strip(),
+            "tool": str(entry.get("raw_tool", "") or "").strip(),
+            "result": result[:900],
+            "identifiers": _extract_evidence_ids_from_text(result)[:10],
+        }
+        if observation["tool"] in {
+            "get_nemar_dataset_details",
+            "get_openneuro_dataset",
+            "get_dandi_dataset",
+            "get_braincode_dataset_details",
+            "get_conp_dataset_details",
+        }:
+            record_fields = _extract_compact_tool_key_fields(str(entry.get("evidence_text", "") or ""))
+            if record_fields:
+                observation["record_fields"] = record_fields
+                observation["identifiers"] = _dedupe_str_list(
+                    observation["identifiers"]
+                    + _extract_evidence_ids_from_text(
+                        " ".join(f"{label}: {value}" for label, value in record_fields.items())
+                    ),
+                    limit=10,
+                )
+        observations.append(observation)
+        if len(observations) >= 4:
+            break
+    return observations
+
+
+def _extract_compact_tool_key_fields(evidence_text: str) -> dict[str, str]:
+    """Retain bounded record metadata that a one-line tool summary would discard."""
+    allowed = {
+        "dataset id", "dandiset id", "title", "modalities", "modality", "participants", "subjects",
+        "sessions", "total files", "archive size", "age range", "formats", "latest snapshot", "tasks",
+        "description", "license", "doi", "bids version", "hed", "nwb", "published", "access",
+    }
+    fields: dict[str, str] = {}
+    for raw_line in str(evidence_text or "").splitlines():
+        match = re.match(r"^\s*-\s*([^:]{2,40}):\s*(.+?)\s*$", raw_line)
+        if not match:
+            continue
+        label = match.group(1).strip()
+        if label.lower() not in allowed or label in fields:
+            continue
+        value = re.sub(r"\s+", " ", match.group(2).strip())
+        fields[label] = value[:500]
+        if len(fields) >= 16:
+            break
+    return fields
+
+
+def _synthesis_step_interpretation_constraints(step: dict[str, Any]) -> list[str]:
+    tool_names = _dedupe_str_list(
+        [
+            *list(step.get("tools_called", []) or []),
+            step.get("tool_hint", ""),
+        ],
+        limit=24,
+    )
+    constraints: list[str] = []
+    for tool_name in tool_names:
+        contract = _tool_evidence_contract(tool_name)
+        evidence_kind = str(contract.get("evidence_kind", "") or "").strip()
+        supports = list(contract.get("supports", []) or [])
+        if evidence_kind and supports:
+            constraints.append(
+                f"{_resolve_source_label(tool_name) or tool_name} returned {evidence_kind}; "
+                f"interpret it as support for {', '.join(supports)}."
+            )
+        constraints.extend(list(contract.get("interpretation_limits", []) or []))
+    return _dedupe_str_list(constraints, limit=12)
+
+
 def _synth_context_instructions(task_state: dict[str, Any], callback_context: CallbackContext | None = None) -> list[str]:
     evidence_store_summary = _summarize_evidence_store(task_state.get("evidence_store", {}))
     claim_synthesis_summary = _build_claim_synthesis_summary(
@@ -8988,11 +9271,15 @@ def _synth_context_instructions(task_state: dict[str, Any], callback_context: Ca
                 "goal": step.get("goal"),
                 "tool_hint": step.get("tool_hint", ""),
                 "source": _preferred_step_source_label(step, str(step.get("tool_hint", ""))),
+                "depends_on": list(step.get("depends_on", []) or []),
+                "handoff": step.get("handoff"),
                 "status": step.get("status"),
                 "reasoning_trace": _sanitize_internal_report_text(str(step.get("reasoning_trace", "") or "")),
                 "tools_called": list(step.get("tools_called", []) or []),
                 "data_sources_queried": _derive_step_data_sources(step),
                 "result_summary": _sanitize_internal_report_text(str(step.get("result_summary", "") or "")),
+                "tool_observations": _compact_synthesis_tool_observations(step),
+                "interpretation_constraints": _synthesis_step_interpretation_constraints(step),
                 "evidence_ids": list(step.get("evidence_ids", []) or [])[:20],
                 "open_gaps": list(step.get("open_gaps", []) or [])[:10],
                 "structured_observations": list(step.get("structured_observations", []) or [])[:8],
@@ -9018,8 +9305,8 @@ def _synth_context_instructions(task_state: dict[str, Any], callback_context: Ca
         "Synthesis context (authoritative; use this instead of inferring from prior prose):",
         _serialize_pretty_json(payload),
         "Use `claim_synthesis_summary` as the normalized claim arbitration layer. Prioritize its top-supported claims for the direct answer, and explicitly describe any `mixed_evidence_claims` as conflicting or mixed evidence rather than flattening them into one-sided prose.",
+        "Treat `tool_observations` as the authoritative mapping between named entities and identifiers. The flat `evidence_ids` arrays prove only that identifiers were retrieved; they do not by themselves map an identifier to a drug, disease, intervention, or claim.",
     ]
-
     prior: list[dict[str, Any]] = []
     if callback_context is not None:
         prior = _get_prior_research(callback_context)
@@ -9205,6 +9492,30 @@ def _make_planner_before_model_callback(*, require_approval: bool, model_name: s
         # --- HITL approval gate ---
         if require_approval and bool(callback_context.state.get(STATE_PLAN_PENDING_APPROVAL, False)):
             if _is_plan_approval_command(user_text):
+                task_state = _get_task_state(callback_context)
+                planning_blockers = [
+                    str(blocker).strip()
+                    for blocker in (task_state or {}).get("planning_blockers", [])
+                    if str(blocker).strip()
+                ]
+                if planning_blockers:
+                    original_objective = str((task_state or {}).get("objective", "")).strip()
+                    _archive_current_task(callback_context)
+                    callback_context.state[STATE_WORKFLOW_TASK] = None
+                    callback_context.state[STATE_PLAN_PENDING_APPROVAL] = False
+                    llm_request.config = llm_request.config or types.GenerateContentConfig()
+                    tc = _thinking_config_for_model(str(model_name))
+                    if tc:
+                        llm_request.config.thinking_config = tc
+                    llm_request.config.response_mime_type = None
+                    llm_request.append_instructions([
+                        f"Revise the previous plan for this objective: {original_objective}",
+                        "The previous plan could not be executed because selected tools could not satisfy these steps:",
+                        *[f"- {blocker}" for blocker in planning_blockers],
+                        "Generate an updated plan that removes every capability mismatch. Do not begin evidence collection.",
+                        _planner_json_instruction_suffix(),
+                    ])
+                    return None
                 callback_context.state[STATE_PLAN_PENDING_APPROVAL] = False
                 return _make_text_response("")
 
@@ -9307,7 +9618,9 @@ def _make_planner_after_model_callback(*, require_approval: bool):
 
         if require_approval:
             callback_context.state[STATE_PLAN_PENDING_APPROVAL] = True
-            rendered += _render_plan_approval_prompt()
+            rendered += _render_plan_approval_prompt(
+                has_blockers=bool(task_state.get("planning_blockers"))
+            )
 
         _set_turn_rendered_output(callback_context, key=STATE_PLANNER_RENDERED, text=rendered)
         return _replace_llm_response_text(llm_response, rendered)
@@ -9536,6 +9849,8 @@ def _react_before_model_callback(*, callback_context: CallbackContext, llm_reque
     callback_context.state[STATE_EXECUTOR_PREV_STEP_STATUS] = str(active_step.get("status", "pending"))
     if prev_active != current_step_id:
         callback_context.state[STATE_EXECUTOR_REASONING_TRACE] = ""
+        callback_context.state[STATE_EXECUTOR_TOOL_RETRY_COUNT] = 0
+        callback_context.state[STATE_EXECUTOR_EVIDENCE_RETRY_FEEDBACK] = ""
         _set_tool_log(callback_context, [])
     else:
         # Within the same step's tool loop -- update last tool_log entry with result
@@ -9584,6 +9899,11 @@ def _react_before_model_callback(*, callback_context: CallbackContext, llm_reque
         llm_request.config.thinking_config = tc
     llm_request.config.response_mime_type = None
     instructions = _react_step_context_instructions(task_state, active_step)
+    retry_feedback = str(
+        callback_context.state.get(STATE_EXECUTOR_EVIDENCE_RETRY_FEEDBACK, "") or ""
+    ).strip()
+    if retry_feedback:
+        instructions.append(retry_feedback)
     llm_request.append_instructions(instructions)
     return None
 
@@ -9673,6 +9993,27 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
     except Exception:
         active_step = {}
 
+    missing_required_tool = not any(
+        str(entry.get("raw_tool", "") or "").strip()
+        for entry in tool_log
+        if str(entry.get("status", "") or "").strip() in {"called", "done"}
+    )
+    if missing_required_tool:
+        tool_retry_count = int(callback_context.state.get(STATE_EXECUTOR_TOOL_RETRY_COUNT, 0) or 0)
+        if tool_retry_count < 1:
+            tool_hint = str(active_step.get("tool_hint", "") or "").strip()
+            callback_context.state[STATE_EXECUTOR_TOOL_RETRY_COUNT] = tool_retry_count + 1
+            callback_context.state[STATE_EXECUTOR_EVIDENCE_RETRY_FEEDBACK] = (
+                "Required tool follow-up (one bounded retry): the prior pass tried to conclude without any evidence "
+                f"tool call. Call the current step's primary tool `{tool_hint}` now. If it fails or returns no matches, "
+                "report that source-specific result and finish the step as blocked; do not infer the result from prior "
+                "steps."
+            )
+            logger.info("[react:after] enforcing one primary-tool call for %s", active_step_id)
+            return _replace_llm_response_text(llm_response, "")
+
+    callback_context.state[STATE_EXECUTOR_EVIDENCE_RETRY_FEEDBACK] = ""
+
     # --- Build step result: accept executor JSON, otherwise derive deterministically ---
     parsed, _ = _parse_json_object_from_text(full_text)
     reasoning_trace = ""
@@ -9703,6 +10044,12 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
     if not parsed.get("step_progress_note"):
         summary = str(parsed.get("result_summary", "") or "")
         parsed["step_progress_note"] = summary[:200] if summary else "Step completed."
+    if missing_required_tool:
+        tool_gap = "The step remained blocked because no evidence tool was called after the bounded follow-up."
+        parsed["status"] = "blocked"
+        parsed["open_gaps"] = _dedupe_str_list([*(parsed.get("open_gaps") or []), tool_gap], limit=20)
+        parsed["result_summary"] = tool_gap
+        parsed["step_progress_note"] = tool_gap
 
     try:
         validated = _apply_step_execution_result_to_task_state(
@@ -9748,6 +10095,10 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
         except Exception:  # noqa: BLE001
             logger.error("[react:after] fallback also failed for %s", active_step_id)
             return _replace_llm_response_text(llm_response, "")
+    if validated["status"] == "blocked" and _next_pending_step_id(task_state) is None:
+        task_state["current_step_id"] = None
+        task_state["plan_status"] = "completed"
+        _refresh_task_state_derived_state(task_state)
     try:
         _, step = _find_step(task_state, validated["step_id"])
         if reasoning_trace:
@@ -9769,6 +10120,8 @@ def _react_after_model_callback(*, callback_context: CallbackContext, llm_respon
     callback_context.state[STATE_WORKFLOW_TASK] = task_state
     callback_context.state[STATE_EXECUTOR_ACTIVE_STEP_ID] = ""
     callback_context.state[STATE_EXECUTOR_PREV_STEP_STATUS] = ""
+    callback_context.state[STATE_EXECUTOR_TOOL_RETRY_COUNT] = 0
+    callback_context.state[STATE_EXECUTOR_EVIDENCE_RETRY_FEEDBACK] = ""
 
     if new_plan_status == "completed":
         callback_context.state[STATE_AUTO_SYNTH_REQUESTED] = True
@@ -10742,6 +11095,19 @@ def _compact_tool_description(description: str, *, max_chars: int = 120) -> str:
     text = re.sub(r"\s+", " ", str(description or "").strip())
     if len(text) <= max_chars:
         return text
+    constraint_sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", text)
+        if re.search(r"\b(?:requires?|does not|cannot|not for|returns? absolute)\b", sentence, re.IGNORECASE)
+    ]
+    if constraint_sentences:
+        constraint = " ".join(constraint_sentences)
+        expanded_limit = max(max_chars, 240)
+        if len(constraint) >= expanded_limit - 24:
+            constraint = constraint[: expanded_limit - 27].rsplit(" ", 1)[0].rstrip(" ,;:.") + "..."
+        head_budget = max(20, expanded_limit - len(constraint) - 2)
+        head = text[:head_budget].rsplit(" ", 1)[0].rstrip(" ,;:.")
+        return f"{head}... {constraint}"[:expanded_limit].rstrip()
     clipped = text[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;:.")
     return f"{clipped}..."
 
@@ -10756,6 +11122,54 @@ def _dedupe_tool_names(tool_hints: list[str]) -> list[str]:
         seen.add(name)
         names.append(name)
     return names
+
+
+def _tool_evidence_contract(tool_name: str) -> dict[str, Any]:
+    name = str(tool_name or "").strip()
+    configured = tool_registry.TOOL_EVIDENCE_CONTRACTS.get(name)
+    if configured:
+        return {
+            "evidence_kind": str(configured.get("evidence_kind", "") or "").strip(),
+            "supports": _dedupe_str_list(list(configured.get("supports", []) or []), limit=8),
+            "interpretation_limits": _dedupe_str_list(
+                list(configured.get("interpretation_limits", []) or []),
+                limit=8,
+            ),
+        }
+    if name.startswith(("search_", "list_")):
+        return {
+            "evidence_kind": "retrieved records",
+            "supports": ["fields explicitly returned for the retrieved records"],
+            "interpretation_limits": [
+                "Treat a returned count as the retrieved set unless the response explicitly provides a source total.",
+                "A zero-result query does not establish source-wide absence unless the search coverage is exhaustive.",
+            ],
+        }
+    return {}
+
+
+def _format_tool_evidence_contract(tool_name: str, *, compact: bool = False) -> str:
+    contract = _tool_evidence_contract(tool_name)
+    if not contract:
+        return ""
+    evidence_kind = str(contract.get("evidence_kind", "") or "").strip()
+    supports = list(contract.get("supports", []) or [])
+    limits = list(contract.get("interpretation_limits", []) or [])
+    if compact:
+        parts = [f"evidence: {evidence_kind}"] if evidence_kind else []
+        if supports:
+            parts.append(f"supports: {', '.join(supports[:3])}")
+        if limits:
+            parts.append(f"scope: {limits[0]}")
+        return _compact_tool_description("; ".join(parts), max_chars=220)
+
+    lines = [f"Evidence contract for `{tool_name}`:"]
+    if evidence_kind:
+        lines.append(f"- Evidence kind: {evidence_kind}.")
+    if supports:
+        lines.append(f"- Directly supports: {', '.join(supports)}.")
+    lines.extend(f"- Interpretation scope: {item}" for item in limits)
+    return "\n".join(lines)
 
 
 def _format_tool_catalog(tool_hints: list[str]) -> str:
@@ -10779,9 +11193,14 @@ def _format_tool_catalog(tool_hints: list[str]) -> str:
             assigned.add(name)
             source = tool_registry.TOOL_SOURCE_NAMES.get(name, "").strip()
             desc = _compact_tool_description(tool_registry.TOOL_DESCRIPTIONS.get(name, ""))
+            evidence_contract = (
+                _format_tool_evidence_contract(name, compact=True)
+                if name in tool_registry.TOOL_EVIDENCE_CONTRACTS else ""
+            )
             source_text = f" ({source})" if source else ""
             desc_text = f": {desc}" if desc else ""
-            lines.append(f"- `{name}`{source_text}{desc_text}")
+            contract_text = f" [{evidence_contract}]" if evidence_contract else ""
+            lines.append(f"- `{name}`{source_text}{desc_text}{contract_text}")
 
     other_tools = [name for name in available if name not in assigned]
     if other_tools:
@@ -10789,9 +11208,14 @@ def _format_tool_catalog(tool_hints: list[str]) -> str:
         for name in other_tools:
             source = tool_registry.TOOL_SOURCE_NAMES.get(name, "").strip()
             desc = _compact_tool_description(tool_registry.TOOL_DESCRIPTIONS.get(name, ""))
+            evidence_contract = (
+                _format_tool_evidence_contract(name, compact=True)
+                if name in tool_registry.TOOL_EVIDENCE_CONTRACTS else ""
+            )
             source_text = f" ({source})" if source else ""
             desc_text = f": {desc}" if desc else ""
-            lines.append(f"- `{name}`{source_text}{desc_text}")
+            contract_text = f" [{evidence_contract}]" if evidence_contract else ""
+            lines.append(f"- `{name}`{source_text}{desc_text}{contract_text}")
 
     return "\n".join(lines)
 
@@ -10827,48 +11251,33 @@ def _format_step_routing_guidance(tool_hint: str, available_tools: list[str]) ->
     hint = str(tool_hint or "").strip()
     meta = tool_registry.TOOL_ROUTING_METADATA.get(hint)
     if not meta:
-        return ""
+        return _format_tool_evidence_contract(hint)
 
-    preferred_for = str(meta.get("preferred_for", "")).strip()
-    overlap_group = str(meta.get("overlap_group", "")).strip()
+    preferred_for = str(meta.get("preferred_for", "") or "").strip()
     fallback_tools = [
-        tool for tool in meta.get("fallback_tools", [])
+        tool
+        for tool in list(meta.get("fallback_tools", []) or [])
         if tool in set(available_tools)
     ]
     source_label = _resolve_source_label(hint)
-    fallback_labels = [
-        f"`{tool}` ({_resolve_source_label(tool)})"
-        for tool in fallback_tools
-    ]
-
     parts = [
         f"Routing guidance for this step's tool_hint `{hint}` ({source_label}):",
         f"- Start with `{hint}` for {preferred_for}."
-        if preferred_for else f"- Start with `{hint}` before trying overlapping tools.",
+        if preferred_for
+        else f"- Start with `{hint}` and judge it against the completion condition.",
     ]
-    if fallback_labels:
+    if fallback_tools:
+        fallback_labels = [
+            f"`{tool}` ({_resolve_source_label(tool)})"
+            for tool in fallback_tools
+        ]
         parts.append(
-            "- Only fall back if the requested evidence type is unavailable or insufficient. "
-            f"Preferred fallbacks: {', '.join(fallback_labels)}."
+            "- Use a fallback only when it can provide the same required evidence type or explicitly fill a missing "
+            f"field: {', '.join(fallback_labels)}."
         )
-    if hint in COMPOUND_QUERY_REQUIRED_TOOLS:
-        parts.append(
-            "- This is a compound-first tool and requires a named drug/compound query. Do not call it with empty arguments or use it "
-            "to discover unknown compounds from a model-only prompt."
-        )
-    parts.append(
-        "- Do not substitute a nearby overlapping source unless it better matches the step's requested evidence type."
-    )
-    if overlap_group == "target_vulnerability":
-        parts.append(
-            "- Keep target-vulnerability work inside specialized screening and dependency tools unless the step explicitly names a "
-            "BigQuery dataset or requires a confirmed structured-data slice."
-        )
-    if overlap_group == "variant_evidence":
-        parts.append(
-            "- Keep variant annotation work inside MyVariant.info, Ensembl VEP, CIViC, ClinGen, RegulomeDB, gnomAD API, "
-            "or dbSNP tools. Do not query `gnomad_public` or other BigQuery datasets unless the step explicitly asks for BigQuery."
-        )
+    evidence_contract = _format_tool_evidence_contract(hint)
+    if evidence_contract:
+        parts.append(evidence_contract)
     return "\n".join(parts)
 
 
@@ -10922,11 +11331,7 @@ def _format_structured_observation_guidance(tool_hint: str, available_tools: lis
         lines.append(f"  Typical entity types: {entity_types}.")
         for rule in guidance.get("extraction_rules", [])[:3]:
             lines.append(f"  Extraction rule: {rule}")
-        example = guidance.get("example")
-        if isinstance(example, dict):
-            lines.append(f"  Example observation for {guidance['label']}:")
-            lines.append(_format_structured_observation_example(example))
-    lines.append("Recommended observation template:")
+    lines.append("Observation schema:")
     lines.append(
         _format_structured_observation_example(
             {
@@ -11022,6 +11427,11 @@ def _resolve_step_tool_allowlist(
     focused_tools = _resolve_step_tools(step_domains, available_tools=available_set) if step_domains else []
 
     tool_hint = str(active_step.get("tool_hint", "")).strip()
+    archive_tools = ARCHIVE_STEP_TOOL_ALLOWLISTS.get(tool_hint)
+    if archive_tools:
+        scoped_archive_tools = [name for name in archive_tools if name in available_set]
+        if scoped_archive_tools:
+            return scoped_archive_tools
     fallback_tools = [
         str(name).strip()
         for name in tool_registry.TOOL_ROUTING_METADATA.get(tool_hint, {}).get("fallback_tools", [])
@@ -11221,6 +11631,19 @@ def _router_before_model_callback(
             turn_complete=False,
         )
 
+    if not has_report and _needs_specific_variant_clarification(user_turn):
+        transfer_part = types.Part(
+            function_call=types.FunctionCall(
+                name="transfer_to_agent",
+                args={"agent_name": "clarifier"},
+            )
+        )
+        return LlmResponse(
+            content=types.Content(role="model", parts=[transfer_part]),
+            partial=False,
+            turn_complete=False,
+        )
+
     if not has_report and _is_obvious_research_workflow_query(user_turn):
         transfer_part = types.Part(
             function_call=types.FunctionCall(
@@ -11369,10 +11792,19 @@ def create_mcp_toolset(tool_filter: list[str] | ToolPredicate | None = None) -> 
         server_params=server_params,
         timeout=90.0,
     )
-    return McpToolset(
+    toolset = McpToolset(
         connection_params=connection_params,
         tool_filter=tool_filter,
     )
+    if isinstance(tool_filter, ToolPredicate):
+        # ADK caches a toolset's filtered list for the whole Runner invocation.
+        # One workflow invocation can execute several plan steps, and each step
+        # has a different context-sensitive allowlist. Re-evaluate the predicate
+        # before every model request so a later step does not inherit the first
+        # step's tools. ADK's own SkillToolset uses the same cache opt-out for
+        # context-dependent tool availability.
+        toolset._use_invocation_cache = False
+    return toolset
 
 
 def create_workflow_agent(
