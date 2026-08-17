@@ -123,8 +123,18 @@ def test_extract_persistable_session_state_filters_transient_keys():
     }
 
 
-def _request_for_owner(owner_id: str, *, accept: str = ""):
-    headers = [(b"accept", accept.encode("ascii"))] if accept else []
+def _request_for_owner(
+    owner_id: str,
+    *,
+    accept: str = "",
+    forwarded_for: str = "",
+    client_host: str = "127.0.0.1",
+):
+    headers = []
+    if accept:
+        headers.append((b"accept", accept.encode("ascii")))
+    if forwarded_for:
+        headers.append((b"x-forwarded-for", forwarded_for.encode("ascii")))
     request = ui_server.Request(
         {
             "type": "http",
@@ -135,12 +145,70 @@ def _request_for_owner(owner_id: str, *, accept: str = ""):
             "raw_path": b"/",
             "query_string": b"",
             "headers": headers,
-            "client": ("127.0.0.1", 12345),
+            "client": (client_host, 12345),
             "server": ("testserver", 80),
         }
     )
     request.state.owner_id = owner_id
     return request
+
+
+def test_client_ip_ignores_forwarded_header_without_trusted_proxy(monkeypatch):
+    monkeypatch.setattr(ui_server, "RATE_LIMIT_TRUSTED_PROXY_HOPS", 0)
+    request = _request_for_owner(
+        "session_test_owner_1234567890123456",
+        forwarded_for="198.51.100.77, 203.0.113.9",
+        client_host="192.0.2.10",
+    )
+
+    assert ui_server._client_ip(request) == "192.0.2.10"
+
+
+def test_client_ip_ignores_attacker_supplied_forwarded_prefix(monkeypatch):
+    monkeypatch.setattr(ui_server, "RATE_LIMIT_TRUSTED_PROXY_HOPS", 1)
+    request = _request_for_owner(
+        "session_test_owner_1234567890123456",
+        forwarded_for="198.51.100.77, 198.51.100.78, 203.0.113.42, 35.191.0.1",
+        client_host="169.254.1.1",
+    )
+
+    assert ui_server._client_ip(request) == "203.0.113.42"
+
+
+def test_client_ip_rejects_malformed_trusted_proxy_suffix(monkeypatch):
+    monkeypatch.setattr(ui_server, "RATE_LIMIT_TRUSTED_PROXY_HOPS", 1)
+    request = _request_for_owner(
+        "session_test_owner_1234567890123456",
+        forwarded_for="198.51.100.77, not-an-ip",
+        client_host="192.0.2.10",
+    )
+
+    assert ui_server._client_ip(request) == "192.0.2.10"
+
+
+def test_rate_limiter_caps_unique_keys_and_discards_oldest(monkeypatch):
+    now = 1000.0
+    monkeypatch.setattr(ui_server.time, "time", lambda: now)
+    limiter = ui_server.RateLimiter(2, 60, max_keys=2)
+
+    assert limiter.check("client-a") == (True, 0)
+    assert limiter.check("client-b") == (True, 0)
+    assert limiter.check("client-c") == (True, 0)
+
+    assert list(limiter._hits) == ["client-b", "client-c"]
+    assert len(limiter._hits) == 2
+
+
+def test_rate_limiter_prunes_expired_key_before_evicting_active_key(monkeypatch):
+    now = 1000.0
+    monkeypatch.setattr(ui_server.time, "time", lambda: now)
+    limiter = ui_server.RateLimiter(2, 60, max_keys=2)
+    limiter.check("expired")
+    now = 1061.0
+    limiter.check("active")
+    limiter.check("new")
+
+    assert list(limiter._hits) == ["active", "new"]
 
 
 def test_signed_browser_owner_cookie_rejects_tampering():
@@ -150,6 +218,13 @@ def test_signed_browser_owner_cookie_rejects_tampering():
     assert ui_server._verify_owner_cookie(signed) == owner_id
     assert ui_server._verify_owner_cookie(f"{owner_id}.invalid") is None
     assert ui_server._verify_owner_cookie("not-a-session") is None
+
+
+def test_configured_browser_session_secret_rejects_short_value(tmp_path, monkeypatch):
+    monkeypatch.setattr(ui_server, "_configured_session_secret", "too-short")
+
+    with pytest.raises(RuntimeError, match="at least 32 characters"):
+        ui_server._configure_session_signing_key(tmp_path)
 
 
 def test_browser_session_middleware_sets_signed_http_only_cookie():
@@ -607,6 +682,70 @@ def test_json_store_persists_runs_and_interrupts_incomplete_runs(tmp_path):
     assert any(event.get("type") == "run.interrupted" for event in restored["progress_events"])
 
 
+def test_json_store_interrupt_reconciles_only_the_matching_active_task(tmp_path):
+    store = JsonTaskStore(tmp_path / "workflow_tasks.json")
+    task = ui_server._make_task("task_active", "Active task", "conv_active")
+    task["active_run_id"] = "run_active"
+    store.save_task(task)
+    store.save_run(
+        {
+            "run_id": "run_active",
+            "kind": "start_task",
+            "status": "running",
+            "task_id": task["task_id"],
+            "logs": [],
+            "progress_events": [],
+            "progress_summaries": [],
+            "created_at": "2026-03-06T00:00:00+00:00",
+            "updated_at": "2026-03-06T00:00:00+00:00",
+        }
+    )
+
+    store.mark_incomplete_runs_failed(
+        "Run interrupted during shutdown.",
+        reason_code="server_shutdown",
+    )
+
+    restored_task = store.get_task(task["task_id"])
+    restored_run = store.get_run("run_active")
+    assert restored_task is not None
+    assert restored_task["status"] == "failed"
+    assert restored_task["awaiting_hitl"] is False
+    assert "active_run_id" not in restored_task
+    assert restored_run is not None
+    assert restored_run["progress_events"][-1]["metrics"]["reason"] == "server_shutdown"
+
+
+def test_json_store_prunes_old_terminal_runs_but_keeps_executing_runs(tmp_path):
+    store = JsonTaskStore(tmp_path / "workflow_tasks.json")
+    for run_id, status in (
+        ("run_old", "completed"),
+        ("run_middle", "failed"),
+        ("run_new", "completed"),
+        ("run_active", "running"),
+    ):
+        store.save_run(
+            {
+                "run_id": run_id,
+                "kind": "new_query",
+                "status": status,
+                "logs": [],
+                "progress_events": [],
+                "progress_summaries": [],
+                "created_at": "2026-03-06T00:00:00+00:00",
+                "updated_at": "2026-03-06T00:00:00+00:00",
+            }
+        )
+
+    removed = store.prune_terminal_runs(2)
+
+    assert removed == 1
+    assert store.get_run("run_old") is None
+    assert store.get_run("run_middle") is not None
+    assert store.get_run("run_new") is not None
+    assert store.get_run("run_active")["status"] == "running"
+
+
 def test_json_store_serializes_concurrent_writes_without_losing_tasks(tmp_path):
     state_path = tmp_path / "workflow_tasks.json"
     store = JsonTaskStore(state_path)
@@ -701,6 +840,122 @@ async def test_export_report_pdf_does_not_expose_renderer_details(runtime, monke
 
     assert exc_info.value.status_code == 503
     assert exc_info.value.detail == "PDF export failed. Please try again."
+
+
+@pytest.mark.asyncio
+async def test_shutdown_persists_interruption_and_blocks_late_run_writes(runtime):
+    task = ui_server._make_task("task_shutdown", "Shutdown safety", "conv_shutdown")
+    run = await runtime._create_run("start_task", task_id=task["task_id"])
+    await runtime._update_run(run.run_id, status="running")
+    task["active_run_id"] = run.run_id
+    runtime.store.save_task(task)
+
+    cancelled = asyncio.Event()
+
+    async def pending_job() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    job = asyncio.create_task(pending_job())
+    runtime._track_background_task(run.run_id, job)
+    await asyncio.sleep(0)
+
+    await runtime.shutdown()
+
+    assert cancelled.is_set()
+    persisted_run = runtime.store.get_run(run.run_id)
+    persisted_task = runtime.store.get_task(task["task_id"])
+    assert persisted_run is not None
+    assert persisted_run["status"] == "failed"
+    assert persisted_run["progress_events"][-1]["type"] == "run.interrupted"
+    assert persisted_run["progress_events"][-1]["metrics"]["reason"] == "server_shutdown"
+    assert persisted_task is not None
+    assert persisted_task["status"] == "failed"
+    assert "active_run_id" not in persisted_task
+
+    await runtime._update_run(run.run_id, status="completed", final_report="late result")
+    await runtime._append_progress_event(
+        run.run_id,
+        phase="finalize",
+        event_type="run.completed",
+        status="done",
+        human_line="Late completion",
+    )
+    assert runtime.store.get_run(run.run_id)["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_workflow_turn_keeps_resources_until_worker_finishes(runtime):
+    started = threading.Event()
+    release = threading.Event()
+
+    async def slow_turn(*args, **kwargs):
+        started.set()
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+        return "done", "research_workflow"
+
+    runtime._workflow_turn_inner = slow_turn  # type: ignore[method-assign]
+    turn = asyncio.create_task(
+        runtime._run_workflow_turn("conv_worker", "test", run_id="run_worker")
+    )
+    for _ in range(100):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert started.is_set()
+
+    turn.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+    assert runtime.conv_sessions["conv_worker"].active_operations == 1
+
+    release.set()
+    for _ in range(100):
+        if runtime.conv_sessions["conv_worker"].active_operations == 0:
+            break
+        await asyncio.sleep(0.01)
+    assert runtime.conv_sessions["conv_worker"].active_operations == 0
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_bounds_terminal_runs_in_memory_and_store(runtime):
+    runtime.max_retained_completed_runs = 2
+    run_ids = []
+    for index in range(3):
+        run = await runtime._create_run("new_query", query=f"Question {index}")
+        run_ids.append(run.run_id)
+        await runtime._update_run(run.run_id, status="completed")
+
+    assert run_ids[0] not in runtime.runs
+    assert runtime.store.get_run(run_ids[0]) is None
+    assert set(run_ids[1:]).issubset(runtime.runs)
+
+
+def test_generated_report_retention_is_bounded_by_report_group(runtime, tmp_path):
+    report_dir = tmp_path / "reports"
+    runtime._report_dir = lambda: report_dir  # type: ignore[method-assign]
+    runtime.max_retained_reports = 10
+
+    for index in range(3):
+        markdown_path = runtime._write_report(f"task_{index}", f"Report {index}")
+        pdf_path = report_dir / f"task_{index}.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+        timestamp = 1_700_000_000 + index
+        os.utime(markdown_path, (timestamp, timestamp))
+        os.utime(pdf_path, (timestamp, timestamp))
+
+    runtime.max_retained_reports = 2
+    removed = runtime._prune_report_files()
+
+    assert removed == 2
+    assert not (report_dir / "task_0.md").exists()
+    assert not (report_dir / "task_0.pdf").exists()
+    assert (report_dir / "task_1.md").exists()
+    assert (report_dir / "task_2.pdf").exists()
 
 
 @pytest.mark.asyncio

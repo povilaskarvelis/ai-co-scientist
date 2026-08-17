@@ -14,6 +14,7 @@ import uuid
 logger = logging.getLogger(__name__)
 
 WORKFLOW_SNAPSHOT_SCHEMA = "workflow_session_state.v1"
+INCOMPLETE_RUN_STATUSES = frozenset({"queued", "running", "in_progress"})
 
 
 def _utc_now() -> str:
@@ -28,7 +29,13 @@ class SupportsWorkflowStateStore(Protocol):
     def get_conversation_tasks(self, conversation_id: str) -> list[dict[str, Any]]: ...
     def save_run(self, run: dict[str, Any], *, flush: bool = False) -> None: ...
     def get_run(self, run_id: str) -> dict[str, Any] | None: ...
-    def mark_incomplete_runs_failed(self, reason: str) -> int: ...
+    def mark_incomplete_runs_failed(
+        self,
+        reason: str,
+        *,
+        reason_code: str = "server_restart",
+    ) -> int: ...
+    def prune_terminal_runs(self, max_runs: int) -> int: ...
     def save_workflow_session(
         self,
         conversation_id: str,
@@ -174,18 +181,58 @@ class JsonTaskStore:
             run = self._data["runs"].get(run_id)
             return copy.deepcopy(run) if isinstance(run, dict) else None
 
-    def mark_incomplete_runs_failed(self, reason: str) -> int:
+    def mark_incomplete_runs_failed(
+        self,
+        reason: str,
+        *,
+        reason_code: str = "server_restart",
+    ) -> int:
         with self._lock:
             updated = 0
             for run_id, run in list(self._data["runs"].items()):
                 if not isinstance(run, dict):
                     continue
-                if _interrupt_run_payload(run, reason):
+                if interrupt_run_payload(run, reason, reason_code=reason_code):
                     self._data["runs"][run_id] = run
+                    task_id = str(run.get("task_id", "") or "").strip()
+                    task = self._data["tasks"].get(task_id)
+                    if isinstance(task, dict) and interrupt_task_payload(task, run, reason):
+                        self._data["tasks"][task_id] = task
+                        conversation_id = str(task.get("conversation_id", "") or "").strip()
+                        conversation = self._data["conversations"].get(conversation_id)
+                        if isinstance(conversation, dict):
+                            conversation["updated_at"] = task["updated_at"]
                     updated += 1
             if updated:
                 self._save()
             return updated
+
+    def prune_terminal_runs(self, max_runs: int) -> int:
+        max_runs = max(0, int(max_runs))
+        with self._lock:
+            terminal_runs = sorted(
+                (
+                    run
+                    for run in self._data["runs"].values()
+                    if isinstance(run, dict)
+                    and str(run.get("status", "") or "").strip() not in INCOMPLETE_RUN_STATUSES
+                ),
+                key=lambda run: (
+                    str(run.get("updated_at", "") or ""),
+                    str(run.get("run_id", "") or ""),
+                ),
+                reverse=True,
+            )
+            expired_ids = {
+                str(run.get("run_id", "") or "")
+                for run in terminal_runs[max_runs:]
+                if str(run.get("run_id", "") or "")
+            }
+            for run_id in expired_ids:
+                self._data["runs"].pop(run_id, None)
+            if expired_ids:
+                self._save()
+            return len(expired_ids)
 
     def save_workflow_session(
         self,
@@ -521,25 +568,99 @@ class PostgresTaskStore:
         payload = row.get("run_json")
         return copy.deepcopy(payload) if isinstance(payload, dict) else None
 
-    def mark_incomplete_runs_failed(self, reason: str) -> int:
-        with self._connect() as conn, conn.cursor() as cur:
+    def mark_incomplete_runs_failed(
+        self,
+        reason: str,
+        *,
+        reason_code: str = "server_restart",
+    ) -> int:
+        _, _, Jsonb = _require_psycopg()
+        updated = 0
+        with self._connect() as conn, conn.transaction(), conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT run_json
+                SELECT run_id, run_json
                 FROM runs
                 WHERE status IN ('queued', 'running', 'in_progress')
+                FOR UPDATE
                 """
             )
             rows = cur.fetchall() or []
-        updated = 0
-        for row in rows:
-            payload = row.get("run_json")
-            if not isinstance(payload, dict):
-                continue
-            if _interrupt_run_payload(payload, reason):
-                self.save_run(payload)
+            for row in rows:
+                payload = row.get("run_json")
+                if not isinstance(payload, dict):
+                    continue
+                if not interrupt_run_payload(payload, reason, reason_code=reason_code):
+                    continue
+                cur.execute(
+                    """
+                    UPDATE runs
+                    SET status = %s, updated_at = %s, run_json = %s
+                    WHERE run_id = %s
+                    """,
+                    (
+                        str(payload.get("status", "") or ""),
+                        str(payload.get("updated_at", "") or _utc_now()),
+                        Jsonb(payload),
+                        str(payload.get("run_id", "") or row.get("run_id", "")),
+                    ),
+                )
+                task_id = str(payload.get("task_id", "") or "").strip()
+                if task_id:
+                    cur.execute(
+                        "SELECT task_json FROM tasks WHERE task_id = %s FOR UPDATE",
+                        (task_id,),
+                    )
+                    task_row = cur.fetchone() or {}
+                    task = task_row.get("task_json")
+                    if isinstance(task, dict) and interrupt_task_payload(task, payload, reason):
+                        cur.execute(
+                            """
+                            UPDATE tasks
+                            SET status = %s, updated_at = %s, task_json = %s
+                            WHERE task_id = %s
+                            """,
+                            (
+                                str(task.get("status", "") or ""),
+                                str(task.get("updated_at", "") or _utc_now()),
+                                Jsonb(task),
+                                task_id,
+                            ),
+                        )
+                        conversation_id = str(task.get("conversation_id", "") or "").strip()
+                        if conversation_id:
+                            cur.execute(
+                                """
+                                UPDATE conversations
+                                SET updated_at = %s
+                                WHERE conversation_id = %s
+                                """,
+                                (
+                                    str(task.get("updated_at", "") or _utc_now()),
+                                    conversation_id,
+                                ),
+                            )
                 updated += 1
         return updated
+
+    def prune_terminal_runs(self, max_runs: int) -> int:
+        max_runs = max(0, int(max_runs))
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH expired AS (
+                    SELECT run_id
+                    FROM runs
+                    WHERE status NOT IN ('queued', 'running', 'in_progress')
+                    ORDER BY updated_at DESC, run_id DESC
+                    OFFSET %s
+                )
+                DELETE FROM runs
+                WHERE run_id IN (SELECT run_id FROM expired)
+                """,
+                (max_runs,),
+            )
+            return max(0, int(cur.rowcount or 0))
 
     def save_workflow_session(
         self,
@@ -621,9 +742,14 @@ def create_state_store(state_store_path: Path) -> SupportsWorkflowStateStore:
     return JsonTaskStore(state_store_path)
 
 
-def _interrupt_run_payload(run: dict[str, Any], reason: str) -> bool:
+def interrupt_run_payload(
+    run: dict[str, Any],
+    reason: str,
+    *,
+    reason_code: str = "server_restart",
+) -> bool:
     status = str(run.get("status", "") or "").strip()
-    if status not in {"queued", "running", "in_progress"}:
+    if status not in INCOMPLETE_RUN_STATUSES:
         return False
 
     timestamp = _utc_now()
@@ -639,7 +765,7 @@ def _interrupt_run_payload(run: dict[str, Any], reason: str) -> bool:
         "step_index": None,
         "step_title": "",
         "tool": "",
-        "metrics": {"reason": "server_restart"},
+        "metrics": {"reason": reason_code},
     }
 
     run["status"] = "failed"
@@ -653,4 +779,25 @@ def _interrupt_run_payload(run: dict[str, Any], reason: str) -> bool:
     logs = list(run.get("logs") or [])
     logs.append({"at": timestamp, "message": human_line})
     run["logs"] = logs[-300:]
+    return True
+
+
+def interrupt_task_payload(
+    task: dict[str, Any],
+    run: dict[str, Any],
+    reason: str,
+) -> bool:
+    """Reconcile a task only when it explicitly references the interrupted run."""
+    run_id = str(run.get("run_id", "") or "").strip()
+    if not run_id or str(task.get("active_run_id", "") or "").strip() != run_id:
+        return False
+
+    task.pop("active_run_id", None)
+    if str(task.get("status", "") or "").strip() not in {"completed", "failed"}:
+        task["status"] = "failed"
+        task["awaiting_hitl"] = False
+    task["interruption_reason"] = str(reason or "Run interrupted before completion.").strip()
+    task["progress_events"] = copy.deepcopy(list(run.get("progress_events") or [])[-600:])
+    task["progress_summaries"] = copy.deepcopy(list(run.get("progress_summaries") or [])[-80:])
+    task["updated_at"] = str(run.get("updated_at", "") or _utc_now())
     return True

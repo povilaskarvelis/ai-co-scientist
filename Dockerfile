@@ -31,4 +31,4 @@ RUN rm -rf /app/adk-agent/state /app/adk-agent/reports \
 WORKDIR /app/adk-agent
 EXPOSE 8080
 
-CMD ["sh", "-c", "uvicorn ui_server:app --host 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["sh", "-c", "exec uvicorn ui_server:app --host 0.0.0.0 --port ${PORT:-8080}"]

@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections import defaultdict
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -36,7 +37,12 @@ from google.genai.types import Content, Part
 from pydantic import BaseModel, Field
 
 from agent import validate_runtime_configuration
-from state_store import SupportsWorkflowStateStore, create_state_store
+from state_store import (
+    SupportsWorkflowStateStore,
+    create_state_store,
+    interrupt_run_payload,
+    interrupt_task_payload,
+)
 from report_pdf import write_markdown_pdf
 from co_scientist.tool_registry import TOOL_SOURCE_NAMES
 from co_scientist.workflow import (
@@ -59,10 +65,23 @@ logger = logging.getLogger(__name__)
 
 RATE_LIMIT_QUERIES = int(os.environ.get("RATE_LIMIT_QUERIES", "20"))
 RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "3600"))
+RATE_LIMIT_MAX_KEYS = max(1, int(os.environ.get("RATE_LIMIT_MAX_KEYS", "10000")))
+RATE_LIMIT_TRUSTED_PROXY_HOPS = max(
+    0,
+    int(os.environ.get("RATE_LIMIT_TRUSTED_PROXY_HOPS", "0")),
+)
 MAX_CONCURRENT_TURNS = int(os.environ.get("ADK_MAX_CONCURRENT_TURNS", "6"))
 MAX_RETAINED_CONVERSATIONS = max(
     0,
     int(os.environ.get("ADK_MAX_RETAINED_CONVERSATIONS", str(MAX_CONCURRENT_TURNS))),
+)
+MAX_RETAINED_COMPLETED_RUNS = max(
+    1,
+    int(os.environ.get("ADK_MAX_RETAINED_COMPLETED_RUNS", "200")),
+)
+MAX_RETAINED_REPORTS = max(
+    1,
+    int(os.environ.get("ADK_MAX_RETAINED_REPORTS", "100")),
 )
 _global_turn_semaphore = threading.Semaphore(MAX_CONCURRENT_TURNS)
 GA4_MEASUREMENT_ID = os.environ.get("GA4_MEASUREMENT_ID", "").strip()
@@ -108,6 +127,10 @@ def _configure_session_signing_key(state_dir: Path) -> None:
     """Keep browser ownership stable for as long as the local MVP state exists."""
     global _SESSION_SIGNING_KEY
     if _configured_session_secret:
+        if len(_configured_session_secret) < 32:
+            raise RuntimeError(
+                "AI_CO_SCIENTIST_SESSION_SECRET must contain at least 32 characters."
+            )
         return
     secret_path = state_dir / ".session_secret"
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -136,35 +159,87 @@ def _request_owner_id(request: Request) -> str:
 class RateLimiter:
     """In-memory sliding-window rate limiter keyed by IP address."""
 
-    def __init__(self, max_requests: int, window_seconds: int) -> None:
+    def __init__(self, max_requests: int, window_seconds: int, *, max_keys: int = 10000) -> None:
         self.max_requests = max_requests
         self.window = window_seconds
-        self._hits: dict[str, list[float]] = defaultdict(list)
+        self.max_keys = max(1, max_keys)
+        self._hits: OrderedDict[str, list[float]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def _fresh_hits(self, key: str, now: float) -> list[float]:
+        hits = self._hits.pop(key, [])
+        return [timestamp for timestamp in hits if now - timestamp < self.window]
+
+    def _make_room_for_new_key(self, now: float) -> None:
+        if len(self._hits) < self.max_keys:
+            return
+        for candidate in list(self._hits):
+            hits = self._fresh_hits(candidate, now)
+            if hits:
+                self._hits[candidate] = hits
+            if len(self._hits) < self.max_keys:
+                return
+        self._hits.popitem(last=False)
 
     def check(self, key: str) -> tuple[bool, int]:
         now = time.time()
-        hits = self._hits[key]
-        self._hits[key] = hits = [t for t in hits if now - t < self.window]
-        if len(hits) >= self.max_requests:
-            retry_after = int(self.window - (now - hits[0])) + 1
-            return False, retry_after
-        hits.append(now)
-        return True, 0
+        with self._lock:
+            is_new_key = key not in self._hits
+            hits = self._fresh_hits(key, now)
+            if is_new_key:
+                self._make_room_for_new_key(now)
+            if len(hits) >= self.max_requests:
+                self._hits[key] = hits
+                retry_after = int(self.window - (now - hits[0])) + 1
+                return False, retry_after
+            hits.append(now)
+            self._hits[key] = hits
+            return True, 0
 
     def remaining(self, key: str) -> int:
         now = time.time()
-        hits = [t for t in self._hits.get(key, []) if now - t < self.window]
-        return max(0, self.max_requests - len(hits))
+        with self._lock:
+            hits = self._fresh_hits(key, now)
+            if hits:
+                self._hits[key] = hits
+            return max(0, self.max_requests - len(hits))
 
 
-query_limiter = RateLimiter(RATE_LIMIT_QUERIES, RATE_LIMIT_WINDOW)
+query_limiter = RateLimiter(
+    RATE_LIMIT_QUERIES,
+    RATE_LIMIT_WINDOW,
+    max_keys=RATE_LIMIT_MAX_KEYS,
+)
+
+
+def _normalized_ip(value: str) -> str | None:
+    try:
+        address = ipaddress.ip_address(str(value or "").strip())
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    return address.compressed
 
 
 def _client_ip(request: Request) -> str:
+    """Resolve the client without trusting attacker-controlled XFF prefixes."""
+    direct_client = request.client.host if request.client else "unknown"
+    direct_ip = _normalized_ip(direct_client) or direct_client
+    if RATE_LIMIT_TRUSTED_PROXY_HOPS <= 0:
+        return direct_ip
+
     forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    chain = [part.strip() for part in forwarded.split(",") if part.strip()]
+    required_length = RATE_LIMIT_TRUSTED_PROXY_HOPS + 1
+    if len(chain) < required_length:
+        return direct_ip
+
+    trusted_suffix = chain[-required_length:]
+    normalized_suffix = [_normalized_ip(part) for part in trusted_suffix]
+    if any(address is None for address in normalized_suffix):
+        return direct_ip
+    return str(normalized_suffix[0])
 
 
 def _enforce_rate_limit(request: Request) -> None:
@@ -224,7 +299,14 @@ def _is_terminal_workflow_error_response(text: str) -> bool:
 
 
 def _fire_and_forget_threadsafe(coro: Any, loop: asyncio.AbstractEventLoop, *, label: str = "") -> None:
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    try:
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+    except RuntimeError as exc:
+        close = getattr(coro, "close", None)
+        if callable(close):
+            close()
+        logger.debug("Could not schedule %s: %s", label or "threadsafe task", exc)
+        return
 
     def _log_failure(done_future) -> None:
         try:
@@ -671,11 +753,17 @@ class UiRuntime:
         self.conv_sessions: dict[str, ConversationSession] = {}
         self.conv_thread_locks: dict[str, threading.Lock] = {}
         self.max_retained_conversations = MAX_RETAINED_CONVERSATIONS
+        self.max_retained_completed_runs = MAX_RETAINED_COMPLETED_RUNS
+        self.max_retained_reports = MAX_RETAINED_REPORTS
         self._conv_sessions_lock = asyncio.Lock()
         self.runs_lock = asyncio.Lock()
         self.runs: dict[str, RunRecord] = {}
         self.background_tasks: set[asyncio.Task] = set()
         self.run_tasks: dict[str, asyncio.Task] = {}
+        self._run_write_guard = threading.Lock()
+        self._blocked_run_writes: set[str] = set()
+        self._shutting_down = False
+        self._report_files_lock = threading.RLock()
         self._thread_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TURNS + 4, thread_name_prefix="wf")
 
     async def startup(self) -> None:
@@ -689,22 +777,121 @@ class UiRuntime:
         )
         if interrupted:
             logger.warning("Marked %d incomplete runs as failed during startup.", interrupted)
+        pruned_runs = self._prune_persisted_terminal_runs()
+        if pruned_runs:
+            logger.info("Pruned %d expired completed run records during startup.", pruned_runs)
+        self._prune_report_files()
         self.ready = True
         self.ready_error = None
 
     async def shutdown(self) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self.ready = False
+        self.ready_error = "Server is shutting down."
+
+        await self._interrupt_active_runs_for_shutdown()
         pending = list(self.background_tasks)
         for task in pending:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-        self._thread_pool.shutdown(wait=False)
+        self._thread_pool.shutdown(wait=False, cancel_futures=True)
         async with self._conv_sessions_lock:
-            retained = list(self.conv_sessions.items())
-            self.conv_sessions.clear()
-            self.conv_thread_locks.clear()
-            for conversation_id, cs in retained:
+            idle = [
+                (conversation_id, cs)
+                for conversation_id, cs in self.conv_sessions.items()
+                if cs.active_operations == 0
+            ]
+            for conversation_id, cs in idle:
+                self.conv_sessions.pop(conversation_id, None)
+                self.conv_thread_locks.pop(conversation_id, None)
                 await self._close_conversation_resources(conversation_id, cs)
+        self._prune_persisted_terminal_runs()
+        self._prune_report_files()
+
+    def _run_writes_blocked(self, run_id: str) -> bool:
+        with self._run_write_guard:
+            return run_id in self._blocked_run_writes
+
+    def _prune_persisted_terminal_runs(self) -> int:
+        try:
+            return self.store.prune_terminal_runs(self.max_retained_completed_runs)
+        except Exception:
+            logger.warning("Failed to prune expired completed run records.", exc_info=True)
+            return 0
+
+    async def _interrupt_active_runs_for_shutdown(self) -> None:
+        reason = "Run interrupted because the server shut down before completion."
+        async with self.runs_lock:
+            run_ids = [
+                run_id
+                for run_id, run in self.runs.items()
+                if run.status in {"queued", "running", "in_progress"}
+            ]
+            with self._run_write_guard:
+                self._blocked_run_writes.update(run_ids)
+
+        try:
+            interrupted = self.store.mark_incomplete_runs_failed(
+                reason,
+                reason_code="server_shutdown",
+            )
+        except Exception:
+            logger.exception("Failed to persist interrupted runs during shutdown.")
+            interrupted = 0
+
+        fallback_payloads: list[dict] = []
+        async with self.runs_lock:
+            for run_id in run_ids:
+                run = self.runs.get(run_id)
+                if run is None:
+                    continue
+                try:
+                    persisted = self.store.get_run(run_id)
+                except Exception:
+                    logger.warning(
+                        "Failed to reload interrupted run %s during shutdown.",
+                        run_id,
+                        exc_info=True,
+                    )
+                    persisted = None
+                if isinstance(persisted, dict) and persisted.get("status") == "failed":
+                    run.status = "failed"
+                    run.error = str(persisted.get("error", "") or "")
+                    run.logs = list(persisted.get("logs") or [])
+                    run.progress_events = list(persisted.get("progress_events") or [])
+                    run.progress_summaries = list(persisted.get("progress_summaries") or [])
+                    run.updated_at = str(persisted.get("updated_at", "") or _utc_now())
+                    continue
+
+                payload = run.to_dict()
+                if interrupt_run_payload(payload, reason, reason_code="server_shutdown"):
+                    run.status = "failed"
+                    run.error = str(payload.get("error", "") or "")
+                    run.logs = list(payload.get("logs") or [])
+                    run.progress_events = list(payload.get("progress_events") or [])
+                    run.updated_at = str(payload.get("updated_at", "") or _utc_now())
+                    fallback_payloads.append(payload)
+
+        for payload in fallback_payloads:
+            try:
+                self.store.save_run(payload, flush=True)
+                task_id = str(payload.get("task_id", "") or "").strip()
+                task = self.store.get_task(task_id) if task_id else None
+                if isinstance(task, dict) and interrupt_task_payload(task, payload, reason):
+                    self.store.save_task(task)
+            except Exception:
+                logger.exception(
+                    "Failed to persist shutdown interruption for run %s.",
+                    payload.get("run_id", ""),
+                )
+        if interrupted or fallback_payloads:
+            logger.warning(
+                "Marked %d active runs as interrupted during shutdown.",
+                max(interrupted, len(run_ids)),
+            )
 
     def _get_conv_thread_lock(self, conversation_id: str) -> threading.Lock:
         if conversation_id not in self.conv_thread_locks:
@@ -837,6 +1024,12 @@ class UiRuntime:
             if cs.active_operations > 0:
                 cs.active_operations -= 1
             cs.last_used_at = time.monotonic()
+            if self._shutting_down:
+                if cs.active_operations == 0:
+                    self.conv_sessions.pop(conversation_id, None)
+                    self.conv_thread_locks.pop(conversation_id, None)
+                    await self._close_conversation_resources(conversation_id, cs)
+                return
             await self._trim_conversation_sessions_locked(
                 self.max_retained_conversations
             )
@@ -847,15 +1040,15 @@ class UiRuntime:
         *,
         task_id: str = "",
     ) -> None:
-        try:
-            await self._persist_conversation_state(conversation_id, task_id=task_id)
-        except Exception:
-            logger.exception(
-                "Failed to persist conversation %s before releasing its resources.",
-                conversation_id,
-            )
-        finally:
-            await self._release_conversation_session(conversation_id)
+        if not self._shutting_down:
+            try:
+                await self._persist_conversation_state(conversation_id, task_id=task_id)
+            except Exception:
+                logger.exception(
+                    "Failed to persist conversation %s before releasing its resources.",
+                    conversation_id,
+                )
+        await self._release_conversation_session(conversation_id)
 
     async def _read_session_state(self, conversation_id: str) -> dict | None:
         cs = self.conv_sessions.get(conversation_id)
@@ -926,10 +1119,22 @@ class UiRuntime:
             finally:
                 _global_turn_semaphore.release()
 
+        worker_future = main_loop.run_in_executor(self._thread_pool, _thread_target)
         try:
-            return await main_loop.run_in_executor(self._thread_pool, _thread_target)
-        finally:
+            result = await asyncio.shield(worker_future)
+        except asyncio.CancelledError:
+            def _release_when_worker_stops(_done) -> None:
+                _fire_and_forget_threadsafe(
+                    self._release_conversation_session(conversation_id),
+                    main_loop,
+                    label=f"release_conversation:{conversation_id}",
+                )
+
+            worker_future.add_done_callback(_release_when_worker_stops)
+            raise
+        else:
             await self._release_conversation_session(conversation_id)
+            return result
 
     async def _run_workflow_turn_filtered(
         self,
@@ -988,8 +1193,12 @@ class UiRuntime:
             return _resolve_source_label(tn or "")
 
         def _fire_progress(**kwargs) -> None:
-            asyncio.run_coroutine_threadsafe(
-                self._append_progress_event(run_id, **kwargs), caller_loop
+            if self._run_writes_blocked(run_id):
+                return
+            _fire_and_forget_threadsafe(
+                self._append_progress_event(run_id, **kwargs),
+                caller_loop,
+                label=f"append_progress:{run_id}",
             )
 
         async for event in cs.runner.run_async(
@@ -1241,6 +1450,8 @@ class UiRuntime:
 
     async def _emit_step_summary(self, run_id: str, wf_state: dict, steps_executed: int) -> None:
         """Build a structured progress summary from workflow state after execution."""
+        if self._run_writes_blocked(run_id):
+            return
         steps = wf_state.get("steps", [])
         completed = sum(1 for s in steps if s.get("status") == "completed")
         total = len(steps)
@@ -1304,6 +1515,8 @@ class UiRuntime:
             "steps_total": total,
         }
         async with self.runs_lock:
+            if self._run_writes_blocked(run_id):
+                return
             run = self.runs.get(run_id)
             if run:
                 run.progress_summaries.append(summary)
@@ -1313,6 +1526,8 @@ class UiRuntime:
         self, task: dict, run_id: str | None = None, *, owner_ip: str = "", merge_progress: bool = True, flush: bool = True
     ) -> None:
         """Save task to store, syncing progress data from the active run unless merge_progress=False."""
+        if run_id and self._run_writes_blocked(run_id):
+            return
         active_run_id = ""
         if run_id and merge_progress:
             async with self.runs_lock:
@@ -1331,6 +1546,8 @@ class UiRuntime:
             task["active_run_id"] = active_run_id
         else:
             task.pop("active_run_id", None)
+        if run_id and self._run_writes_blocked(run_id):
+            return
         self.store.save_task(task, owner_ip=owner_ip, flush=flush)
         conversation_id = str(task.get("conversation_id", "") or "").strip()
         if flush and conversation_id:
@@ -1363,8 +1580,13 @@ class UiRuntime:
         return run
 
     async def _update_run(self, run_id: str, **updates) -> None:
+        if self._run_writes_blocked(run_id):
+            return
         run_payload: dict | None = None
+        terminal = False
         async with self.runs_lock:
+            if self._run_writes_blocked(run_id):
+                return
             run = self.runs.get(run_id)
             if not run:
                 return
@@ -1372,8 +1594,26 @@ class UiRuntime:
                 setattr(run, key, value)
             run.updated_at = _utc_now()
             run_payload = run.to_dict()
+            terminal = run.status not in {"queued", "running", "in_progress"}
         if run_payload:
             self.store.save_run(run_payload, flush=True)
+        if terminal:
+            await self._prune_completed_runs()
+
+    async def _prune_completed_runs(self) -> None:
+        async with self.runs_lock:
+            terminal_runs = sorted(
+                (
+                    run
+                    for run in self.runs.values()
+                    if run.status not in {"queued", "running", "in_progress"}
+                ),
+                key=lambda run: (run.updated_at, run.run_id),
+                reverse=True,
+            )
+            for run in terminal_runs[self.max_retained_completed_runs:]:
+                self.runs.pop(run.run_id, None)
+        self._prune_persisted_terminal_runs()
 
     async def _append_progress_event(
         self,
@@ -1386,6 +1626,8 @@ class UiRuntime:
         task_id: str | None = None,
         metrics: dict | None = None,
     ) -> None:
+        if self._run_writes_blocked(run_id):
+            return
         event = {
             "event_id": f"evt_{uuid.uuid4().hex[:10]}",
             "at": _utc_now(),
@@ -1401,6 +1643,8 @@ class UiRuntime:
         }
         run_payload: dict | None = None
         async with self.runs_lock:
+            if self._run_writes_blocked(run_id):
+                return
             run = self.runs.get(run_id)
             if not run:
                 return
@@ -2034,11 +2278,50 @@ class UiRuntime:
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def _prune_report_files(self) -> int:
+        """Keep only the newest report groups; task state remains the source of truth."""
+        with self._report_files_lock:
+            report_dir = self._report_dir()
+            report_dir.mkdir(parents=True, exist_ok=True)
+            grouped: dict[str, list[Path]] = {}
+            try:
+                report_paths = list(report_dir.iterdir())
+            except OSError:
+                logger.warning("Failed to inspect generated report retention.", exc_info=True)
+                return 0
+            for path in report_paths:
+                if not path.is_file() or path.suffix.lower() not in {".md", ".pdf"}:
+                    continue
+                grouped.setdefault(path.stem, []).append(path)
+
+            group_mtimes: list[tuple[int, str, list[Path]]] = []
+            for stem, paths in grouped.items():
+                try:
+                    newest_mtime = max(path.stat().st_mtime_ns for path in paths)
+                except OSError:
+                    logger.warning("Failed to inspect generated report group %s.", stem, exc_info=True)
+                    continue
+                group_mtimes.append((newest_mtime, stem, paths))
+            newest_groups = sorted(group_mtimes, reverse=True)
+            removed = 0
+            for _mtime, _stem, paths in newest_groups[self.max_retained_reports:]:
+                for path in paths:
+                    try:
+                        path.unlink(missing_ok=True)
+                        removed += 1
+                    except OSError:
+                        logger.warning("Failed to prune generated report %s.", path, exc_info=True)
+            return removed
+
     def _write_report(self, task_id: str, markdown: str) -> Path:
         safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", task_id)
-        path = self._report_dir() / f"{safe_id}.md"
-        path.write_text((markdown or "").rstrip() + "\n", encoding="utf-8")
-        return path
+        with self._report_files_lock:
+            report_dir = self._report_dir()
+            report_dir.mkdir(parents=True, exist_ok=True)
+            path = report_dir / f"{safe_id}.md"
+            path.write_text((markdown or "").rstrip() + "\n", encoding="utf-8")
+            self._prune_report_files()
+            return path
 
     # -- Read APIs (conversations, tasks, runs) --------------------------------
 
@@ -2594,8 +2877,10 @@ async def export_report_pdf(task_id: str, request: Request) -> FileResponse:
         title=str(task.get("title", "Report") or "Report"),
     )
     if error:
+        pdf_path.unlink(missing_ok=True)
         logger.warning("PDF export failed for task %s: %s", task_id, error)
         raise HTTPException(status_code=503, detail="PDF export failed. Please try again.")
+    runtime._prune_report_files()
     return FileResponse(
         pdf_path,
         media_type="application/pdf",

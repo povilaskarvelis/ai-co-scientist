@@ -315,7 +315,10 @@ Opens the custom web interface at `http://localhost:8080` with conversation mana
 - The UI server binds to `127.0.0.1:8080` by default. Override with `CO_SCI_UI_HOST` and `CO_SCI_UI_PORT`.
 - Local task and conversation state is stored in `adk-agent/state/workflow_tasks.json` by default.
 - To use Postgres-backed persistence instead of local JSON, set `AI_CO_SCIENTIST_POSTGRES_DSN` (or `POSTGRES_DSN` / `DATABASE_URL`).
-- Generated Markdown/PDF reports are written to `adk-agent/reports/`.
+- Set `AI_CO_SCIENTIST_SESSION_SECRET` to at least 32 random characters when browser ownership must remain stable across server restarts. Cloud Run deployment manages this secret automatically.
+- Generated Markdown/PDF reports are written to `adk-agent/reports/`. The runtime keeps the newest 100 report groups by default; override with `ADK_MAX_RETAINED_REPORTS`.
+- Completed and failed orchestration records are bounded to the newest 200 by default in memory and persistent state; override with `ADK_MAX_RETAINED_COMPLETED_RUNS`. Tasks and conversation history are not removed by this run-record cleanup.
+- On graceful shutdown, executing runs and their active tasks are persisted as interrupted before background orchestration is cancelled. Saved approval checkpoints are left intact.
 - Planner skills are enabled by default. Set `ADK_PLANNER_SKILLS_ENABLED=0` to disable repo-local ADK planner skills.
 - Executor lookup skills are enabled by default. Set `ADK_EXECUTION_SKILLS_ENABLED=0` to disable repo-local executor skills.
 - Report-assistant follow-up skills are enabled by default. Set `ADK_REPORT_ASSISTANT_SKILLS_ENABLED=0` to disable repo-local report-assistant skills.
@@ -352,11 +355,16 @@ python agent.py --benchmark --query "What is the Open Targets Association Score 
 ## Cloud Run Deployment
 
 ```bash
+AI_CO_SCIENTIST_POSTGRES_DSN="postgresql://user:password@host/database" \
 PROJECT_ID="your-project-id" \
 REGION="us-central1" \
 SERVICE_NAME="ai-co-scientist" \
 bash scripts/deploy_cloud_run.sh
 ```
+
+The first durable deploy stores the Postgres connection string and a generated browser-session signing key in Secret Manager. Later deploys reuse the existing secret versions, so the connection string can be omitted. The script does not provision a database or a warm instance.
+
+Cloud Run's local filesystem is ephemeral, so the deploy script stops before building when no Postgres configuration exists. To intentionally deploy a disposable demo without durable conversations, set `ALLOW_EPHEMERAL_STATE=true`.
 
 The deploy script builds a container image via Cloud Build, then deploys the primary `ui_server.py` app to Cloud Run with Vertex AI auth and the full BigQuery dataset allowlist pre-configured.
 
