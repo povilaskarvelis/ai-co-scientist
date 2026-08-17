@@ -115,8 +115,23 @@ def test_cloud_run_ephemeral_state_requires_explicit_override(tmp_path):
         tmp_path,
         AI_CO_SCIENTIST_SESSION_SECRET=SESSION_SECRET,
         ALLOW_EPHEMERAL_STATE="true",
+        MAX_INSTANCES="2",
     )
 
     assert result.returncode == 0, result.stderr
     assert "Conversation persistence: ephemeral (explicit override)" in result.stdout
+    assert "Ephemeral state requires MAX_INSTANCES=1" in result.stdout
+    assert "--max-instances 1" in result.stdout
     assert "AI_CO_SCIENTIST_POSTGRES_DSN=" not in result.stdout
+
+
+def test_cloud_run_durable_state_preserves_multi_instance_limit(tmp_path):
+    result = _run_deploy(
+        tmp_path,
+        AI_CO_SCIENTIST_POSTGRES_DSN="postgresql://user:password@example.invalid/database",
+        MAX_INSTANCES="2",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Ephemeral state requires MAX_INSTANCES=1" not in result.stdout
+    assert "--max-instances 2" in result.stdout

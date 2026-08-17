@@ -1246,6 +1246,13 @@ async def test_run_start_task_stops_immediately_on_terminal_rate_limit(runtime):
 
     task = ui_server._make_task("task_rate_limit", "Assess obesity mechanisms", "conv_rate_limit")
     task["awaiting_hitl"] = True
+    task["steps"] = [
+        {
+            "id": "S1",
+            "goal": "Compare human evidence across candidate mechanisms",
+            "status": "pending",
+        }
+    ]
     runtime.store.save_task(task)
 
     run = await runtime._create_run("start_task", task_id=task["task_id"])
@@ -1255,6 +1262,16 @@ async def test_run_start_task_stops_immediately_on_terminal_rate_limit(runtime):
     assert payload is not None
     assert payload["status"] == "failed"
     assert "Rate Limited" in payload["error"]
+    execution_event = next(
+        event for event in payload["progress_events"]
+        if event["type"] == "execution.running"
+    )
+    assert execution_event["human_line"].startswith("Starting S1 of 1:")
+    assert execution_event["metrics"] == {
+        "step_id": "S1",
+        "step_number": 1,
+        "steps_total": 1,
+    }
 
     stored_task = runtime.store.get_task(task["task_id"])
     assert stored_task is not None

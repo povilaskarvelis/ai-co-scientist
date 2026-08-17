@@ -1855,6 +1855,26 @@ def test_describe_tool_result_generic_fallback():
     assert "BRCA1" in desc
 
 
+def test_describe_tool_call_hides_internal_skill_operations():
+    assert workflow._describe_tool_call("list_skills", {}) == ""
+    assert workflow._describe_tool_call("load_skill", {"name": "database-lookup"}) == ""
+    assert workflow._describe_tool_call("load_skill_resource", {"resource": "reference.md"}) == ""
+
+
+def test_describe_open_targets_calls_includes_target_and_disease():
+    association = workflow._describe_tool_call(
+        "get_open_targets_association",
+        {"target": "MC4R", "disease": "obesity"},
+    )
+    l2g = workflow._describe_tool_call(
+        "get_open_targets_l2g",
+        {"target": "GDF15", "disease": "obesity"},
+    )
+
+    assert association == "Checking Open Targets association for MC4R and obesity"
+    assert l2g == "Checking Open Targets L2G evidence for GDF15 and obesity"
+
+
 def test_resolve_source_label():
     assert workflow._resolve_source_label("run_bigquery_select_query") == "BigQuery"
     assert workflow._resolve_source_label("search_clinical_trials") == "ClinicalTrials.gov"
@@ -4066,6 +4086,25 @@ def test_extract_evidence_ids_from_text():
 def test_extract_evidence_ids_from_text_empty():
     assert workflow._extract_evidence_ids_from_text("") == []
     assert workflow._extract_evidence_ids_from_text("no identifiers here") == []
+
+
+def test_uniprot_extraction_rejects_prose_that_looks_like_an_identifier():
+    text = (
+        "The UniProt protein entry for GDF15 contains a curated annotation. "
+        "Valid examples are UniProt:Q99988, UniProt ID Q5S007, and "
+        "UniProt Accession A0A024RBG1."
+    )
+
+    ids = workflow._extract_evidence_ids_from_text(text)
+
+    assert "UniProt:Q99988" in ids
+    assert "UniProt:Q5S007" in ids
+    assert "UniProt:A0A024RBG1" in ids
+    assert "UniProt:PROTEIN" not in ids
+    assert "UniProt:ENTRY" not in ids
+    assert "UniProt:FOR" not in ids
+    assert workflow._is_valid_evidence_id("UniProt:Q5S007") is True
+    assert workflow._is_valid_evidence_id("UniProt:PROTEIN") is False
 
 
 def test_extract_evidence_ids_preserves_balanced_parentheses_in_doi():

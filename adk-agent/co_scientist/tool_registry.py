@@ -351,8 +351,8 @@ TOOL_ROUTING_METADATA: dict[str, dict[str, Any]] = {
     },
     "search_gwas_associations": {
         "overlap_group": "gwas_catalog_lookup",
-        "preferred_for": "broad GWAS Catalog association discovery when the study accession is not yet known or when you are exploring trait-variant hits across studies",
-        "fallback_tools": ["get_gwas_study_variant_association", "get_open_targets_l2g", "resolve_gene_identifiers"],
+        "preferred_for": "broad GWAS Catalog association discovery by trait or rsID when the study accession is not yet known; it is not a direct gene-symbol filter",
+        "fallback_tools": ["get_gwas_study_variant_association", "get_open_targets_association", "get_open_targets_l2g", "resolve_gene_identifiers"],
     },
     "get_gwas_study_variant_association": {
         "overlap_group": "gwas_catalog_lookup",
@@ -662,6 +662,19 @@ TOOL_EVIDENCE_CONTRACTS: dict[str, dict[str, Any]] = {
             "Binding-mode or scaffold comparisons require record-level structural details, not a structure count alone.",
         ],
     },
+    "search_gwas_associations": {
+        "evidence_kind": "trait- or variant-indexed GWAS association search records",
+        "supports": [
+            "returned trait and variant identities",
+            "mapped genes explicitly present on returned association rows",
+            "reported p-values and effect metadata",
+        ],
+        "interpretation_limits": [
+            "The tool accepts a trait or rsID, not a gene filter; entering a gene symbol as the trait does not establish gene-specific evidence.",
+            "A broad trait result supports a gene-level claim only when that exact gene is present in the returned row's mapped-gene field.",
+            "Do not reuse the same broad trait result as independent evidence for multiple genes.",
+        ],
+    },
 }
 
 _ARCHIVE_SEARCH_TOOLS = (
@@ -720,7 +733,7 @@ SOURCE_PRECEDENCE_RULES: list[dict[str, Any]] = [
     {
         "topic": "GWAS Catalog lookup",
         "tools": ["get_gwas_study_variant_association", "get_gwas_study_top_risk_allele", "search_gwas_associations", "get_open_targets_l2g"],
-        "summary": "Use `get_gwas_study_variant_association` for a specific study accession plus variant/risk-allele row and its RAF/beta/p-value; use `get_gwas_study_top_risk_allele` for study-wide 'highest/lowest p-value risk allele' questions; use `search_gwas_associations` for broader GWAS Catalog discovery when the exact study row is not yet known; use `get_open_targets_l2g` only when the task is Open Targets genetics prioritization rather than direct GWAS Catalog study metadata.",
+        "summary": "Use `get_gwas_study_variant_association` for a specific study accession plus variant/risk-allele row and its RAF/beta/p-value; use `get_gwas_study_top_risk_allele` for study-wide 'highest/lowest p-value risk allele' questions; use `search_gwas_associations` for broader discovery by trait or rsID, not as a direct gene-symbol filter. A gene-level claim requires that gene on the returned association row; use Open Targets tools for target-disease genetics prioritization.",
     },
     {
         "topic": "Literature search",

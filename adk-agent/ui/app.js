@@ -637,6 +637,31 @@ function normalizeActivityText(text) {
   return String(text || "").replace(/\s+/g, " ").trim();
 }
 
+function activityDisplaySummary(text) {
+  return CoScientistActivityState.sanitizeDisplaySummary(text);
+}
+
+const INTERNAL_ACTIVITY_TOOL_NAMES = new Set(["list_skills", "load_skill", "load_skill_resource"]);
+
+function isInternalActivityTool(value) {
+  return INTERNAL_ACTIVITY_TOOL_NAMES.has(normalizeActivityText(value));
+}
+
+function activityQuietSeconds(updatedAt = "", latestEvent = null, latestSummary = null) {
+  const timestamps = [updatedAt, latestEvent?.at, latestSummary?.at]
+    .map((value) => Date.parse(String(value || "")))
+    .filter((value) => Number.isFinite(value));
+  if (!timestamps.length) return 0;
+  return Math.max(0, Math.floor((Date.now() - Math.max(...timestamps)) / 1000));
+}
+
+function formatActivityQuietDuration(seconds) {
+  const safeSeconds = Math.max(0, Number(seconds || 0));
+  if (safeSeconds < 60) return `about ${Math.max(20, Math.floor(safeSeconds / 5) * 5)} seconds`;
+  const minutes = Math.max(1, Math.floor(safeSeconds / 60));
+  return `about ${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
 function activityStepStatusLabel(status) {
   const normalized = String(status || "").trim();
   if (normalized === "completed") return "Completed";
@@ -654,6 +679,8 @@ function activityStepStatusClass(status) {
 }
 
 function summarizeActivityToolEntry(entry) {
+  const rawTool = normalizeActivityText(entry?.raw_tool || entry?.tool || "");
+  if (isInternalActivityTool(rawTool)) return "";
   const summary = normalizeActivityText(entry?.summary || "");
   const result = normalizeActivityText(entry?.result || "");
   const status = String(entry?.status || "done").trim();
@@ -667,7 +694,7 @@ function collectActivitySources(step) {
   const sources = [];
   const addSource = (value) => {
     const normalized = normalizeActivityText(value);
-    if (!normalized || sources.includes(normalized)) return;
+    if (!normalized || isInternalActivityTool(normalized) || sources.includes(normalized)) return;
     sources.push(normalized);
   };
 
@@ -721,7 +748,7 @@ function buildActivityDetailsHtml(stepDetails = []) {
         const sources = collectActivitySources(step);
         const toolLog = Array.isArray(step?.tool_log) ? step.tool_log : [];
         const toolLines = toolLog.map((entry) => summarizeActivityToolEntry(entry)).filter(Boolean);
-        const resultSummary = normalizeActivityText(step?.result_summary || "");
+        const resultSummary = activityDisplaySummary(step?.result_summary || "");
         const openGaps = (Array.isArray(step?.open_gaps) ? step.open_gaps : [])
           .map((item) => normalizeActivityText(item))
           .filter(Boolean);
@@ -803,9 +830,13 @@ function reactTraceLines({ trace = "", phases = null } = {}) {
   return lines;
 }
 
-function buildActivitySnapshot({ taskId = "", status = "", events = [], summaries = [], planApproved = true } = {}) {
+function buildActivitySnapshot({ taskId = "", status = "", events = [], summaries = [], planApproved = true, updatedAt = "" } = {}) {
   const normalizedStatus = String(status || "").trim();
-  const safeEvents = (Array.isArray(events) ? events : []).filter((e) => String(e?.type || "") !== "plan.initializing");
+  const safeEvents = (Array.isArray(events) ? events : []).filter((event) => {
+    if (String(event?.type || "") === "plan.initializing") return false;
+    const toolName = event?.metrics?.tool || event?.tool || "";
+    return !isInternalActivityTool(toolName);
+  });
   const safeSummaries = Array.isArray(summaries) ? summaries : [];
   const visibleStatuses = new Set(["running", "queued", "awaiting_hitl", "needs_clarification", "failed", "completed", "in_progress"]);
   const shouldShow = visibleStatuses.has(normalizedStatus) || safeEvents.length > 0 || safeSummaries.length > 0;
@@ -889,6 +920,27 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
     preview = "Click for activity details";
   }
 
+  const isActive = ["running", "queued", "in_progress"].includes(normalizedStatus);
+  const quietSeconds = activityQuietSeconds(updatedAt, latestEvent, latestSummary);
+  if (isActive && quietSeconds >= 20) {
+    const sid = String(currentStepFromDetails?.id || latestStepStarted?.metrics?.step_id || "").trim();
+    const goal = normalizeActivityText(currentStepFromDetails?.goal || "");
+    if (latestToolCalled?.human_line) {
+      summary = `Still working — ${normalizeActivityText(latestToolCalled.human_line).replace(/…$/, "")}`;
+    } else if (sid && goal) {
+      summary = `Still working on ${sid}: ${goal}`;
+    } else if (sid) {
+      summary = `Still working on ${sid}`;
+    } else {
+      summary = "Still preparing the next research step";
+    }
+    preview = `No new progress update for ${formatActivityQuietDuration(quietSeconds)}; the run is still active.`;
+  }
+
+  if (normalizeActivityText(preview) === normalizeActivityText(summary)) {
+    preview = "";
+  }
+
   return {
     taskId: String(taskId || "").trim() || "pending",
     status: normalizedStatus,
@@ -940,7 +992,7 @@ function activityCardHtml(snapshot) {
           </div>
         </div>
       </div>
-      <div class="activity-preview">${escapeHtml(snapshot.preview)}</div>
+      <div class="activity-preview ${snapshot.preview ? "" : "hidden"}">${escapeHtml(snapshot.preview)}</div>
       <div class="activity-details ${expanded ? "" : "hidden"}">${snapshot.detailsHtml}</div>
     </section>
   `;
@@ -961,7 +1013,10 @@ function patchActivityCardElement(card, snapshot) {
   const summaryEl = card.querySelector(".activity-summary");
   if (summaryEl && summaryEl.textContent !== snapshot.summary) summaryEl.textContent = snapshot.summary;
   const previewEl = card.querySelector(".activity-preview");
-  if (previewEl && previewEl.textContent !== snapshot.preview) previewEl.textContent = snapshot.preview;
+  if (previewEl) {
+    if (previewEl.textContent !== snapshot.preview) previewEl.textContent = snapshot.preview;
+    previewEl.classList.toggle("hidden", !snapshot.preview);
+  }
   const detailsEl = card.querySelector(".activity-details");
   if (detailsEl) {
     if (detailsEl.innerHTML !== snapshot.detailsHtml) detailsEl.innerHTML = snapshot.detailsHtml;
@@ -1019,7 +1074,9 @@ function iterationActivitySnapshot(iteration) {
   const task = iteration?.task || {};
   const taskId = String(task.task_id || "").trim();
   if (!taskId) return null;
-  if (state.startingTaskIds.has(taskId)) {
+  const run = getRunForTask(taskId);
+  const runStatus = String(run?.status || "").trim();
+  if (CoScientistActivityState.shouldUseStartingPlaceholder(state.startingTaskIds.has(taskId), runStatus)) {
     return buildActivitySnapshot({
       taskId,
       status: "running",
@@ -1028,9 +1085,7 @@ function iterationActivitySnapshot(iteration) {
       planApproved: true,
     });
   }
-  const run = getRunForTask(taskId);
   const taskStatus = String(task.status || "").trim();
-  const runStatus = String(run?.status || "").trim();
   const hasActiveRun = run && ["running", "queued", "in_progress"].includes(runStatus);
   if (!hasActiveRun && !taskHasStarted(task) && taskStatus !== "completed" && taskStatus !== "failed") return null;
   const researchLog = iteration?.research_log || {};
@@ -1049,7 +1104,14 @@ function iterationActivitySnapshot(iteration) {
   const summaries = useLogForCompleted ? logSummaries : runSummaries.length ? runSummaries : logSummaries;
   // Plan is approved if we have an active run executing, or task's hitl_history shows continue
   const planApproved = (run && ["running", "queued", "in_progress"].includes(status)) || taskHasStarted(task);
-  return buildActivitySnapshot({ taskId, status, events, summaries, planApproved });
+  return buildActivitySnapshot({
+    taskId,
+    status,
+    events,
+    summaries,
+    planApproved,
+    updatedAt: run?.updated_at || task?.updated_at || "",
+  });
 }
 
 function pendingActivitySnapshot() {
@@ -1058,7 +1120,7 @@ function pendingActivitySnapshot() {
   const status = String(run?.status || "queued").trim();
   const events = Array.isArray(run?.progress_events) ? run.progress_events : [];
   const summaries = Array.isArray(run?.progress_summaries) ? run.progress_summaries : [];
-  return buildActivitySnapshot({ taskId, status, events, summaries });
+  return buildActivitySnapshot({ taskId, status, events, summaries, updatedAt: run?.updated_at || "" });
 }
 
 function taskHasStarted(task) {
@@ -1088,6 +1150,7 @@ function updateInlineActivityCard(run) {
     status: String(run.status || "").trim(),
     events: Array.isArray(run.progress_events) ? run.progress_events : [],
     summaries: Array.isArray(run.progress_summaries) ? run.progress_summaries : [],
+    updatedAt: run.updated_at || "",
   });
   if (!snapshot) return;
 

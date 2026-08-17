@@ -173,6 +173,14 @@ elif [[ "${ALLOW_EPHEMERAL_STATE}" != "true" ]]; then
   exit 1
 fi
 
+# Without shared persistence, separate Cloud Run instances cannot see each
+# other's conversations or active run registry. Keep the ephemeral MVP on one
+# instance so follow-up and polling requests cannot be routed to missing state.
+if [[ "${PERSISTENCE_ENABLED}" != "true" && "${MAX_INSTANCES}" != "1" ]]; then
+  echo "Ephemeral state requires MAX_INSTANCES=1; overriding ${MAX_INSTANCES} to prevent cross-instance run loss."
+  MAX_INSTANCES="1"
+fi
+
 echo "Using project=${PROJECT_ID} region=${REGION} service=${SERVICE_NAME}"
 echo "LLM backend: $([ "${USE_VERTEX_AI}" = "true" ] && echo "Vertex AI" || echo "AI Studio API key")"
 echo "Cloud Run concurrency: ${CONCURRENCY}"

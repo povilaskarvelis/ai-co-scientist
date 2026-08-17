@@ -2125,9 +2125,12 @@ def _describe_tool_call(name: str, args: dict[str, Any]) -> str:
     The description explains *what information is being sought*, not just
     the tool name.  Uses the tool's semantic purpose + available args.
     """
+    if _is_internal_skill_tool_name(name):
+        return ""
     source = tool_registry.TOOL_SOURCE_NAMES.get(name, name)
     query = str(args.get("query", "") or "").strip()
     gene = str(args.get("gene", "") or args.get("gene_symbol", "") or args.get("gene_id", "") or "").strip()
+    target = str(args.get("target", "") or args.get("target_id", "") or "").strip()
     disease = str(args.get("disease", "") or args.get("disease_id", "") or "").strip()
     compound = str(args.get("compound", "") or args.get("drug", "") or args.get("drug_name", "") or "").strip()
 
@@ -2233,6 +2236,16 @@ def _describe_tool_call(name: str, args: dict[str, Any]) -> str:
     if name == "search_gwas_associations":
         return f"Searching GWAS associations for {gene or query}" if (gene or query) else "Querying GWAS Catalog"
 
+    # --- Open Targets ---
+    if name == "get_open_targets_association":
+        if target and disease:
+            return f"Checking Open Targets association for {target} and {disease}"
+        return f"Checking Open Targets association for {target or disease}" if (target or disease) else "Querying Open Targets Platform"
+    if name == "get_open_targets_l2g":
+        if target and disease:
+            return f"Checking Open Targets L2G evidence for {target} and {disease}"
+        return f"Checking Open Targets L2G evidence for {target or disease}" if (target or disease) else "Querying Open Targets Platform"
+
     # --- ClinGen / gene curation ---
     if name == "get_clingen_gene_curation":
         return f"Checking gene-disease validity for {gene or query}" if (gene or query) else "Querying ClinGen"
@@ -2258,7 +2271,7 @@ def _describe_tool_call(name: str, args: dict[str, Any]) -> str:
         return f"Retrieving mutation profile for {gene or query}" if (gene or query) else "Querying cBioPortal"
 
     # --- Generic fallback: use source + whatever query-like arg is available ---
-    any_query = query or gene or compound or disease
+    any_query = query or gene or target or compound or disease
     if any_query:
         return f"Querying {source} for {any_query[:80]}"
     return f"Querying {source}"
@@ -2982,9 +2995,16 @@ def _consume_buffered_json_object(
     return None, last_error
 
 
+_UNIPROT_ACCESSION_PATTERN = (
+    r"(?:[OPQ][0-9][A-Z0-9]{3}[0-9]"
+    r"|[A-NR-Z][0-9][A-Z][A-Z0-9]{2}[0-9]"
+    r"|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){2})"
+)
+
+
 _EVIDENCE_ID_PATTERNS = re.compile(
     r"(?:PMID:\d+|DOI:10\.[^\s\]\[);,]+|NCT\d{8,}|PMC\d+|OpenAlex:W\d+"
-    r"|UniProt:[A-Z0-9]{4,}|PubChem:\d+|PDB:[A-Z0-9]{4}"
+    rf"|UniProt:{_UNIPROT_ACCESSION_PATTERN}|PubChem:\d+|PDB:[A-Z0-9]{{4}}"
     r"|rs\d{4,}|CHEMBL\d+|Reactome:R-HSA-\d+|GCST\d+"
     r"|ENSG\d{11}|ENST\d{11}|MONDO[_:]\d+|EFO[_:]\d+|HP:\d+|GO:\d+)"
 )
@@ -4500,7 +4520,7 @@ def _infer_entity_from_identifier(identifier: str) -> dict[str, Any] | None:
         (re.compile(r"(?i)^(?:PMC:)?(PMC\d+)$"), "paper", "paper:{}"),
         (re.compile(r"(?i)^OpenAlex:(W\d+)$"), "paper", "paper:{}"),
         (re.compile(r"(?i)^(?:NCT:)?(NCT\d{8})$"), "trial", "trial:{}"),
-        (re.compile(r"(?i)^UniProt:([A-Z][A-Z0-9]{2,9})$"), "protein", "protein:uniprot:{}"),
+        (re.compile(rf"(?i)^UniProt:({_UNIPROT_ACCESSION_PATTERN})$"), "protein", "protein:uniprot:{}"),
         (re.compile(r"(?i)^PubChem:(\d+)$"), "compound", "compound:pubchem:{}"),
         (re.compile(r"(?i)^(CHEMBL\d+)$"), "compound", "compound:{}"),
         (re.compile(r"(?i)^PDB:([A-Z0-9]{4,8})$"), "structure", "structure:pdb:{}"),
@@ -7155,7 +7175,7 @@ _INLINE_ID_RE = re.compile(
     r"|\b(?P<nct>NCT\d{8})\b"
     r"|\bOpenAlex\s*:?\s*(?P<openalex>W\d+)\b"
     r"|\b(?P<pmc>PMC\d+)\b"
-    r"|\bUniProt(?:\s+(?:ID|Accession))?\s*:?\s*(?P<uniprot>[A-Z][A-Z0-9]{2,9})\b"
+    rf"|\bUniProt(?:\s+(?:ID|Accession))?\s*:?\s*(?P<uniprot>{_UNIPROT_ACCESSION_PATTERN})\b"
     r"|\b(?:Ensembl(?:\s+(?:Gene|Transcript|Protein))?\s+ID\s*:?\s*)?(?P<ensembl>ENS[A-Z0-9]{3,}\d{6,})\b"
     r"|\b(?:Entrez(?:\s+Gene)?\s+ID|NCBI\s+Gene\s+ID)\s*:?\s*(?P<entrez>\d+)\b"
     r"|\b(?P<hgnc>HGNC:\d+)\b"
@@ -7199,7 +7219,7 @@ def _evidence_id_to_url(eid: str) -> str | None:
     m = re.fullmatch(r"(?i)(?:PMC:)?(PMC\d+)", raw)
     if m:
         return f"https://www.ncbi.nlm.nih.gov/pmc/articles/{m.group(1)}/"
-    m = re.fullmatch(r"(?i)UniProt:([A-Z][A-Z0-9]{2,9})", raw)
+    m = re.fullmatch(rf"(?i)UniProt:({_UNIPROT_ACCESSION_PATTERN})", raw)
     if m:
         return f"https://www.uniprot.org/uniprotkb/{m.group(1)}"
     m = re.fullmatch(r"(?i)(?:Ensembl:)?(ENS[A-Z0-9]{3,}\d{6,})", raw)
@@ -7316,7 +7336,7 @@ _VALID_EVIDENCE_ID_RE = re.compile(
     r"|NCT\d{8}"
     r"|OpenAlex:W\d+"
     r"|PMC\d+"
-    r"|UniProt:[A-Z][A-Z0-9]{2,9}"
+    rf"|UniProt:{_UNIPROT_ACCESSION_PATTERN}"
     r"|PubChem:\d+"
     r"|PDB:[A-Za-z0-9]{4,8}"
     r"|rs\d{3,}"

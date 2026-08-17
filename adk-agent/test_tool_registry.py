@@ -267,6 +267,16 @@ def test_iter_active_source_precedence_rules_includes_gwas_catalog_lookup():
     assert "GWAS Catalog lookup" in topics
 
 
+def test_gwas_search_metadata_prevents_gene_symbol_overclaiming():
+    routing = tool_registry.TOOL_ROUTING_METADATA["search_gwas_associations"]
+    contract = tool_registry.TOOL_EVIDENCE_CONTRACTS["search_gwas_associations"]
+
+    assert "not a direct gene-symbol filter" in routing["preferred_for"]
+    assert "get_open_targets_association" in routing["fallback_tools"]
+    assert any("not a gene filter" in limit for limit in contract["interpretation_limits"])
+    assert any("mapped-gene field" in limit for limit in contract["interpretation_limits"])
+
+
 def test_iter_active_source_precedence_rules_includes_variant_evidence_overlap_for_gnomad_and_regulomedb():
     active = tool_registry.iter_active_source_precedence_rules(
         ["get_gnomad_gene_constraint", "get_regulomedb_variant_summary", "get_variant_annotations"]

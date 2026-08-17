@@ -1470,6 +1470,8 @@ class UiRuntime:
                 except Exception:  # noqa: BLE001
                     pass
                 human = _describe_tool_call(name, args)
+                if not human:
+                    continue
                 _fire_progress(
                     phase="execute",
                     event_type="tool.called",
@@ -1529,6 +1531,8 @@ class UiRuntime:
                     continue
                 tool_error_signatures.add(signature)
                 tool_name = str(error_metrics.get("tool", "") or "").strip()
+                if tool_name and not _describe_tool_call(tool_name, {}):
+                    continue
                 source = _step_source_label(tool_name) if tool_name else ""
                 error_message = str(error_metrics.get("message", "") or "").strip()
                 if source:
@@ -2250,13 +2254,50 @@ class UiRuntime:
             task["awaiting_hitl"] = False
             await self._save_task_with_progress(task, run_id)
 
+            planned_steps = list(task.get("steps") or [])
+            next_step = next(
+                (
+                    step
+                    for step in planned_steps
+                    if str(step.get("status", "pending") or "pending").strip()
+                    not in {"completed", "blocked"}
+                ),
+                None,
+            )
+            if next_step:
+                next_step_id = str(next_step.get("id", "") or "").strip()
+                next_step_goal = _compact_text(next_step.get("goal", ""), max_chars=150)
+                step_number = next(
+                    (
+                        index
+                        for index, step in enumerate(planned_steps, start=1)
+                        if step is next_step
+                    ),
+                    1,
+                )
+                execution_line = (
+                    f"Starting {next_step_id or f'step {step_number}'} "
+                    f"of {len(planned_steps)}: {next_step_goal}"
+                    if next_step_goal
+                    else f"Starting step {step_number} of {len(planned_steps)}..."
+                )
+                execution_metrics = {
+                    "step_id": next_step_id,
+                    "step_number": step_number,
+                    "steps_total": len(planned_steps),
+                }
+            else:
+                execution_line = "Starting plan execution..."
+                execution_metrics = {"steps_total": len(planned_steps)}
+
             await self._append_progress_event(
                 run_id,
                 phase="execute",
                 event_type="execution.running",
                 status="start",
-                human_line="Executing plan...",
+                human_line=execution_line,
                 task_id=task_id,
+                metrics=execution_metrics,
             )
 
             max_continue_loops = 100
