@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -83,7 +83,6 @@ MAX_RETAINED_REPORTS = max(
     1,
     int(os.environ.get("ADK_MAX_RETAINED_REPORTS", "100")),
 )
-_global_turn_semaphore = threading.Semaphore(MAX_CONCURRENT_TURNS)
 GA4_MEASUREMENT_ID = os.environ.get("GA4_MEASUREMENT_ID", "").strip()
 _GA4_ID_PATTERN = re.compile(r"^G-[A-Z0-9]+$")
 SESSION_COOKIE_NAME = "co_scientist_session"
@@ -487,6 +486,108 @@ class ConversationSession:
     mcp_tools: object | None
     active_operations: int = 0
     last_used_at: float = field(default_factory=time.monotonic)
+    workflow_loop_bound: bool = False
+
+
+class _WorkflowEventLoop:
+    """Own one long-lived event loop for all ADK and MCP activity."""
+
+    def __init__(self) -> None:
+        self._state_lock = threading.Lock()
+        self._started = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._start_error: BaseException | None = None
+        self._closed = False
+
+    @property
+    def is_running(self) -> bool:
+        with self._state_lock:
+            return bool(
+                self._loop is not None
+                and self._thread is not None
+                and self._thread.is_alive()
+                and not self._closed
+            )
+
+    def start(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("Workflow event loop is closed.")
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._started.clear()
+            self._start_error = None
+            thread = threading.Thread(
+                target=self._run,
+                name="workflow-event-loop",
+                daemon=True,
+            )
+            self._thread = thread
+            thread.start()
+
+        if not self._started.wait(timeout=5):
+            raise RuntimeError("Timed out while starting the workflow event loop.")
+        if self._start_error is not None:
+            raise RuntimeError("Failed to start the workflow event loop.") from self._start_error
+
+    def _run(self) -> None:
+        loop: asyncio.AbstractEventLoop | None = None
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            with self._state_lock:
+                self._loop = loop
+            self._started.set()
+            loop.run_forever()
+        except BaseException as exc:  # noqa: BLE001
+            self._start_error = exc
+            self._started.set()
+            logger.exception("Workflow event loop stopped unexpectedly.")
+        finally:
+            if loop is not None:
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    logger.exception("Failed to drain the workflow event loop.")
+                finally:
+                    loop.close()
+            with self._state_lock:
+                self._loop = None
+
+    def submit(self, coroutine) -> Future:
+        try:
+            self.start()
+        except Exception:
+            coroutine.close()
+            raise
+        with self._state_lock:
+            loop = self._loop
+        if loop is None or loop.is_closed():
+            coroutine.close()
+            raise RuntimeError("Workflow event loop is unavailable.")
+        return asyncio.run_coroutine_threadsafe(coroutine, loop)
+
+    def stop(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            loop = self._loop
+            thread = self._thread
+        if loop is not None and not loop.is_closed():
+            loop.call_soon_threadsafe(loop.stop)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5)
+            if thread.is_alive():
+                logger.error("Workflow event-loop thread did not stop cleanly.")
 
 
 # ---------------------------------------------------------------------------
@@ -751,7 +852,6 @@ class UiRuntime:
         self.user_id = "researcher"
         self.session_service: InMemorySessionService | None = None
         self.conv_sessions: dict[str, ConversationSession] = {}
-        self.conv_thread_locks: dict[str, threading.Lock] = {}
         self.max_retained_conversations = MAX_RETAINED_CONVERSATIONS
         self.max_retained_completed_runs = MAX_RETAINED_COMPLETED_RUNS
         self.max_retained_reports = MAX_RETAINED_REPORTS
@@ -764,7 +864,14 @@ class UiRuntime:
         self._blocked_run_writes: set[str] = set()
         self._shutting_down = False
         self._report_files_lock = threading.RLock()
-        self._thread_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TURNS + 4, thread_name_prefix="wf")
+        self._workflow_loop = _WorkflowEventLoop()
+        self._workflow_turn_semaphore: asyncio.Semaphore | None = None
+        self._workflow_conversation_locks: dict[str, asyncio.Lock] = {}
+        self._active_workflow_tasks: set[asyncio.Task] = set()
+        self._workflow_futures: set[Future] = set()
+        self._workflow_futures_lock = threading.Lock()
+        self._workflow_activity_lock = threading.Lock()
+        self._pending_workflow_turns = 0
 
     async def startup(self) -> None:
         is_valid, error_message = validate_runtime_configuration()
@@ -797,19 +904,75 @@ class UiRuntime:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-        self._thread_pool.shutdown(wait=False, cancel_futures=True)
+
+        await self._cancel_workflow_turns()
         async with self._conv_sessions_lock:
-            idle = [
-                (conversation_id, cs)
-                for conversation_id, cs in self.conv_sessions.items()
-                if cs.active_operations == 0
-            ]
-            for conversation_id, cs in idle:
-                self.conv_sessions.pop(conversation_id, None)
-                self.conv_thread_locks.pop(conversation_id, None)
-                await self._close_conversation_resources(conversation_id, cs)
+            sessions = list(self.conv_sessions.items())
+            self.conv_sessions.clear()
+        for conversation_id, cs in sessions:
+            await self._close_conversation_resources(conversation_id, cs)
+        self._workflow_loop.stop()
         self._prune_persisted_terminal_runs()
         self._prune_report_files()
+
+    @property
+    def workflow_busy(self) -> bool:
+        with self._workflow_activity_lock:
+            return self._pending_workflow_turns > 0
+
+    def _mark_workflow_turn_started(self) -> None:
+        with self._workflow_activity_lock:
+            self._pending_workflow_turns += 1
+
+    def _mark_workflow_turn_finished(self) -> None:
+        with self._workflow_activity_lock:
+            self._pending_workflow_turns = max(0, self._pending_workflow_turns - 1)
+
+    def _track_workflow_future(self, future) -> None:
+        with self._workflow_futures_lock:
+            self._workflow_futures.add(future)
+
+        def _discard(done) -> None:
+            with self._workflow_futures_lock:
+                self._workflow_futures.discard(done)
+            self._mark_workflow_turn_finished()
+
+        future.add_done_callback(_discard)
+
+    async def _cancel_workflow_turns(self) -> None:
+        with self._workflow_futures_lock:
+            futures = list(self._workflow_futures)
+        if not futures:
+            return
+        if self._workflow_loop.is_running:
+            try:
+                cancel_future = self._workflow_loop.submit(
+                    self._cancel_workflow_tasks_on_event_loop()
+                )
+                await asyncio.wrap_future(cancel_future)
+            except Exception:
+                logger.exception("Failed to cancel workflow turns cleanly during shutdown.")
+                for future in futures:
+                    future.cancel()
+        else:
+            for future in futures:
+                future.cancel()
+        await asyncio.gather(
+            *(asyncio.wrap_future(future) for future in futures),
+            return_exceptions=True,
+        )
+
+    async def _cancel_workflow_tasks_on_event_loop(self) -> None:
+        current_task = asyncio.current_task()
+        active_tasks = [
+            task
+            for task in self._active_workflow_tasks
+            if task is not current_task and not task.done()
+        ]
+        for task in active_tasks:
+            task.cancel()
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
 
     def _run_writes_blocked(self, run_id: str) -> bool:
         with self._run_write_guard:
@@ -893,24 +1056,31 @@ class UiRuntime:
                 max(interrupted, len(run_ids)),
             )
 
-    def _get_conv_thread_lock(self, conversation_id: str) -> threading.Lock:
-        if conversation_id not in self.conv_thread_locks:
-            self.conv_thread_locks[conversation_id] = threading.Lock()
-        return self.conv_thread_locks[conversation_id]
-
     async def _close_conversation_resources(
         self,
         conversation_id: str,
         cs: ConversationSession,
     ) -> None:
-        if cs.mcp_tools is not None:
+        async def _close_workflow_resources() -> None:
             try:
-                await cs.mcp_tools.close()
-            except Exception:
-                logger.exception(
-                    "Failed to close MCP resources for conversation %s.",
-                    conversation_id,
+                if cs.mcp_tools is not None:
+                    await cs.mcp_tools.close()
+            finally:
+                self._workflow_conversation_locks.pop(conversation_id, None)
+
+        try:
+            if cs.workflow_loop_bound:
+                close_future = self._workflow_loop.submit(
+                    _close_workflow_resources()
                 )
+                await asyncio.wrap_future(close_future)
+            else:
+                await _close_workflow_resources()
+        except Exception:
+            logger.exception(
+                "Failed to close MCP resources for conversation %s.",
+                conversation_id,
+            )
         if self.session_service is not None:
             try:
                 await self.session_service.delete_session(
@@ -954,7 +1124,6 @@ class UiRuntime:
             if self.conv_sessions.get(conversation_id) is not cs or cs.active_operations:
                 continue
             self.conv_sessions.pop(conversation_id, None)
-            self.conv_thread_locks.pop(conversation_id, None)
             await self._close_conversation_resources(conversation_id, cs)
 
     async def _get_or_create_session_locked(self, conversation_id: str) -> ConversationSession:
@@ -1027,7 +1196,6 @@ class UiRuntime:
             if self._shutting_down:
                 if cs.active_operations == 0:
                     self.conv_sessions.pop(conversation_id, None)
-                    self.conv_thread_locks.pop(conversation_id, None)
                     await self._close_conversation_resources(conversation_id, cs)
                 return
             await self._trim_conversation_sessions_locked(
@@ -1091,37 +1259,32 @@ class UiRuntime:
         *,
         run_id: str,
     ) -> tuple[str, str]:
-        """Run a workflow turn in a dedicated thread.
+        """Run a workflow turn on the persistent ADK/MCP event loop.
 
         Returns (response_text, responding_author).
         """
         cs = await self._acquire_conversation_session(conversation_id)
         main_loop = asyncio.get_running_loop()
-        thread_lock = self._get_conv_thread_lock(conversation_id)
-
-        def _thread_target() -> tuple[str, str]:
-            acquired = _global_turn_semaphore.acquire(timeout=0)
-            if not acquired:
-                logger.info("[ui:%s] Turn queued — %d concurrent turns already running (max %d)", run_id, MAX_CONCURRENT_TURNS, MAX_CONCURRENT_TURNS)
-                _global_turn_semaphore.acquire()
-            try:
-                thread_lock.acquire()
-                try:
-                    loop = asyncio.new_event_loop()
-                    try:
-                        return loop.run_until_complete(
-                            self._workflow_turn_inner(cs, conversation_id, prompt, run_id=run_id, caller_loop=main_loop)
-                        )
-                    finally:
-                        loop.close()
-                finally:
-                    thread_lock.release()
-            finally:
-                _global_turn_semaphore.release()
-
-        worker_future = main_loop.run_in_executor(self._thread_pool, _thread_target)
+        cs.workflow_loop_bound = True
+        self._mark_workflow_turn_started()
         try:
-            result = await asyncio.shield(worker_future)
+            worker_future = self._workflow_loop.submit(
+                self._workflow_turn_on_event_loop(
+                    cs,
+                    conversation_id,
+                    prompt,
+                    run_id=run_id,
+                    caller_loop=main_loop,
+                )
+            )
+        except Exception:
+            self._mark_workflow_turn_finished()
+            await self._release_conversation_session(conversation_id)
+            raise
+        self._track_workflow_future(worker_future)
+        async_worker_future = asyncio.wrap_future(worker_future)
+        try:
+            result = await asyncio.shield(async_worker_future)
         except asyncio.CancelledError:
             def _release_when_worker_stops(_done) -> None:
                 _fire_and_forget_threadsafe(
@@ -1132,9 +1295,51 @@ class UiRuntime:
 
             worker_future.add_done_callback(_release_when_worker_stops)
             raise
+        except Exception:
+            await self._release_conversation_session(conversation_id)
+            raise
         else:
             await self._release_conversation_session(conversation_id)
             return result
+
+    async def _workflow_turn_on_event_loop(
+        self,
+        cs: ConversationSession,
+        conversation_id: str,
+        prompt: str,
+        *,
+        run_id: str,
+        caller_loop: asyncio.AbstractEventLoop,
+    ) -> tuple[str, str]:
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._active_workflow_tasks.add(current_task)
+        try:
+            if self._workflow_turn_semaphore is None:
+                self._workflow_turn_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TURNS)
+            conversation_lock = self._workflow_conversation_locks.setdefault(
+                conversation_id,
+                asyncio.Lock(),
+            )
+            async with conversation_lock:
+                if self._workflow_turn_semaphore.locked():
+                    logger.info(
+                        "[ui:%s] Turn queued — %d concurrent turns already running (max %d)",
+                        run_id,
+                        MAX_CONCURRENT_TURNS,
+                        MAX_CONCURRENT_TURNS,
+                    )
+                async with self._workflow_turn_semaphore:
+                    return await self._workflow_turn_inner(
+                        cs,
+                        conversation_id,
+                        prompt,
+                        run_id=run_id,
+                        caller_loop=caller_loop,
+                    )
+        finally:
+            if current_task is not None:
+                self._active_workflow_tasks.discard(current_task)
 
     async def _run_workflow_turn_filtered(
         self,
@@ -1175,7 +1380,7 @@ class UiRuntime:
         run_id: str,
         caller_loop: asyncio.AbstractEventLoop,
     ) -> tuple[str, str]:
-        """The actual event-processing loop — runs inside its own thread event loop.
+        """The event-processing loop, run on the persistent workflow event loop.
 
         Returns (response_text, responding_author).
         """
@@ -2630,7 +2835,7 @@ async def about() -> HTMLResponse:
 async def health() -> dict:
     return {
         "ok": runtime.ready,
-        "busy": any(lock.locked() for lock in runtime.conv_thread_locks.values()),
+        "busy": runtime.workflow_busy,
         "error": runtime.ready_error,
     }
 

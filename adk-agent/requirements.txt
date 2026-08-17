@@ -1,5 +1,7 @@
-google-adk[mcp]>=1.28.1
-google-genai>=1.64.0
+# Keep the agent framework and its protocol SDKs pinned as one tested set.
+google-adk[mcp]==2.7.0
+google-genai==2.18.1
+mcp==1.29.0
 python-dotenv>=1.2.2
 pytest>=9.0.3
 pytest-asyncio>=0.21.0

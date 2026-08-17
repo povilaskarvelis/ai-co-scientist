@@ -472,13 +472,11 @@ async def test_conversation_retention_evicts_lru_resources(runtime, monkeypatch)
     await runtime._release_conversation_session("conv_newer")
     oldest.last_used_at = 1.0
     newer.last_used_at = 2.0
-    runtime._get_conv_thread_lock("conv_oldest")
 
     await runtime._acquire_conversation_session("conv_newest")
     await runtime._release_conversation_session("conv_newest")
 
     assert set(runtime.conv_sessions) == {"conv_newer", "conv_newest"}
-    assert "conv_oldest" not in runtime.conv_thread_locks
     assert resources[0].close_calls == 1
     assert resources[1].close_calls == 0
     assert resources[2].close_calls == 0
@@ -919,6 +917,108 @@ async def test_cancelled_workflow_turn_keeps_resources_until_worker_finishes(run
         await asyncio.sleep(0.01)
     assert runtime.conv_sessions["conv_worker"].active_operations == 0
     await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_workflow_turn_releases_conversation(runtime):
+    async def failed_turn(*args, **kwargs):
+        raise RuntimeError("turn failed")
+
+    runtime._workflow_turn_inner = failed_turn  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="turn failed"):
+        await runtime._run_workflow_turn("conv_failed", "test", run_id="run_failed")
+
+    assert runtime.conv_sessions["conv_failed"].active_operations == 0
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_workflow_turns_and_mcp_cleanup_share_one_event_loop(runtime, monkeypatch):
+    turn_loops: list[asyncio.AbstractEventLoop] = []
+
+    class LoopAwareMcpResources(DummyMcpResources):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_loop: asyncio.AbstractEventLoop | None = None
+
+        async def close(self) -> None:
+            self.close_loop = asyncio.get_running_loop()
+            await super().close()
+
+    resources = LoopAwareMcpResources()
+    monkeypatch.setattr(
+        ui_server,
+        "create_workflow_agent",
+        lambda require_plan_approval=True: (object(), resources),
+    )
+
+    async def record_turn_loop(*args, **kwargs):
+        turn_loops.append(asyncio.get_running_loop())
+        return "done", "research_workflow"
+
+    runtime._workflow_turn_inner = record_turn_loop  # type: ignore[method-assign]
+
+    await runtime._run_workflow_turn("conv_loop", "first", run_id="run_first")
+    await runtime._run_workflow_turn("conv_loop", "second", run_id="run_second")
+    runtime.max_retained_conversations = 0
+    await runtime._release_conversation_session("conv_loop")
+
+    assert len(turn_loops) == 2
+    assert turn_loops[0] is turn_loops[1]
+    assert resources.close_loop is turn_loops[0]
+    assert resources.close_loop is not asyncio.get_running_loop()
+    assert resources.close_calls == 1
+    assert "conv_loop" not in runtime._workflow_conversation_locks
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_turn_cleanup_before_closing_mcp(runtime, monkeypatch):
+    lifecycle_events: list[tuple[str, asyncio.AbstractEventLoop]] = []
+    started = threading.Event()
+
+    class LifecycleMcpResources(DummyMcpResources):
+        async def close(self) -> None:
+            lifecycle_events.append(("mcp_closed", asyncio.get_running_loop()))
+            await super().close()
+
+    resources = LifecycleMcpResources()
+    monkeypatch.setattr(
+        ui_server,
+        "create_workflow_agent",
+        lambda require_plan_approval=True: (object(), resources),
+    )
+
+    async def pending_turn(*args, **kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            lifecycle_events.append(("turn_cleaned", asyncio.get_running_loop()))
+
+    runtime._workflow_turn_inner = pending_turn  # type: ignore[method-assign]
+    turn = asyncio.create_task(
+        runtime._run_workflow_turn("conv_shutdown", "test", run_id="run_shutdown")
+    )
+    for _ in range(100):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert started.is_set()
+
+    await runtime.shutdown()
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn
+    assert [event for event, _loop in lifecycle_events] == [
+        "turn_cleaned",
+        "mcp_closed",
+    ]
+    assert lifecycle_events[0][1] is lifecycle_events[1][1]
+    assert resources.close_calls == 1
+    assert not runtime._workflow_loop.is_running
 
 
 @pytest.mark.asyncio
