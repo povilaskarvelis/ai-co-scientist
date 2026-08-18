@@ -27,6 +27,17 @@ def test_iter_active_source_precedence_rules_includes_neuroscience_dataset_disco
     assert "Neuroscience dataset discovery" in topics
 
 
+def test_literature_routing_explains_pubmed_boolean_query_semantics():
+    literature_rule = next(
+        rule for rule in tool_registry.SOURCE_PRECEDENCE_RULES
+        if rule.get("topic") == "Literature search"
+    )
+
+    assert "adjacent terms as AND" in literature_rule["summary"]
+    assert "explicit OR" in literature_rule["summary"]
+    assert "adjacent terms" in tool_registry.TOOL_DESCRIPTIONS["search_pubmed"]
+
+
 def test_open_targets_tool_metadata_distinguishes_live_and_release_specific_lookup():
     assert "data" in tool_registry.TOOL_TO_DOMAINS["get_open_targets_association"]
     desc = tool_registry.TOOL_DESCRIPTIONS["get_open_targets_association"]

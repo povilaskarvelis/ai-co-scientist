@@ -105,8 +105,8 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "search_clinical_trials": "Search ClinicalTrials.gov (returns NCT IDs)",
     "get_clinical_trial": "Get details of a specific clinical trial by NCT ID",
     "summarize_clinical_trials_landscape": "Aggregate trial landscape stats for a condition",
-    "search_pubmed": "Search PubMed literature (returns PMIDs, titles, authors)",
-    "search_pubmed_advanced": "Advanced PubMed search with field-specific queries (MeSH, author, journal)",
+    "search_pubmed": "Search PubMed literature; adjacent terms are AND, so use explicit OR for alternatives (returns PMIDs, titles, authors)",
+    "search_pubmed_advanced": "Advanced PubMed search with explicit Boolean and field-specific queries (MeSH, author, journal)",
     "get_pubmed_abstract": "Fetch full abstract for a PMID",
     "get_paper_fulltext": "Fetch PMC full text when available using a PMID, PMCID, or DOI",
     "search_iedb_epitope_evidence": "Search IEDB for epitope, T-cell, and MHC ligand evidence using peptide, antigen, and allele filters",
@@ -738,7 +738,7 @@ SOURCE_PRECEDENCE_RULES: list[dict[str, Any]] = [
     {
         "topic": "Literature search",
         "tools": ["search_pubmed", "search_europe_pmc_literature", "search_openalex_works"],
-        "summary": "Use `search_pubmed` by default for biomedical papers and PMIDs; use `search_europe_pmc_literature` when preprints, citation metadata, or open-access status matter; use `search_openalex_works` for broader citation graph or researcher context.",
+        "summary": "Use `search_pubmed` by default for biomedical papers and PMIDs. PubMed treats adjacent terms as AND, so group alternative entities or synonyms with explicit OR and parentheses, or run separate focused searches when their evidence must remain distinct. Use `search_europe_pmc_literature` when preprints, citation metadata, or open-access status matter; use `search_openalex_works` for broader citation graph or researcher context.",
     },
     {
         "topic": "Pathway context",

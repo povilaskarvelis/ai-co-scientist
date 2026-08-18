@@ -3147,9 +3147,57 @@ def _normalize_summary_activity_line(line: str) -> str:
     return normalized
 
 
+_EXECUTOR_INTERNAL_JSON_KEYS = {
+    "data_sources_queried",
+    "evidence_ids",
+    "handoff",
+    "open_gaps",
+    "reasoning_trace",
+    "result_summary",
+    "schema",
+    "step_id",
+    "step_progress_note",
+    "structured_observations",
+    "suggested_next_searches",
+    "tools_called",
+}
+
+
+def _strip_embedded_executor_json_payloads(text: str) -> str:
+    raw = str(text or "")
+    decoder = json.JSONDecoder()
+    output: list[str] = []
+    cursor = 0
+    while cursor < len(raw):
+        brace_index = raw.find("{", cursor)
+        if brace_index < 0:
+            output.append(raw[cursor:])
+            break
+        output.append(raw[cursor:brace_index])
+        try:
+            payload, consumed = decoder.raw_decode(raw[brace_index:])
+        except json.JSONDecodeError:
+            output.append("{")
+            cursor = brace_index + 1
+            continue
+        if isinstance(payload, dict) and _EXECUTOR_INTERNAL_JSON_KEYS.intersection(payload):
+            cursor = brace_index + consumed
+            continue
+        output.append(raw[brace_index:brace_index + consumed])
+        cursor = brace_index + consumed
+    return "".join(output)
+
+
 def _clean_executor_summary_text(text: str) -> str:
+    raw_text = re.split(
+        r"(?i)(?:^|\s)#{1,6}\s*Completed\s+step\s+S?\d+\b",
+        str(text or ""),
+        maxsplit=1,
+    )[0]
+    raw_text = _strip_embedded_executor_json_payloads(raw_text)
+    raw_text = re.sub(r"`{2,3}\s*(?:json)?", " ", raw_text, flags=re.IGNORECASE)
     cleaned_lines: list[str] = []
-    for raw_line in str(text or "").splitlines():
+    for raw_line in raw_text.splitlines():
         line = str(raw_line or "").strip()
         if not line:
             continue
@@ -3178,6 +3226,8 @@ def _clean_executor_summary_text(text: str) -> str:
             continue
         if _normalize_executor_section_title(line) in _EXECUTOR_SECTION_ALIASES:
             continue
+        line = re.sub(r"^#{1,6}\s+", "", line)
+        line = re.sub(r"\s+#{1,6}\s+", ". ", line)
         line = re.sub(r"^(?:[-*+]\s+|\d+\.\s+)", "", line)
         line = line.replace("\\'", "'")
         line = _normalize_summary_activity_line(line)

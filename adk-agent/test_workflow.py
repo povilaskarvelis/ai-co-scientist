@@ -4276,6 +4276,41 @@ def test_clean_executor_summary_text_strips_embedded_executor_json_fragments():
     assert "canonical identifier, LRRK2." in cleaned
 
 
+def test_clean_executor_summary_text_strips_multiline_completion_payloads_and_headings():
+    raw = """## Summary
+Canonical identifiers were resolved for CALCR and GFRAL.
+### Resolved Gene Identifiers
+CALCR: ENSG00000004948. GFRAL: ENSG00000187871.
+## Completed step S1
+``json
+{
+  "step_id": "S1",
+  "handoff": {
+    "entity_type": "gene",
+    "entities": [{"label": "CALCR"}, {"label": "GFRAL"}]
+  }
+}
+``
+"""
+
+    cleaned = workflow._clean_executor_summary_text(raw)
+
+    assert cleaned == (
+        "Canonical identifiers were resolved for CALCR and GFRAL. "
+        "Resolved Gene Identifiers CALCR: ENSG00000004948. GFRAL: ENSG00000187871."
+    )
+    assert "Completed step" not in cleaned
+    assert "handoff" not in cleaned
+    assert "##" not in cleaned
+    assert "``" not in cleaned
+
+
+def test_strip_embedded_executor_json_payloads_preserves_non_internal_json():
+    raw = 'Observed parameters {"dose_mg": 5, "duration_weeks": 12} in the source.'
+
+    assert workflow._strip_embedded_executor_json_payloads(raw) == raw
+
+
 def test_validate_structured_observations_normalizes_biolink_predicate():
     observations = workflow._validate_structured_observations([
         {
@@ -4741,6 +4776,14 @@ def test_pending_query_ui_stays_in_planning_state_until_plan_is_ready():
     assert "hasResearchProgress" not in app_js
     assert "Still preparing the next research step" not in app_js
     assert "No new progress update" not in app_js
+
+
+def test_live_activity_updates_do_not_rebuild_the_entire_message_timeline():
+    app_js = Path("adk-agent/ui/app.js").read_text(encoding="utf-8")
+
+    assert "calculatePreservedScrollTop" in app_js
+    assert "nextScrollHeight: detailsEl.scrollHeight" in app_js
+    assert "storeRunData(run);\n        updateInlineActivityCard(run);\n        updateLoadingSpinnerLabel();\n        renderMessages();" not in app_js
 
 
 def test_router_requests_variant_identity_before_individual_variant_classification():

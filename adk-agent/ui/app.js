@@ -987,7 +987,18 @@ function patchActivityCardElement(card, snapshot) {
   }
   const detailsEl = card.querySelector(".activity-details");
   if (detailsEl) {
-    if (detailsEl.innerHTML !== snapshot.detailsHtml) detailsEl.innerHTML = snapshot.detailsHtml;
+    if (detailsEl.innerHTML !== snapshot.detailsHtml) {
+      const previousScrollTop = detailsEl.scrollTop;
+      const previousScrollHeight = detailsEl.scrollHeight;
+      const clientHeight = detailsEl.clientHeight;
+      detailsEl.innerHTML = snapshot.detailsHtml;
+      detailsEl.scrollTop = CoScientistActivityState.calculatePreservedScrollTop({
+        previousScrollTop,
+        previousScrollHeight,
+        clientHeight,
+        nextScrollHeight: detailsEl.scrollHeight,
+      });
+    }
     detailsEl.classList.toggle("hidden", !expanded);
   }
 }
@@ -1088,7 +1099,7 @@ function placeActivityAfterPlan(task, activeRun) {
 }
 
 function updateInlineActivityCard(run) {
-  if (!run || !el.messages) return;
+  if (!run || !el.messages) return false;
   const runTaskId = String(run.task_id || "").trim();
   const snapshot = buildActivitySnapshot({
     taskId: runTaskId || "pending",
@@ -1096,16 +1107,16 @@ function updateInlineActivityCard(run) {
     events: Array.isArray(run.progress_events) ? run.progress_events : [],
     summaries: Array.isArray(run.progress_summaries) ? run.progress_summaries : [],
   });
-  if (!snapshot) return;
+  if (!snapshot) return false;
 
   const cards = Array.from(el.messages.querySelectorAll('[data-role="activity-card"]'));
-  if (!cards.length) return;
+  if (!cards.length) return false;
   const targetCards = cards.filter((card) => {
     const cardTaskId = String(card.dataset.taskId || "").trim();
     if (runTaskId) return cardTaskId === runTaskId || cardTaskId === "pending";
     return cardTaskId === "pending";
   });
-  if (!targetCards.length) return;
+  if (!targetCards.length) return false;
 
   if (runTaskId && isActivityExpanded("pending") && !isActivityExpanded(runTaskId)) {
     setActivityExpanded(runTaskId, true);
@@ -1114,6 +1125,7 @@ function updateInlineActivityCard(run) {
   for (const card of targetCards) {
     patchActivityCardElement(card, snapshot);
   }
+  return true;
 }
 
 function renderSidebar() {
@@ -2766,7 +2778,6 @@ async function submitNewQuery(query, { conversationId = null, parentTaskId = nul
         storeRunData(run);
         updateInlineActivityCard(run);
         updateLoadingSpinnerLabel();
-        renderMessages();
       },
     );
     await handleTerminalRunState(payload);
@@ -2801,7 +2812,6 @@ async function submitContinue(taskId) {
           storeRunData(run);
           updateInlineActivityCard(run);
           updateLoadingSpinnerLabel();
-          renderMessages();
         },
       );
     } catch (err) {
@@ -2819,7 +2829,6 @@ async function submitContinue(taskId) {
           storeRunData(run);
           updateInlineActivityCard(run);
           updateLoadingSpinnerLabel();
-          renderMessages();
         },
       );
     }
@@ -2830,7 +2839,7 @@ async function submitContinue(taskId) {
     throw err;
   }
   storeRunData(payload);
-  renderMessages();
+  updateInlineActivityCard(payload);
   await handleTerminalRunState(payload);
 }
 
@@ -2850,7 +2859,6 @@ async function submitFeedback(taskId, message) {
           storeRunData(run);
           updateInlineActivityCard(run);
           updateLoadingSpinnerLabel();
-          renderMessages();
         },
       );
     } catch (err) {
@@ -2866,12 +2874,11 @@ async function submitFeedback(taskId, message) {
           storeRunData(run);
           updateInlineActivityCard(run);
           updateLoadingSpinnerLabel();
-          renderMessages();
         },
       );
     }
     storeRunData(payload);
-    renderMessages();
+    updateInlineActivityCard(payload);
     await handleTerminalRunState(payload);
   } catch (err) {
     setLoading(false);

@@ -28,6 +28,12 @@ import {
   selectOpenTargetsDiseaseAssociation,
   shouldUseLiveOpenTargetsApi,
 } from "./open_targets_helpers.js";
+import {
+  createSerializedRequestPacer,
+  getNcbiEutilsMinIntervalMs,
+  isNcbiEutilsUrl,
+  summarizeNcbiEutilsError,
+} from "./ncbi_eutils_helpers.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -146,6 +152,9 @@ const BIOGRID_ORCS_ACCESS_KEY = String(process.env.BIOGRID_ORCS_ACCESS_KEY || pr
 const OPENALEX_MAILTO = process.env.OPENALEX_MAILTO || process.env.CONTACT_EMAIL || "";
 const NCBI_API_KEY = String(process.env.NCBI_API_KEY || process.env.PUBMED_API_KEY || "").trim();
 const NCBI_EMAIL = String(process.env.NCBI_EMAIL || process.env.CONTACT_EMAIL || OPENALEX_MAILTO || "").trim();
+const waitForNcbiEutilsSlot = createSerializedRequestPacer({
+  minIntervalMs: getNcbiEutilsMinIntervalMs(NCBI_API_KEY),
+});
 const BQ_PROJECT_ID = String(process.env.BQ_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || "").trim();
 const BQ_LOCATION = String(process.env.BQ_LOCATION || process.env.GOOGLE_CLOUD_LOCATION || "US").trim() || "US";
 const BQ_DATASET_ALLOWLIST = String(process.env.BQ_DATASET_ALLOWLIST || "").trim();
@@ -1506,9 +1515,13 @@ async function fetchWithRetry(url, options = {}) {
 
   let lastError;
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let timer = null;
     try {
+      if (isNcbiEutilsUrl(url)) {
+        await waitForNcbiEutilsSlot();
+      }
+      const controller = new AbortController();
+      timer = setTimeout(() => controller.abort(), timeoutMs);
       const response = await fetch(url, { ...fetchOptions, signal: controller.signal });
       clearTimeout(timer);
       if (response.ok) {
@@ -1529,7 +1542,7 @@ async function fetchWithRetry(url, options = {}) {
       const backoffMs = Math.min(maxBackoffMs, retryAfterMs ?? Math.min(maxBackoffMs, 600 * 2 ** attempt));
       await sleep(backoffMs + Math.floor(Math.random() * 200));
     } catch (error) {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       lastError = error;
       if (attempt >= retries) {
         throw lastError;
@@ -7201,10 +7214,11 @@ function buildPubmedRateLimitHint() {
 
 function formatPubmedToolError(error) {
   const message = normalizeWhitespace(error?.message || String(error) || "unknown PubMed error");
+  const summary = summarizeNcbiEutilsError(message);
   if (message.includes("429") || /rate limit/i.test(message)) {
-    return `${message} ${buildPubmedRateLimitHint()}`;
+    return `${summary} ${buildPubmedRateLimitHint()}`;
   }
-  return message;
+  return summary;
 }
 
 async function fetchPubmedSummaryXml(pmids) {
@@ -7739,9 +7753,9 @@ server.registerTool(
   "search_pubmed",
   {
     description:
-      "Searches PubMed for biomedical literature. Returns PMIDs, titles, authors, journal, and publication dates. Use for finding specific papers, systematic reviews, or evidence for claims.",
+      "Searches PubMed for biomedical literature. Returns PMIDs, titles, authors, journal, and publication dates. PubMed treats adjacent terms as AND; join alternative entities or synonyms with explicit OR and parentheses, or use separate focused searches.",
     inputSchema: {
-      query: z.string().describe("PubMed search query. Supports MeSH terms and boolean operators (AND, OR, NOT)."),
+      query: z.string().describe("PubMed search query with explicit Boolean semantics. Adjacent terms are AND; use parentheses and OR for alternative entities or synonyms."),
       maxResults: z.number().optional().describe("Max results to return (default 20, max 100)."),
       minDate: z.string().optional().describe("Minimum publication date (YYYY/MM/DD or YYYY)."),
       maxDate: z.string().optional().describe("Maximum publication date (YYYY/MM/DD or YYYY)."),
@@ -11685,9 +11699,9 @@ server.registerTool(
   "search_pubmed_advanced",
   {
     description:
-      "Advanced PubMed search with field-specific queries. Use for precise searches targeting specific fields like author, journal, MeSH terms, or publication type.",
+      "Advanced PubMed search with explicit Boolean and field-specific queries. Use parentheses and OR for alternative entities or synonyms; adjacent terms are AND.",
     inputSchema: {
-      query: z.string().describe("Full PubMed query with field tags, e.g., '\"BRCA1\"[Title] AND \"breast cancer\"[MeSH] AND review[pt]'"),
+      query: z.string().describe("Full PubMed query with explicit Boolean operators and optional field tags, e.g., '(BRCA1[Title] OR BRCA2[Title]) AND breast neoplasms[MeSH]'."),
       maxResults: z.number().optional().describe("Max results (default 20, max 100)."),
       sort: z.string().optional().describe("Sort: 'relevance' (default) or 'date'."),
     },
