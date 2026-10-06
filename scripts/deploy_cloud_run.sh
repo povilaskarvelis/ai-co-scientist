@@ -11,9 +11,9 @@ set -euo pipefail
 # ALLOW_EPHEMERAL_STATE, RATE_LIMIT_TRUSTED_PROXY_HOPS, RATE_LIMIT_MAX_KEYS, RATE_LIMIT_QUERIES,
 # ADK_MAX_RETAINED_COMPLETED_RUNS, ADK_MAX_RETAINED_REPORTS, ADK_MAX_LLM_CALLS_PER_TURN,
 # ADK_NATIVE_MODEL, ADK_PLANNER_MODEL, ADK_SYNTHESIZER_MODEL, ADK_ROUTER_MODEL,
-# NCBI_API_KEY, GTOPDB_API_KEY (stored in Secret Manager)
-# Model, rate-limit and source-key settings fall back to adk-agent/.env, so the deployed
-# service runs the configuration that was tested locally.
+# NCBI_API_KEY, GTOPDB_API_KEY (stored in Secret Manager; also read from adk-agent/.env)
+# Model and rate-limit settings are forwarded only when set explicitly for the deploy; otherwise
+# the code defaults apply (including Gemini 2.5 Pro for the final report).
 # ─────────────────────────────────────────────────────────────────────────────
 
 PROJECT_ID="${PROJECT_ID:-}"
@@ -38,9 +38,9 @@ GA4_MEASUREMENT_ID="${GA4_MEASUREMENT_ID:-G-NTCXHW3B2G}"
 # (ADK_MAX_CONCURRENT_TURNS) is what bounds model work, so request slots can be generous.
 CONCURRENCY="${CONCURRENCY:-40}"
 CPU="${CPU:-2}"
-# Runs continue on a background event loop after a visitor's stream drops. With request-based
-# CPU (CPU_THROTTLING=true) such runs are starved and can be lost when the instance scales in.
-CPU_THROTTLING="${CPU_THROTTLING:-false}"
+# Request-based CPU keeps an idle instance cheap. CPU_THROTTLING=false keeps CPU allocated for the
+# instance's lifetime so a run whose visitor closed the tab still finishes, at a higher idle cost.
+CPU_THROTTLING="${CPU_THROTTLING:-true}"
 MIN_INSTANCES="${MIN_INSTANCES:-0}"
 MAX_INSTANCES="${MAX_INSTANCES:-1}"
 # Google ingress appends the client followed by its proxy address to X-Forwarded-For.
@@ -83,10 +83,6 @@ load_env_var_from_file "BIOGRID_ACCESS_KEY" "${ENV_FILE}"
 load_env_var_from_file "BIOGRID_ORCS_ACCESS_KEY" "${ENV_FILE}"
 load_env_var_from_file "NCBI_API_KEY" "${ENV_FILE}"
 load_env_var_from_file "GTOPDB_API_KEY" "${ENV_FILE}"
-for tuned_var in ADK_NATIVE_MODEL ADK_PLANNER_MODEL ADK_SYNTHESIZER_MODEL ADK_ROUTER_MODEL \
-  RATE_LIMIT_QUERIES ADK_MAX_LLM_CALLS_PER_TURN; do
-  load_env_var_from_file "${tuned_var}" "${ENV_FILE}"
-done
 load_env_var_from_file "AI_CO_SCIENTIST_POSTGRES_DSN" "${ENV_FILE}"
 load_env_var_from_file "POSTGRES_DSN" "${ENV_FILE}"
 load_env_var_from_file "DATABASE_URL" "${ENV_FILE}"

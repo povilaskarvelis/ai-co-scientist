@@ -137,30 +137,44 @@ def test_cloud_run_durable_state_preserves_multi_instance_limit(tmp_path):
     assert "--max-instances 2" in result.stdout
 
 
-def test_cloud_run_deploy_keeps_cpu_for_background_runs_and_raises_concurrency(tmp_path):
+def test_cloud_run_deploy_defaults_to_request_based_cpu_and_raises_concurrency(tmp_path):
     result = _run_deploy(
         tmp_path,
         AI_CO_SCIENTIST_POSTGRES_DSN="postgresql://user:password@example.invalid/database",
     )
 
     assert result.returncode == 0, result.stderr
-    assert "--no-cpu-throttling" in result.stdout
+    assert "--cpu-throttling" in result.stdout
+    assert "--no-cpu-throttling" not in result.stdout
+    assert "--min-instances 0" in result.stdout
     assert "--concurrency 40" in result.stdout
 
 
-def test_cloud_run_deploy_forwards_the_tested_model_configuration(tmp_path):
+def test_cloud_run_deploy_keeps_code_default_models_unless_overridden(tmp_path):
+    # Local development settings must not leak into the deployed service: the code default
+    # (Gemini 2.5 Pro for the final report) applies unless the deploy sets a model explicitly.
+    (tmp_path / "adk-agent").mkdir()
+    (tmp_path / "adk-agent" / ".env").write_text('ADK_SYNTHESIZER_MODEL="gemini-2.5-flash"\n', encoding="utf-8")
+
+    result = _run_deploy(
+        tmp_path,
+        AI_CO_SCIENTIST_POSTGRES_DSN="postgresql://user:password@example.invalid/database",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ADK_SYNTHESIZER_MODEL" not in result.stdout
+
+
+def test_cloud_run_deploy_forwards_explicit_overrides(tmp_path):
     result = _run_deploy(
         tmp_path,
         AI_CO_SCIENTIST_POSTGRES_DSN="postgresql://user:password@example.invalid/database",
         ADK_NATIVE_MODEL="gemini-2.5-flash",
-        ADK_SYNTHESIZER_MODEL="gemini-2.5-flash",
         RATE_LIMIT_QUERIES="10",
-        CPU_THROTTLING="true",
+        CPU_THROTTLING="false",
     )
 
     assert result.returncode == 0, result.stderr
     assert "ADK_NATIVE_MODEL=gemini-2.5-flash" in result.stdout
-    assert "ADK_SYNTHESIZER_MODEL=gemini-2.5-flash" in result.stdout
     assert "RATE_LIMIT_QUERIES=10" in result.stdout
-    assert "--cpu-throttling" in result.stdout
-    assert "--no-cpu-throttling" not in result.stdout
+    assert "--no-cpu-throttling" in result.stdout
