@@ -1059,7 +1059,8 @@ def _normalize_for_term_matching(text: str) -> str:
     term. Punctuation inside a token (clinicaltrials.gov, gain-of-function) is kept.
     """
     spaced = re.sub(r"[,.;:!?)\]\"]+(?=\s|$)|[(\[\"]", " ", _normalize_user_text(text))
-    return f" {re.sub(r'\s+', ' ', spaced).strip()} "
+    collapsed = re.sub(r"\s+", " ", spaced).strip()
+    return f" {collapsed} "
 
 
 def _is_finalize_command(text: str) -> bool:
