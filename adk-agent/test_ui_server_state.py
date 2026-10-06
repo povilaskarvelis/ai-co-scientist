@@ -1445,3 +1445,24 @@ async def test_get_run_falls_back_to_persisted_store(runtime):
     assert payload["run_id"] == "run_saved"
     assert payload["status"] == "failed"
     assert payload["error"] == "Persisted failure"
+
+
+def test_crashed_run_marks_its_task_failed_instead_of_leaving_it_in_progress(runtime):
+    task = ui_server._make_task("task_crash", "Assess LRRK2", "conv_crash")
+    runtime.store.save_task(task, owner_ip="owner")
+
+    asyncio.run(runtime._fail_task_after_crash("task_crash", "run_crash"))
+
+    assert runtime.store.get_task("task_crash")["status"] == "failed"
+
+
+def test_crashed_run_keeps_a_plan_that_is_still_awaiting_approval(runtime):
+    task = ui_server._make_task("task_plan", "Assess LRRK2", "conv_plan")
+    task["awaiting_hitl"] = True
+    runtime.store.save_task(task, owner_ip="owner")
+
+    asyncio.run(runtime._fail_task_after_crash("task_plan", "run_plan"))
+
+    stored = runtime.store.get_task("task_plan")
+    assert stored["status"] == "in_progress"
+    assert stored["awaiting_hitl"] is True

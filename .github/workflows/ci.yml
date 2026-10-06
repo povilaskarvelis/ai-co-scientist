@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: adk-agent/requirements.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            research-mcp/package-lock.json
+            packages/cosci-cursor/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r adk-agent/requirements.txt
+          npm ci --prefix research-mcp
+          npm ci --prefix packages/cosci-cursor
+
+      - name: Python tests
+        run: python -m pytest -q
+
+      - name: Node tests
+        run: |
+          npm test --prefix research-mcp
+          node --test adk-agent/ui/activity_state.test.js
+
+      - name: Syntax check
+        run: |
+          node --check research-mcp/server.js
+          node --check adk-agent/ui/app.js
+
+      - name: Typecheck Cursor package
+        run: npm run typecheck --prefix packages/cosci-cursor

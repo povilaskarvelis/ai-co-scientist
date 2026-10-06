@@ -65,6 +65,8 @@ const QUICKGO_API = "https://www.ebi.ac.uk/QuickGO/services";
 const MONARCH_API = "https://monarchinitiative.org/v3/api";
 const ALLIANCE_GENOME_API = "https://www.alliancegenome.org/api";
 const GTOPDB_API = "https://www.guidetopharmacology.org/services";
+// GtoPdb web services require a registered API key (sent as the GTP-API-Key header) since 2026.
+const GTOPDB_API_KEY = String(process.env.GTOPDB_API_KEY || "").trim();
 const ENA_PORTAL_API = "https://www.ebi.ac.uk/ena/portal/api";
 const EMDB_API = "https://www.ebi.ac.uk/emdb/api";
 const ALPHAFOLD_API = "https://alphafold.ebi.ac.uk/api";
@@ -136,7 +138,7 @@ const OPENALEX_AUTHORS_SELECT = [
   "display_name",
   "works_count",
   "cited_by_count",
-  "last_known_institution",
+  "last_known_institutions",
   "orcid",
 ].join(",");
 const HF_DATASET_PUBMEDQA = String(process.env.HF_DATASET_PUBMEDQA || "qiaojin/PubMedQA").trim();
@@ -817,17 +819,50 @@ function normalizeToolResponseEnvelope(toolName, rawResult, requestArgs) {
   return normalizedResponse;
 }
 
+// Tool output reaches the LLM, the activity log and persisted run state, so it must never carry
+// credentials. Some upstreams take keys as query parameters (BioGRID accesskey, NCBI api_key), and
+// request URLs are echoed in error messages and source lists.
+const SECRET_QUERY_PARAMS = new Set(["accesskey", "api_key", "apikey", "access_token", "gtp-api-key"]);
+const CONFIGURED_SECRET_VALUES = [
+  BIOGRID_ACCESS_KEY,
+  BIOGRID_ORCS_ACCESS_KEY,
+  NCBI_API_KEY,
+  GTOPDB_API_KEY,
+  HF_TOKEN,
+].filter((value) => value && value.length >= 8);
+
+function redactUrlSecrets(text) {
+  return String(text || "").replace(/([?&])([^=&#\s]+)=([^&#\s"'<>|]*)/g, (match, separator, name, value) =>
+    SECRET_QUERY_PARAMS.has(name.toLowerCase()) && value ? `${separator}${name}=REDACTED` : match
+  );
+}
+
+function redactSecrets(value) {
+  if (typeof value === "string") {
+    let text = redactUrlSecrets(value);
+    for (const secret of CONFIGURED_SECRET_VALUES) {
+      if (text.includes(secret)) text = text.split(secret).join("REDACTED");
+    }
+    return text;
+  }
+  if (Array.isArray(value)) return value.map(redactSecrets);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactSecrets(item)]));
+  }
+  return value;
+}
+
 function wrapToolHandler(toolName, handler) {
   return async (...args) => {
     try {
       const rawResult = await handler(...args);
-      return normalizeToolResponseEnvelope(toolName, rawResult, args[0]);
+      return redactSecrets(normalizeToolResponseEnvelope(toolName, rawResult, args[0]));
     } catch (error) {
       const message = normalizeWhitespace(error?.message || String(error));
-      return normalizeToolResponseEnvelope(toolName, {
+      return redactSecrets(normalizeToolResponseEnvelope(toolName, {
         isError: true,
         content: [{ type: "text", text: `Error in ${toolName}: ${message}` }],
-      }, args[0]);
+      }, args[0]));
     }
   };
 }
@@ -1504,6 +1539,18 @@ function extractUniProtDiseaseVariantAnnotations(entry, limitDiseases = 6, limit
   return annotations;
 }
 
+// Some hosts (for example alphafold.ebi.ac.uk) reject Node's default "node" User-Agent.
+const DEFAULT_USER_AGENT =
+  String(process.env.RESEARCH_MCP_USER_AGENT || "").trim() || "ai-co-scientist-research-mcp/1.0";
+
+function withDefaultHeaders(headers) {
+  const merged = new Headers(headers || {});
+  if (!merged.has("user-agent")) {
+    merged.set("user-agent", DEFAULT_USER_AGENT);
+  }
+  return merged;
+}
+
 async function fetchWithRetry(url, options = {}) {
   const retries = options.retries ?? 2;
   const timeoutMs = options.timeoutMs ?? 12000;
@@ -1512,6 +1559,7 @@ async function fetchWithRetry(url, options = {}) {
   delete fetchOptions.retries;
   delete fetchOptions.timeoutMs;
   delete fetchOptions.maxBackoffMs;
+  fetchOptions.headers = withDefaultHeaders(fetchOptions.headers);
 
   let lastError;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -1531,11 +1579,14 @@ async function fetchWithRetry(url, options = {}) {
       const retryable = response.status === 429 || response.status >= 500;
       const responseBody = await response.text().catch(() => "");
       lastError = new Error(
-        `Request failed (${response.status}): ${url}${
+        `Request failed (${response.status}): ${redactUrlSecrets(url)}${
           responseBody ? ` | ${responseBody.slice(0, 220).replace(/\s+/g, " ").trim()}` : ""
         }`
       );
+      lastError.status = response.status;
       if (!retryable || attempt >= retries) {
+        // Client errors such as 401/403/404 will not succeed on retry; the catch block rethrows them.
+        lastError.noRetry = true;
         throw lastError;
       }
       const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
@@ -1543,8 +1594,13 @@ async function fetchWithRetry(url, options = {}) {
       await sleep(backoffMs + Math.floor(Math.random() * 200));
     } catch (error) {
       if (timer) clearTimeout(timer);
-      lastError = error;
-      if (attempt >= retries) {
+      if (error?.noRetry) {
+        throw error;
+      }
+      const timedOut = error?.name === "AbortError";
+      lastError = timedOut ? new Error(`Request timed out after ${timeoutMs} ms: ${redactUrlSecrets(url)}`) : error;
+      // A request that timed out once is likely to time out again, so retry it at most once.
+      if (attempt >= retries || (timedOut && attempt >= 1)) {
         throw lastError;
       }
       const backoffMs = Math.min(maxBackoffMs, 600 * 2 ** attempt);
@@ -1569,10 +1625,34 @@ async function fetchJsonWithRetry(url, options = {}) {
         `Upstream service returned a server warning instead of JSON: ${normalized.slice(0, 220)}`
       );
     }
+    if (/^<(!doctype html|html)/i.test(normalized)) {
+      throw new Error(
+        `Upstream returned an HTML page instead of JSON (likely a bot challenge or a moved endpoint): ${url}`
+      );
+    }
     throw new Error(
       `Invalid JSON payload received${normalized ? `: ${normalized.slice(0, 220)}` : ""}`
     );
   }
+}
+
+function gtopdbFetchOptions(options = {}) {
+  if (!GTOPDB_API_KEY) return options;
+  return { ...options, headers: { ...(options.headers || {}), "GTP-API-Key": GTOPDB_API_KEY } };
+}
+
+function describeGtopdbError(error) {
+  if (error?.status === 401 || error?.status === 403) {
+    return GTOPDB_API_KEY
+      ? `Guide to Pharmacology rejected the configured API key (HTTP ${error.status}).`
+      : "Guide to Pharmacology now requires an API key; set GTOPDB_API_KEY to enable this tool.";
+  }
+  return error?.message || String(error);
+}
+
+function isGtopdbNoMatchError(error) {
+  // A target search with no hits answers 404 or an empty body rather than an empty JSON array.
+  return error?.status === 404 || error?.message === "Invalid JSON payload received";
 }
 
 async function fetchBufferWithRetry(url, options = {}) {
@@ -2582,15 +2662,30 @@ async function fetchQuickGoTerms(goIds) {
   );
 }
 
+// depmap.org serves a Cloudflare Turnstile challenge page to scripted clients. Parsing that
+// HTML as CSV yields zero rows, which tools then report as "not present", a false negative.
+function assertNotHtmlPage(response, text, url) {
+  const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+  if (contentType.includes("text/html") || /^\s*<(!doctype html|html)/i.test(text)) {
+    const error = new Error(
+      `Upstream returned an HTML page instead of data (likely a bot challenge or a moved endpoint): ${url}`
+    );
+    error.noRetry = true;
+    throw error;
+  }
+}
+
 async function fetchDepMapDownloadCatalog() {
   const cached = getFreshCacheValue(depMapDownloadCatalogCache, 6 * 60 * 60 * 1000);
   if (cached) return cached;
-  const response = await fetchWithRetry(`${DEPMAP_PORTAL_API}/api/download/files`, {
+  const url = `${DEPMAP_PORTAL_API}/api/download/files`;
+  const response = await fetchWithRetry(url, {
     retries: 1,
     timeoutMs: 20000,
     maxBackoffMs: 3000,
   });
   const text = await response.text();
+  assertNotHtmlPage(response, text, url);
   const rows = parseCsvObjects(text);
   depMapDownloadCatalogCache = storeCacheValue(depMapDownloadCatalogCache, rows);
   return rows;
@@ -2599,12 +2694,14 @@ async function fetchDepMapDownloadCatalog() {
 async function fetchDepMapSummaryTable() {
   const cached = getFreshCacheValue(depMapSummaryCache, 6 * 60 * 60 * 1000);
   if (cached) return cached;
-  const response = await fetchWithRetry(`${DEPMAP_PORTAL_API}/tda/table_download`, {
+  const url = `${DEPMAP_PORTAL_API}/tda/table_download`;
+  const response = await fetchWithRetry(url, {
     retries: 1,
     timeoutMs: 25000,
     maxBackoffMs: 3000,
   });
   const text = await response.text();
+  assertNotHtmlPage(response, text, url);
   depMapSummaryCache = storeCacheValue(depMapSummaryCache, text);
   return text;
 }
@@ -4274,7 +4371,7 @@ async function fetchBiogridJson(baseUrl, pathname, params = new URLSearchParams(
       ...(options.headers || {}),
     },
   });
-  return { url, data };
+  return { url: redactUrlSecrets(url), data };
 }
 
 function biogridTaxIdToMyGeneSpecies(taxId = 9606) {
@@ -10840,6 +10937,13 @@ function readEncodeApiError(payload) {
   return "";
 }
 
+// Experiment-like objects carry the organism on the donor, not at the top level;
+// filtering them on organism.scientific_name silently returns zero hits.
+const ENCODE_ORGANISM_FACET_BY_TYPE = {
+  Experiment: "replicates.library.biosample.donor.organism.scientific_name",
+  FunctionalCharacterizationExperiment: "replicates.library.biosample.donor.organism.scientific_name",
+};
+
 function buildEncodeSearchUrl({
   objectType,
   searchTerm,
@@ -10850,14 +10954,15 @@ function buildEncodeSearchUrl({
   frame,
 }) {
   const params = new URLSearchParams();
-  params.set("type", normalizeWhitespace(objectType || "") || "Experiment");
+  const type = normalizeWhitespace(objectType || "") || "Experiment";
+  params.set("type", type);
   const term = normalizeWhitespace(searchTerm || "");
   if (term) {
     params.set("searchTerm", term);
   }
   const org = normalizeWhitespace(organism || "");
   if (org) {
-    params.set("organism.scientific_name", org);
+    params.set(ENCODE_ORGANISM_FACET_BY_TYPE[type] || "organism.scientific_name", org);
   }
   const assay = normalizeWhitespace(assayTitle || "");
   if (assay) {
@@ -10935,6 +11040,7 @@ async function fetchEncodeJsonWithRetry(url, options = {}) {
         }`
       );
       if (!retryable || attempt >= retries) {
+        lastError.noRetry = true;
         throw lastError;
       }
       const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
@@ -10942,6 +11048,9 @@ async function fetchEncodeJsonWithRetry(url, options = {}) {
       await sleep(backoffMs + Math.floor(Math.random() * 200));
     } catch (error) {
       clearTimeout(timer);
+      if (error?.noRetry) {
+        throw error;
+      }
       lastError = error;
       if (attempt >= retries) {
         throw lastError;
@@ -12020,7 +12129,7 @@ server.registerTool(
       const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 9000, maxBackoffMs: 2500 });
       const results = data?.results ?? [];
       const keyFields = results.map((a, idx) => {
-        const inst = a.last_known_institution?.display_name || "Unknown institution";
+        const inst = a.last_known_institutions?.[0]?.display_name || "Unknown institution";
         return `${idx + 1}. ${a.display_name || "Unknown"} | Works: ${a.works_count ?? 0} | Cited by: ${a.cited_by_count ?? 0} | Institution: ${inst} | ID: ${a.id}`;
       });
       return {
@@ -12311,9 +12420,9 @@ server.registerTool(
       const keyFields = [];
       for (let idx = 0; idx < results.length; idx++) {
         const a = results[idx];
-        let inst = a.last_known_institution?.display_name || "";
-        let homepage = a.last_known_institution?.homepage_url || "N/A";
-        let instSource = "author.last_known_institution";
+        let inst = a.last_known_institutions?.[0]?.display_name || "";
+        let homepage = a.last_known_institutions?.[0]?.homepage_url || "N/A";
+        let instSource = "author.last_known_institutions";
 
         if (!inst && a.id) {
           // Fallback: derive institution from the author's latest work authorship record.
@@ -13508,7 +13617,7 @@ server.registerTool(
         const doi = normalizeWhitespace(row?.doi || "");
         const citationCount = toNonNegativeInt(row?.citedByCount, 0);
         return (
-          `${idx + 1}. ${normalizeWhitespace(row?.title || "Untitled")} ` +
+          `${idx + 1}. ${stripHtmlToText(row?.title) || "Untitled"} ` +
           `| Source: ${normalizeWhitespace(row?.source || "unknown")} ` +
           `| Year: ${normalizeWhitespace(row?.pubYear || "unknown")} ` +
           `| PMID: ${pmid || "n/a"} | DOI: ${doi || "n/a"} ` +
@@ -13640,12 +13749,18 @@ server.registerTool(
     try {
       const geneSymbolUrl = `${GTOPDB_API}/targets?${new URLSearchParams({ geneSymbol: query }).toString()}`;
       const nameUrl = `${GTOPDB_API}/targets?${new URLSearchParams({ name: query }).toString()}`;
-      const [geneSymbolHits, nameHits] = await Promise.all([
-        fetchJsonWithRetry(geneSymbolUrl, { retries: 1, timeoutMs: 15000, maxBackoffMs: 2500 }).catch(() => []),
-        fetchJsonWithRetry(nameUrl, { retries: 1, timeoutMs: 15000, maxBackoffMs: 2500 }).catch(() => []),
-      ]);
+      const lookupTargets = (url) =>
+        fetchJsonWithRetry(url, gtopdbFetchOptions({ retries: 1, timeoutMs: 15000, maxBackoffMs: 2500 }))
+          .then((rows) => ({ rows: Array.isArray(rows) ? rows : [], error: null }))
+          .catch((error) => ({ rows: [], error: isGtopdbNoMatchError(error) ? null : error }));
+      const [bySymbol, byName] = await Promise.all([lookupTargets(geneSymbolUrl), lookupTargets(nameUrl)]);
+      // Report an outage or missing key as an error, never as "no targets": the report
+      // synthesizer would otherwise present it as negative evidence.
+      if (bySymbol.error && byName.error) {
+        throw new Error(describeGtopdbError(bySymbol.error));
+      }
       const mergedTargets = dedupeArray(
-        [...(Array.isArray(geneSymbolHits) ? geneSymbolHits : []), ...(Array.isArray(nameHits) ? nameHits : [])]
+        [...bySymbol.rows, ...byName.rows]
           .map((row) => JSON.stringify(row))
       ).map((row) => JSON.parse(row));
       const targets = mergedTargets.sort((a, b) => scoreGtopdbTarget(b, query) - scoreGtopdbTarget(a, query));
@@ -13669,7 +13784,14 @@ server.registerTool(
       if (approvedOnly) interactionParams.set("approved", "true");
       if (primaryTargetOnly) interactionParams.set("primaryTarget", "true");
       const interactionsUrl = `${GTOPDB_API}/targets/${encodeURIComponent(bestTarget.targetId)}/interactions?${interactionParams.toString()}`;
-      const interactions = await fetchJsonWithRetry(interactionsUrl, { retries: 1, timeoutMs: 15000, maxBackoffMs: 2500 }).catch(() => []);
+      let interactionsError = null;
+      const interactions = await fetchJsonWithRetry(
+        interactionsUrl,
+        gtopdbFetchOptions({ retries: 1, timeoutMs: 15000, maxBackoffMs: 2500 })
+      ).catch((error) => {
+        if (!isGtopdbNoMatchError(error)) interactionsError = error;
+        return [];
+      });
       const topInteractions = Array.isArray(interactions) ? interactions.slice(0, boundedLimit) : [];
 
       const candidateText = targets
@@ -13697,14 +13819,15 @@ server.registerTool(
             keyFields,
             sources: [geneSymbolUrl, nameUrl, interactionsUrl],
             limitations: [
+              interactionsError ? `Interaction lookup failed (${describeGtopdbError(interactionsError)}); interactions are missing, not absent.` : "",
               "Guide to Pharmacology is curated and selective rather than exhaustive; absence of an interaction is not evidence of no activity.",
               approvedOnly ? "Approved-only filtering can exclude investigational ligands with strong affinity data." : "Interaction summaries can mix approved and investigational ligands unless you enable approvedOnly.",
-            ],
+            ].filter(Boolean),
           }),
         }],
       };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error in get_guidetopharmacology_target: ${error.message}` }] };
+      return { content: [{ type: "text", text: `Error in get_guidetopharmacology_target: ${describeGtopdbError(error)}` }] };
     }
   }
 );
@@ -13729,7 +13852,7 @@ server.registerTool(
 
     const url = `${GTOPDB_API}/ligands/${encodeURIComponent(cleanLigandId)}/interactions`;
     try {
-      const interactions = await fetchJsonWithRetry(url, { retries: 2, timeoutMs: 15000, maxBackoffMs: 2500 });
+      const interactions = await fetchJsonWithRetry(url, gtopdbFetchOptions({ retries: 2, timeoutMs: 15000, maxBackoffMs: 2500 }));
       const refs = [];
       for (const row of Array.isArray(interactions) ? interactions : []) {
         for (const ref of Array.isArray(row?.refs) ? row.refs : []) {
@@ -13815,7 +13938,7 @@ server.registerTool(
         },
       };
     } catch (error) {
-      return { content: [{ type: "text", text: `Error in get_gtopdb_ligand_reference: ${error.message}` }] };
+      return { content: [{ type: "text", text: `Error in get_gtopdb_ligand_reference: ${describeGtopdbError(error)}` }] };
     }
   }
 );
@@ -14207,7 +14330,7 @@ server.registerTool(
       const data = await fetchJsonWithRetry(url);
       const entries = data?.results?.[0]?.entries || data?.entries || [];
       const sliced = entries.slice(0, limit);
-      const keyFields = sliced.map((e, idx) => `${idx + 1}. ${e.name || "Unnamed pathway"} | Stable ID: ${e.stId || "N/A"} | Species: ${e.species?.[0]?.displayName || species}`);
+      const keyFields = sliced.map((e, idx) => `${idx + 1}. ${stripHtmlToText(e.name) || "Unnamed pathway"} | Stable ID: ${e.stId || "N/A"} | Species: ${e.species?.[0]?.displayName || species}`);
       return { content: [{ type: "text", text: renderStructuredResponse({ summary: `Retrieved ${sliced.length} Reactome pathway hits.`, keyFields, sources: [url], limitations: ["Reactome search ranking may include broad pathways; validate specificity downstream."] }) }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error in search_reactome_pathways: ${error.message}` }] };
@@ -15862,7 +15985,7 @@ server.registerTool(
             id
             name
             description
-            officialName
+            fullName
             variants {
               totalCount
             }
@@ -15925,7 +16048,7 @@ server.registerTool(
     const levelSummary = Object.entries(levelCounts).map(([k, v]) => `${k}:${v}`).join(", ") || "none";
 
     const keyFields = [
-      `Gene: ${normalizedName} (${normalizeWhitespace(gene.officialName || "")})`,
+      `Gene: ${normalizedName} (${normalizeWhitespace(gene.fullName || "")})`,
       `Description: ${description.slice(0, 300)}${description.length > 300 ? "..." : ""}`,
       `CIViC variants: ${variantCount}`,
       `Evidence items (accepted): ${allEvidence.length} (levels: ${levelSummary})`,
@@ -16802,6 +16925,53 @@ function computeJasparConsensusAndInformationContent(pfm) {
   };
 }
 
+// The GWAS Catalog associations endpoint matches `efo_trait` against exact EFO labels only, so
+// everyday names ("obesity", "Alzheimer's disease", "type 2 diabetes") return zero hits. Resolve the
+// name to an ontology id first and query by id with child traits included.
+const GWAS_TRAIT_QUALIFIER_PATTERN = /\b(age of onset|age at onset|measurement|biomarker|response to|neuropathologic|nephropathy)\b/i;
+
+function normalizeGwasTraitQuery(value) {
+  return normalizeWhitespace(String(value || "").replace(/['’]s\b/gi, ""));
+}
+
+function scoreGwasTraitCandidate(label, query) {
+  const normalizedLabel = label.toLowerCase();
+  const normalizedQuery = query.toLowerCase();
+  if (normalizedLabel === normalizedQuery) return 100;
+  if (["disorder", "mellitus", "disease"].some((suffix) => normalizedLabel === `${normalizedQuery} ${suffix}`)) return 90;
+  const tokens = normalizedQuery.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0 || !tokens.every((token) => normalizedLabel.includes(token))) return 0;
+  if (GWAS_TRAIT_QUALIFIER_PATTERN.test(label) && !GWAS_TRAIT_QUALIFIER_PATTERN.test(query)) return 10;
+  // Prefer the most general label that still contains every query word.
+  return Math.max(11, 50 - (label.length - query.length));
+}
+
+async function resolveGwasEfoTrait(trait) {
+  const normalizedQuery = normalizeGwasTraitQuery(trait);
+  let best = null;
+  for (const query of dedupeArray([normalizedQuery, normalizeWhitespace(trait)]).filter(Boolean)) {
+    const url = `${GWAS_CATALOG_API}/efo-traits?${new URLSearchParams({ trait: query, size: "50" })}`;
+    const data = await fetchJsonWithRetry(url, { retries: 1, timeoutMs: 15000 });
+    for (const row of data?._embedded?.efo_traits || []) {
+      const label = normalizeWhitespace(row?.efo_trait || "");
+      const id = normalizeWhitespace(row?.efo_id || "");
+      if (!label || !id) continue;
+      const score = scoreGwasTraitCandidate(label, normalizedQuery);
+      if (score > 0 && (!best || score > best.score)) best = { label, id, score };
+    }
+    if (best && best.score >= 90) break;
+  }
+  return best;
+}
+
+function formatGwasPValue(value) {
+  if (value == null) return "N/A";
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "N/A";
+  // The API reports p-values below double precision as 0.
+  return numeric === 0 ? "<1e-300" : numeric.toExponential(1);
+}
+
 server.registerTool(
   "search_gwas_associations",
   {
@@ -16823,23 +16993,30 @@ server.registerTool(
       return { content: [{ type: "text", text: "Provide either a trait/disease name or a variant rsID." }] };
     }
 
-    const params = new URLSearchParams({ size: String(limit), show_child_traits: "false" });
-    if (cleanVariant) {
-      params.set("variant_id", cleanVariant);
-    } else {
-      params.set("efo_trait", cleanTrait);
-    }
-
-    const url = `${GWAS_CATALOG_API}/associations?${params}`;
+    const params = new URLSearchParams({ size: String(limit), sort: "p_value", direction: "asc" });
+    let resolvedTrait = null;
+    let url = "";
     let data;
     try {
+      if (cleanVariant) {
+        params.set("variant_id", cleanVariant);
+      } else {
+        resolvedTrait = await resolveGwasEfoTrait(cleanTrait).catch(() => null);
+        if (resolvedTrait) {
+          params.set("efo_id", resolvedTrait.id);
+          params.set("show_child_traits", "true");
+        } else {
+          params.set("efo_trait", cleanTrait);
+        }
+      }
+      url = `${GWAS_CATALOG_API}/associations?${params}`;
       data = await fetchJsonWithRetry(url, { retries: 2, timeoutMs: 15000 });
     } catch (err) {
       return {
         content: [{ type: "text", text: renderStructuredResponse({
           summary: `GWAS Catalog query failed: ${err.message}`,
           keyFields: [`Query: ${cleanVariant || cleanTrait}`],
-          sources: [url],
+          sources: [url || `${GWAS_CATALOG_API}/associations`],
           limitations: ["The GWAS Catalog API may be temporarily unavailable. Rate limit: 15 req/s."],
         }) }],
       };
@@ -16852,9 +17029,17 @@ server.registerTool(
       return {
         content: [{ type: "text", text: renderStructuredResponse({
           summary: `No GWAS associations found for "${cleanVariant || cleanTrait}".`,
-          keyFields: [`Query: ${cleanVariant || cleanTrait}`, `Total results: 0`],
+          keyFields: [
+            `Query: ${cleanVariant || cleanTrait}`,
+            resolvedTrait ? `Resolved trait: ${resolvedTrait.label} (${resolvedTrait.id})` : "",
+            `Total results: 0`,
+          ].filter(Boolean),
           sources: [url],
-          limitations: ["Try alternative trait names or check EFO ontology terms at www.ebi.ac.uk/gwas."],
+          limitations: [
+            resolvedTrait
+              ? "The resolved ontology term has no curated associations; try a broader or related trait."
+              : "No matching GWAS Catalog trait term was found; try the EFO label (e.g. 'obesity disorder').",
+          ],
         }) }],
       };
     }
@@ -16863,7 +17048,7 @@ server.registerTool(
       const snps = (a.snp_allele || []).map((s) => `${s.rs_id}(${s.effect_allele})`).join(", ");
       const genes = (a.mapped_genes || []).join(", ");
       const traits = (a.efo_traits || []).map((t) => t.efo_trait).join("; ");
-      const pval = a.p_value != null ? Number(a.p_value).toExponential(1) : "N/A";
+      const pval = formatGwasPValue(a.p_value);
       const or_val = a.or_value || "-";
       const beta = a.beta || "-";
       const ci = (a.ci_lower != null && a.ci_upper != null) ? `[${a.ci_lower}-${a.ci_upper}]` : "";
@@ -16878,6 +17063,7 @@ server.registerTool(
           summary: `Found ${totalElements.toLocaleString()} GWAS associations for "${cleanVariant || cleanTrait}" (showing top ${associations.length}).`,
           keyFields: [
             `Query: ${cleanVariant || cleanTrait}`,
+            ...(resolvedTrait ? [`Resolved trait: ${resolvedTrait.label} (${resolvedTrait.id}), including child traits`] : []),
             `Total associations: ${totalElements.toLocaleString()}`,
             `Showing: ${associations.length}`,
             ...rows,
@@ -16889,7 +17075,7 @@ server.registerTool(
               : `https://www.ebi.ac.uk/gwas/search?query=${encodeURIComponent(cleanTrait)}`,
           ],
           limitations: [
-            "Results sorted by default API ordering. For strongest associations, filter by p-value.",
+            "Results are ordered by p-value (strongest first); the list shows only the top rows.",
             "GWAS Catalog contains curated top associations from published GWAS only.",
           ],
         }),
@@ -17640,13 +17826,16 @@ server.registerTool(
       return { content: [{ type: "text", text: "Provide an rsID or genomic region for RegulomeDB lookup." }] };
     }
 
-    const summaryUrl = `${REGULOMEDB_BASE_URL}/regulome-summary/?regions=${encodeURIComponent(cleanQuery)}&genome=${encodeURIComponent(cleanGenome)}&maf=0&format=json`;
-    const searchUrl = `${REGULOMEDB_BASE_URL}/regulome-search/?regions=${encodeURIComponent(cleanQuery)}&genome=${encodeURIComponent(cleanGenome)}&maf=0&format=json`;
-
-    const [summaryData, searchData] = await Promise.all([
-      fetchJsonWithRetry(summaryUrl, { headers: { Accept: "application/json" }, retries: 1, timeoutMs: 20000, maxBackoffMs: 2500 }).catch(() => null),
-      fetchJsonWithRetry(searchUrl, { headers: { Accept: "application/json" }, retries: 1, timeoutMs: /^rs\d+$/i.test(cleanQuery) ? 20000 : 45000, maxBackoffMs: 2500 }).catch(() => null),
-    ]);
+    // RegulomeDB moved its JSON API to /api/search; one response carries both the score and the
+    // evidence rows. Request failures propagate so they are reported as errors, not as "no data".
+    const searchUrl = `${REGULOMEDB_BASE_URL}/api/search?regions=${encodeURIComponent(cleanQuery)}&genome=${encodeURIComponent(cleanGenome)}&format=json`;
+    const searchData = await fetchJsonWithRetry(searchUrl, {
+      headers: { Accept: "application/json" },
+      retries: 1,
+      timeoutMs: /^rs\d+$/i.test(cleanQuery) ? 30000 : 45000,
+      maxBackoffMs: 2500,
+    });
+    const summaryData = searchData;
 
     const regulomeScore = summaryData?.regulome_score || null;
     const ranking = normalizeWhitespace(regulomeScore?.ranking || "");
@@ -17664,8 +17853,8 @@ server.registerTool(
         content: [{ type: "text", text: renderStructuredResponse({
           summary: `No RegulomeDB summary could be recovered for ${cleanQuery}.`,
           keyFields: [`Query: ${cleanQuery}`, `Genome: ${cleanGenome}`],
-          sources: [summaryUrl, searchUrl],
-          limitations: ["The public RegulomeDB JSON endpoints may time out for large regions or unsupported queries."],
+          sources: [searchUrl],
+          limitations: ["The public RegulomeDB JSON endpoint may time out for large regions or unsupported queries."],
         }) }],
       };
     }
@@ -17685,7 +17874,7 @@ server.registerTool(
             variantIds.length > 0 ? `Variant IDs: ${variantIds.join(", ")}` : "",
             motifTargets.length > 0 ? `Unique motif targets: ${motifTargets.join(", ")}` : "",
           ].filter(Boolean),
-          sources: [summaryUrl, searchUrl],
+          sources: [searchUrl],
           limitations: [
             "Motif targets are counted as unique `target_label` values across RegulomeDB PWM and footprint rows in the public JSON search results.",
           ],
@@ -22847,7 +23036,8 @@ server.registerTool(
       const topics = Array.isArray(r?.topics) ? r.topics.slice(0, 4).join(", ") : "";
       const parts = [`  ${String(i + 1).padStart(3)}. ${name} — ${desc || "No description"} | stars: ${stars} | updated: ${updated} | archived: ${archived}`];
       if (topics) parts.push(`     Topics: ${topics}`);
-TEMP    });
+      return parts.join("\n");
+    });
 
     return {
       content: [{

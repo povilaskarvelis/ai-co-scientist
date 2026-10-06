@@ -7,9 +7,13 @@ set -euo pipefail
 # AI_CO_SCIENTIST_POSTGRES_DSN – existing Postgres connection string on the first durable deploy
 # ── Optional overrides ───────────────────────────────────────────────────────
 # REGION, SERVICE_NAME, REPO_NAME, IMAGE_NAME, USE_VERTEX_AI, GA4_MEASUREMENT_ID, CONCURRENCY, CPU,
-# MIN_INSTANCES, MAX_INSTANCES, SERVICE_ACCOUNT, AI_CO_SCIENTIST_SESSION_SECRET,
-# ALLOW_EPHEMERAL_STATE, RATE_LIMIT_TRUSTED_PROXY_HOPS, RATE_LIMIT_MAX_KEYS,
-# ADK_MAX_RETAINED_COMPLETED_RUNS, ADK_MAX_RETAINED_REPORTS
+# CPU_THROTTLING, MIN_INSTANCES, MAX_INSTANCES, SERVICE_ACCOUNT, AI_CO_SCIENTIST_SESSION_SECRET,
+# ALLOW_EPHEMERAL_STATE, RATE_LIMIT_TRUSTED_PROXY_HOPS, RATE_LIMIT_MAX_KEYS, RATE_LIMIT_QUERIES,
+# ADK_MAX_RETAINED_COMPLETED_RUNS, ADK_MAX_RETAINED_REPORTS, ADK_MAX_LLM_CALLS_PER_TURN,
+# ADK_NATIVE_MODEL, ADK_PLANNER_MODEL, ADK_SYNTHESIZER_MODEL, ADK_ROUTER_MODEL,
+# NCBI_API_KEY, GTOPDB_API_KEY (stored in Secret Manager)
+# Model, rate-limit and source-key settings fall back to adk-agent/.env, so the deployed
+# service runs the configuration that was tested locally.
 # ─────────────────────────────────────────────────────────────────────────────
 
 PROJECT_ID="${PROJECT_ID:-}"
@@ -21,6 +25,8 @@ USE_VERTEX_AI="${USE_VERTEX_AI:-}"
 GOOGLE_API_KEY="${GOOGLE_API_KEY:-}"
 BIOGRID_ACCESS_KEY="${BIOGRID_ACCESS_KEY:-}"
 BIOGRID_ORCS_ACCESS_KEY="${BIOGRID_ORCS_ACCESS_KEY:-}"
+NCBI_API_KEY="${NCBI_API_KEY:-}"
+GTOPDB_API_KEY="${GTOPDB_API_KEY:-}"
 AI_CO_SCIENTIST_POSTGRES_DSN="${AI_CO_SCIENTIST_POSTGRES_DSN:-}"
 POSTGRES_DSN="${POSTGRES_DSN:-}"
 DATABASE_URL="${DATABASE_URL:-}"
@@ -28,8 +34,13 @@ AI_CO_SCIENTIST_SESSION_SECRET="${AI_CO_SCIENTIST_SESSION_SECRET:-}"
 ALLOW_EPHEMERAL_STATE="${ALLOW_EPHEMERAL_STATE:-false}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-}"
 GA4_MEASUREMENT_ID="${GA4_MEASUREMENT_ID:-G-NTCXHW3B2G}"
-CONCURRENCY="${CONCURRENCY:-8}"
+# Each research run holds one streaming request for several minutes; the turn semaphore
+# (ADK_MAX_CONCURRENT_TURNS) is what bounds model work, so request slots can be generous.
+CONCURRENCY="${CONCURRENCY:-40}"
 CPU="${CPU:-2}"
+# Runs continue on a background event loop after a visitor's stream drops. With request-based
+# CPU (CPU_THROTTLING=true) such runs are starved and can be lost when the instance scales in.
+CPU_THROTTLING="${CPU_THROTTLING:-false}"
 MIN_INSTANCES="${MIN_INSTANCES:-0}"
 MAX_INSTANCES="${MAX_INSTANCES:-1}"
 # Google ingress appends the client followed by its proxy address to X-Forwarded-For.
@@ -70,6 +81,12 @@ load_env_var_from_file() {
 load_env_var_from_file "GOOGLE_API_KEY" "${ENV_FILE}"
 load_env_var_from_file "BIOGRID_ACCESS_KEY" "${ENV_FILE}"
 load_env_var_from_file "BIOGRID_ORCS_ACCESS_KEY" "${ENV_FILE}"
+load_env_var_from_file "NCBI_API_KEY" "${ENV_FILE}"
+load_env_var_from_file "GTOPDB_API_KEY" "${ENV_FILE}"
+for tuned_var in ADK_NATIVE_MODEL ADK_PLANNER_MODEL ADK_SYNTHESIZER_MODEL ADK_ROUTER_MODEL \
+  RATE_LIMIT_QUERIES ADK_MAX_LLM_CALLS_PER_TURN; do
+  load_env_var_from_file "${tuned_var}" "${ENV_FILE}"
+done
 load_env_var_from_file "AI_CO_SCIENTIST_POSTGRES_DSN" "${ENV_FILE}"
 load_env_var_from_file "POSTGRES_DSN" "${ENV_FILE}"
 load_env_var_from_file "DATABASE_URL" "${ENV_FILE}"
@@ -127,6 +144,8 @@ fi
 GOOGLE_SECRET_NAME="ai-co-scientist-api-key"
 BIOGRID_SECRET_NAME="ai-co-scientist-biogrid-access-key"
 BIOGRID_ORCS_SECRET_NAME="ai-co-scientist-biogrid-orcs-access-key"
+NCBI_SECRET_NAME="ai-co-scientist-ncbi-api-key"
+GTOPDB_SECRET_NAME="ai-co-scientist-gtopdb-api-key"
 POSTGRES_SECRET_NAME="ai-co-scientist-postgres-dsn"
 SESSION_SECRET_NAME="ai-co-scientist-session-secret"
 PROJECT_NUMBER=""
@@ -301,6 +320,14 @@ BIOGRID_ORCS_SECRET_VERSION=""
 if [[ -n "${BIOGRID_ORCS_ACCESS_KEY}" ]] || secret_has_enabled_version "${BIOGRID_ORCS_SECRET_NAME}"; then
   BIOGRID_ORCS_SECRET_VERSION="$(ensure_secret_value "${BIOGRID_ORCS_SECRET_NAME}" "${BIOGRID_ORCS_ACCESS_KEY}")"
 fi
+NCBI_SECRET_VERSION=""
+if [[ -n "${NCBI_API_KEY}" ]] || secret_has_enabled_version "${NCBI_SECRET_NAME}"; then
+  NCBI_SECRET_VERSION="$(ensure_secret_value "${NCBI_SECRET_NAME}" "${NCBI_API_KEY}")"
+fi
+GTOPDB_SECRET_VERSION=""
+if [[ -n "${GTOPDB_API_KEY}" ]] || secret_has_enabled_version "${GTOPDB_SECRET_NAME}"; then
+  GTOPDB_SECRET_VERSION="$(ensure_secret_value "${GTOPDB_SECRET_NAME}" "${GTOPDB_API_KEY}")"
+fi
 
 # ── Build ────────────────────────────────────────────────────────────────────
 
@@ -373,6 +400,27 @@ if [[ -n "${BIOGRID_ORCS_SECRET_VERSION}" ]]; then
   SECRET_MAPPINGS+=("BIOGRID_ORCS_ACCESS_KEY=${BIOGRID_ORCS_SECRET_NAME}:${BIOGRID_ORCS_SECRET_VERSION}")
 fi
 
+if [[ -n "${NCBI_SECRET_VERSION}" ]]; then
+  SECRET_MAPPINGS+=("NCBI_API_KEY=${NCBI_SECRET_NAME}:${NCBI_SECRET_VERSION}")
+fi
+
+if [[ -n "${GTOPDB_SECRET_VERSION}" ]]; then
+  SECRET_MAPPINGS+=("GTOPDB_API_KEY=${GTOPDB_SECRET_NAME}:${GTOPDB_SECRET_VERSION}")
+fi
+
+for tuned_var in ADK_NATIVE_MODEL ADK_PLANNER_MODEL ADK_SYNTHESIZER_MODEL ADK_ROUTER_MODEL \
+  RATE_LIMIT_QUERIES ADK_MAX_LLM_CALLS_PER_TURN; do
+  if [[ -n "${!tuned_var:-}" ]]; then
+    ENV_VAR_MAPPINGS+=("${tuned_var}=${!tuned_var}")
+  fi
+done
+
+if [[ "${CPU_THROTTLING}" == "true" ]]; then
+  CPU_ALLOCATION_FLAG="--cpu-throttling"
+else
+  CPU_ALLOCATION_FLAG="--no-cpu-throttling"
+fi
+
 DEPLOY_FLAGS=(
   --project "${PROJECT_ID}"
   --region "${REGION}"
@@ -386,7 +434,7 @@ DEPLOY_FLAGS=(
   --max-instances "${MAX_INSTANCES}"
   --concurrency "${CONCURRENCY}"
   --service-account "${RUNTIME_SERVICE_ACCOUNT}"
-  --cpu-throttling
+  "${CPU_ALLOCATION_FLAG}"
   --timeout 900
   --set-env-vars "^||^$(join_with '||' "${ENV_VAR_MAPPINGS[@]}")"
   --set-secrets "$(join_with ',' "${SECRET_MAPPINGS[@]}")"

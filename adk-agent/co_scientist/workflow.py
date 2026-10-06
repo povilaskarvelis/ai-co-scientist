@@ -26,8 +26,6 @@ import logging
 import os
 from pathlib import Path
 import re
-import random
-import time
 from typing import Any
 from typing import Mapping
 import urllib.parse
@@ -35,6 +33,7 @@ import urllib.request
 
 from google.adk.agents import LlmAgent, LoopAgent, SequentialAgent
 from google.adk.agents.callback_context import CallbackContext
+from google.adk.models.google_llm import Gemini
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.tools import McpToolset
@@ -314,6 +313,12 @@ KNOWN_MCP_TOOLS = [
     "search_zenodo_records",
     "get_zenodo_record",
 ]
+
+
+def _active_mcp_tools() -> list[str]:
+    """Known MCP tools minus those disabled because their upstream is unusable."""
+    disabled = tool_registry.disabled_tools()
+    return [name for name in KNOWN_MCP_TOOLS if name not in disabled]
 
 DEFAULT_TOOL_HINT_BY_DOMAIN = {
     "literature": "search_pubmed",
@@ -7935,7 +7940,9 @@ def _select_literature_ids_cited_in_body(ids: list[str], body_text: str, *, limi
             if len(selected) >= limit:
                 break
             continue
-        if not has_author_year_signal:
+        # Metadata is needed to match an alias (a DOI cited for a paper kept as its PMID) or an
+        # author-year citation; skip the lookup when the body has neither kind of signal.
+        if not has_author_year_signal and not direct_ids:
             continue
 
         meta = _fetch_reference_meta(normalized) or {}
@@ -7961,9 +7968,10 @@ def _select_literature_ids_cited_in_body(ids: list[str], body_text: str, *, limi
             if len(selected) >= limit:
                 break
 
-    # If the model emitted no usable citation markers, retain a small key-
-    # literature set so the existing fallback can cite representative papers.
-    return selected or ids[: min(3, limit)]
+    # Only literature the report body actually cites is listed. Evidence IDs mined from tool
+    # payloads (for example PMIDs attached to drug-gene interaction records) are often off-topic,
+    # so they must not be presented as supporting literature.
+    return selected
 
 
 def _collect_final_report_literature_ids(
@@ -8159,41 +8167,6 @@ def _collapse_duplicate_citation_mentions(text: str) -> str:
         updated = next_text
 
     return updated + refs_tail
-
-
-def _inject_key_literature_fallback(text: str, lit_ids: list[str], *, max_refs: int = 3) -> str:
-    """Insert a small cited literature block when references exist but the body has none."""
-    if not text or not lit_ids:
-        return text
-
-    refs_split = re.split(r"(?m)^#{2,3} References\b", text, maxsplit=1)
-    body = refs_split[0]
-    refs_tail = ("\n## References" + refs_split[1]) if len(refs_split) > 1 else ""
-
-    if re.search(r"\]\(#ref-\d+\)", body):
-        return text
-
-    citation_snippets = [
-        _format_apa_intext_citation(ref_number, eid)
-        for ref_number, eid in enumerate(lit_ids[:max_refs], start=1)
-    ]
-    citation_snippets = [snippet for snippet in citation_snippets if snippet]
-    if not citation_snippets:
-        return text
-
-    fallback_block = (
-        "### Key Literature\n\n"
-        f"Supporting literature includes {_human_join(citation_snippets)}.\n\n"
-    )
-
-    next_steps_match = re.search(r"(?m)^### Recommended Next Steps\b", body)
-    if next_steps_match:
-        insert_at = next_steps_match.start()
-        body = body[:insert_at].rstrip() + "\n\n" + fallback_block + body[insert_at:].lstrip()
-    else:
-        body = body.rstrip() + "\n\n" + fallback_block
-
-    return body + refs_tail
 
 
 def _expand_reference_only_body_lines(text: str, lit_ids: list[str]) -> str:
@@ -8738,18 +8711,6 @@ def _build_structured_limitations(
         else:
             items.append(f"Only {completed} of {total} planned steps completed before synthesis, so coverage is still partial.")
 
-    for step in task_state.get("steps", []):
-        tool_names = _dedupe_str_list(
-            [*list(step.get("tools_called", []) or []), step.get("tool_hint", "")],
-            limit=24,
-        )
-        for tool_name in tool_names:
-            contract = _tool_evidence_contract(tool_name)
-            items.extend(
-                f"Source scope ({_resolve_source_label(tool_name) or tool_name}): {limit_text}"
-                for limit_text in list(contract.get("interpretation_limits", []) or [])
-            )
-
     for conflict in list(claim_summary.get("mixed_evidence_claims", []) or [])[:3]:
         preferred = str(conflict.get("preferred_interpretation", "")).strip()
         subject = str(conflict.get("subject", "")).strip()
@@ -8797,9 +8758,10 @@ def _build_structured_next_actions(
             f"Resolve the mixed evidence for {focus} using an orthogonal source or confirmatory experiment."
         )
 
-    actions.extend(_fallback_next_actions_from_task_state(task_state))
     if model_next_actions:
         actions.extend(model_next_actions)
+    if len(actions) < 2:
+        actions.extend(_fallback_next_actions_from_task_state(task_state))
     return _dedupe_str_list(actions, limit=6)
 
 
@@ -8862,13 +8824,10 @@ def _fallback_next_actions_from_task_state(task_state: dict[str, Any]) -> list[s
             if low in seen_gaps:
                 continue
             seen_gaps.add(low)
-            actions.append(f"Address open gap: {gap_text}")
+            actions.append(f"Follow up: {gap_text}")
             if len(actions) >= 5:
                 return actions
 
-    if not actions:
-        actions.append("Review the compiled evidence for decision readiness and identify any confirmatory analyses worth running.")
-        actions.append("Document key assumptions and uncertainties before making a downstream decision or recommendation.")
     return actions[:5]
 
 
@@ -8960,7 +8919,6 @@ def _render_final_synthesis_markdown(task_state: dict[str, Any], synthesis: dict
     body_so_far = _hyperlink_inline_ids(body_so_far, ref_map)
     body_so_far = _hyperlink_author_year_citations(body_so_far, lit_ids)
     body_so_far = _collapse_duplicate_citation_mentions(body_so_far)
-    body_so_far = _inject_key_literature_fallback(body_so_far, lit_ids)
     body_so_far = _expand_reference_only_body_lines(body_so_far, lit_ids)
     lines = body_so_far.split("\n")
 
@@ -9018,7 +8976,7 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
     goal_text = str(active_step.get("goal", "") or "")
     focused_tools = _resolve_step_tool_allowlist(
         active_step,
-        available_tools=KNOWN_MCP_TOOLS,
+        available_tools=_active_mcp_tools(),
     )
 
     focused_catalog = _format_tool_catalog(focused_tools)
@@ -9705,7 +9663,24 @@ RATE_LIMIT_AUTO_RETRY = os.environ.get(
     "ADK_RATE_LIMIT_AUTO_RETRY", "true"
 ).strip().lower() not in {"0", "false", "no", "off"}
 
-STATE_RATE_LIMIT_RETRY_COUNT = "temp:co_scientist_rate_limit_retry_count"
+RETRYABLE_MODEL_HTTP_STATUS_CODES = [408, 429, 500, 502, 503, 504]
+
+
+def _gemini_model(model_name: str) -> Gemini:
+    """Gemini handle that retries 429/5xx responses with backoff inside the async client.
+
+    All conversations share one event loop, so retries must never block it: a capacity spike
+    should delay only the affected call, not every visitor's run.
+    """
+    return Gemini(
+        model=model_name,
+        retry_options=types.HttpRetryOptions(
+            attempts=(RATE_LIMIT_MAX_RETRIES + 1) if RATE_LIMIT_AUTO_RETRY else 1,
+            initial_delay=float(RATE_LIMIT_BACKOFF_BASE),
+            max_delay=float(RATE_LIMIT_BACKOFF_MAX),
+            http_status_codes=RETRYABLE_MODEL_HTTP_STATUS_CODES,
+        ),
+    )
 
 
 def _using_vertex_ai_backend() -> bool:
@@ -9721,15 +9696,21 @@ def _clear_model_error_stream_state(callback_context: CallbackContext) -> None:
 
 
 def _render_rate_limit_error_markdown(*, backend_label: str, error_msg: str) -> str:
+    lowered = error_msg.lower()
+    daily_quota = "perday" in lowered or "per day" in lowered or "daily" in lowered
     if _using_vertex_ai_backend():
         guidance = (
             "Please try again later, increase the available Vertex AI quota, "
             "or redeploy with `USE_VERTEX_AI=false` to use the configured API-key backend."
         )
+    elif daily_quota:
+        guidance = (
+            "Please try again later. The daily Google AI Studio quota for this key is used up "
+            "and resets once a day."
+        )
     else:
         guidance = (
-            "Please try again later. Google AI Studio quota windows can take hours "
-            "to reset before another run will succeed."
+            "Please try again later. Per-minute limits usually clear within a minute or two."
         )
     return (
         "## Rate Limited\n\n"
@@ -9745,57 +9726,31 @@ def _on_model_error(
     llm_request: LlmRequest,
     error: Exception,
 ) -> LlmResponse | None:
-    """Handle model-level errors with exponential backoff for rate limits."""
+    """Turn a model error that survived client-side retries into a clear, terminal message.
+
+    Transient 429/5xx responses are retried with backoff inside the async genai client (see
+    ``_gemini_model``). An error that reaches this callback has exhausted those retries, so the
+    turn stops here instead of re-running the current plan step on every remaining loop iteration.
+    """
     error_type = type(error).__name__
     error_msg = str(error)
     logger.error("Model error in %s: [%s] %s", "agent", error_type, error_msg)
 
     callback_context.state[STATE_MODEL_ERROR_PASSTHROUGH] = True
+    callback_context.state[STATE_TURN_ABORT_REASON] = "model_error"
+    _clear_model_error_stream_state(callback_context)
 
     lowered_error = error_msg.lower()
-    is_quota_rate_limit = any(
-        hint in lowered_error
-        for hint in ("429", "resource exhausted", "rate limit", "quota")
-    )
-    is_retryable_backend_outage = any(
-        hint in lowered_error
-        for hint in ("503", "unavailable")
-    ) and not is_quota_rate_limit
-    if is_quota_rate_limit or is_retryable_backend_outage:
-        backend_label = "Vertex AI" if _using_vertex_ai_backend() else "Google AI Studio"
-        retry_count = int(callback_context.state.get(STATE_RATE_LIMIT_RETRY_COUNT, 0))
-
-        if is_quota_rate_limit:
-            callback_context.state[STATE_RATE_LIMIT_RETRY_COUNT] = 0
-            _clear_model_error_stream_state(callback_context)
-            user_msg = _render_rate_limit_error_markdown(
-                backend_label=backend_label,
-                error_msg=error_msg,
-            )
-        elif RATE_LIMIT_AUTO_RETRY and retry_count < RATE_LIMIT_MAX_RETRIES:
-            callback_context.state[STATE_RATE_LIMIT_RETRY_COUNT] = retry_count + 1
-            backoff = min(RATE_LIMIT_BACKOFF_BASE * (2 ** retry_count) + random.uniform(0, RATE_LIMIT_BACKOFF_BASE), RATE_LIMIT_BACKOFF_MAX)
-            logger.info(
-                "Temporary backend outage from %s — retry %d/%d, backing off %.1fs",
-                backend_label, retry_count + 1, RATE_LIMIT_MAX_RETRIES, backoff,
-            )
-            time.sleep(backoff)
-            user_msg = (
-                f"_Temporary model outage from {backend_label} — retry {retry_count + 1}/{RATE_LIMIT_MAX_RETRIES}, waited {backoff:.0f}s…_"
-            )
-        else:
-            callback_context.state[STATE_RATE_LIMIT_RETRY_COUNT] = 0
-            reason = (
-                f"Retries exhausted ({RATE_LIMIT_MAX_RETRIES})"
-                if retry_count >= RATE_LIMIT_MAX_RETRIES
-                else "Auto-retry disabled"
-            )
-            user_msg = (
-                "## Execution Error\n\n"
-                f"{backend_label} is temporarily unavailable. {reason}.\n\n"
-                f"`{error_msg[:300]}`\n\n"
-                "Please try again later."
-            )
+    backend_label = "Vertex AI" if _using_vertex_ai_backend() else "Google AI Studio"
+    if any(hint in lowered_error for hint in ("429", "resource exhausted", "resource_exhausted", "rate limit", "quota")):
+        user_msg = _render_rate_limit_error_markdown(backend_label=backend_label, error_msg=error_msg)
+    elif any(hint in lowered_error for hint in ("503", "unavailable", "overloaded", "high demand")):
+        user_msg = (
+            "## Execution Error\n\n"
+            f"{backend_label} is temporarily overloaded and did not recover after automatic retries.\n\n"
+            "Please try again in a few minutes.\n\n"
+            f"`{error_msg[:300]}`"
+        )
     else:
         user_msg = (
             f"## Execution Error\n\n"
@@ -11466,16 +11421,17 @@ def _resolve_step_tools(domains: list[str] | None, *, available_tools: set[str] 
     that don't yet include domain tags).
     """
     if not domains:
-        return list(KNOWN_MCP_TOOLS)
+        return _active_mcp_tools()
 
     target_domains = set(domains) | tool_registry.ALWAYS_AVAILABLE_DOMAINS
+    disabled = tool_registry.disabled_tools()
     seen: set[str] = set()
     tools: list[str] = []
     for domain in tool_registry.ALL_DOMAIN_NAMES:
         if domain not in target_domains:
             continue
         for tool in tool_registry.TOOL_DOMAINS.get(domain, []):
-            if tool in seen:
+            if tool in seen or tool in disabled:
                 continue
             if available_tools is not None and tool not in available_tools:
                 continue
@@ -11490,7 +11446,7 @@ def _resolve_step_tool_allowlist(
     available_tools: list[str] | None = None,
 ) -> list[str]:
     """Return the narrowed MCP tool list for a single active step."""
-    available = _dedupe_str_list(list(available_tools) if available_tools else KNOWN_MCP_TOOLS, limit=120)
+    available = _dedupe_str_list(list(available_tools) if available_tools else _active_mcp_tools(), limit=120)
     available_set = set(available)
 
     step_domains = active_step.get("domains") or []
@@ -11603,8 +11559,9 @@ def _build_benchmark_loop_instruction(tool_hints: list[str]) -> str:
 
 def _format_domain_catalog() -> str:
     lines = []
+    disabled = tool_registry.disabled_tools()
     for domain in tool_registry.ALL_DOMAIN_NAMES:
-        tools = tool_registry.TOOL_DOMAINS.get(domain, [])
+        tools = [tool for tool in tool_registry.TOOL_DOMAINS.get(domain, []) if tool not in disabled]
         tool_names = ", ".join(f"`{tool}`" for tool in tools)
         always = " (always included)" if domain in tool_registry.ALWAYS_AVAILABLE_DOMAINS else ""
         lines.append(f"- {domain}{always}: {tool_names}")
@@ -11921,7 +11878,7 @@ def create_workflow_agent(
         else bool(report_assistant_skills_enabled)
     )
 
-    base_tool_hints = _dedupe_str_list(KNOWN_MCP_TOOLS if tool_filter is None else tool_filter, limit=120)
+    base_tool_hints = _dedupe_str_list(_active_mcp_tools() if tool_filter is None else tool_filter, limit=120)
     if benchmark_mode:
         benchmark_mcp_toolset = create_mcp_toolset(tool_filter=base_tool_hints)
         benchmark_tools: list[Any] = []
@@ -11937,7 +11894,7 @@ def create_workflow_agent(
                 "Loop-based benchmark execution profile for direct biomedical "
                 "database question answering with retry/recovery behavior."
             ),
-            model=runtime_model,
+            model=_gemini_model(runtime_model),
             instruction=_build_benchmark_loop_instruction(base_tool_hints),
             tools=benchmark_tools,
             include_contents="none",
@@ -11998,7 +11955,7 @@ def create_workflow_agent(
 
     planner = LlmAgent(
         name="planner",
-        model=planner_model,
+        model=_gemini_model(planner_model),
         instruction=_build_planner_instruction(
             executor_tool_hints,
             prefer_bigquery=use_bigquery_priority,
@@ -12017,7 +11974,7 @@ def create_workflow_agent(
     )
     step_executor = LlmAgent(
         name="step_executor",
-        model=runtime_model,
+        model=_gemini_model(runtime_model),
         instruction=_build_step_executor_instruction(
             executor_tool_hints,
             prefer_bigquery=use_bigquery_priority,
@@ -12038,7 +11995,7 @@ def create_workflow_agent(
     )
     report_synthesizer = LlmAgent(
         name="report_synthesizer",
-        model=synthesizer_model,
+        model=_gemini_model(synthesizer_model),
         instruction=SYNTHESIZER_INSTRUCTION,
         tools=[],
         include_contents="none",
@@ -12067,7 +12024,7 @@ def create_workflow_agent(
             "Answers factual biomedical questions directly from knowledge. "
             "No database lookups or tool calls needed."
         ),
-        model=runtime_model,
+        model=_gemini_model(runtime_model),
         instruction=GENERAL_QA_INSTRUCTION,
         tools=[],
         disallow_transfer_to_parent=True,
@@ -12080,7 +12037,7 @@ def create_workflow_agent(
             "Asks the user to clarify vague, ambiguous, incomplete, or "
             "nonsensical queries before proceeding."
         ),
-        model=runtime_model,
+        model=_gemini_model(runtime_model),
         instruction=CLARIFIER_INSTRUCTION,
         tools=[],
         disallow_transfer_to_parent=True,
@@ -12095,7 +12052,7 @@ def create_workflow_agent(
             "lookups using biomedical tools. Only available after a report "
             "has been produced."
         ),
-        model=runtime_model,
+        model=_gemini_model(runtime_model),
         instruction=REPORT_ASSISTANT_INSTRUCTION,
         tools=report_assistant_tools,
         disallow_transfer_to_parent=True,
@@ -12110,7 +12067,7 @@ def create_workflow_agent(
     router = LlmAgent(
         name="co_scientist_router",
         description="AI Co-Scientist: biomedical research assistant with intent routing.",
-        model=router_model,
+        model=_gemini_model(router_model),
         instruction=ROUTER_INSTRUCTION,
         sub_agents=[general_qa, clarifier, report_assistant, research_workflow],
         before_model_callback=_router_before_model_callback,

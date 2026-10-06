@@ -7,7 +7,42 @@ dicts scattered through ``workflow.py``.
 
 from __future__ import annotations
 
+import os
 from typing import Any
+
+
+# Tools whose upstream is unusable today (verified October 2026). They stay registered in the MCP
+# server but are hidden from the planner and executors, so plans route to working sources and
+# reports do not cite a dead source as "no data". ADK_DISABLED_TOOLS adds names (comma-separated);
+# ADK_REENABLE_TOOLS removes names from this default set once an upstream works again.
+DEFAULT_DISABLED_TOOLS: dict[str, str] = {
+    "get_biogrid_interactions": "BioGRID webservice rejects the configured access key (HTTP 401).",
+    "get_screen_nearest_ccre_assay": "SCREEN API rejects server-side requests (HTTP 403).",
+    "get_screen_ccre_top_celltype_assay": "SCREEN API rejects server-side requests (HTTP 403).",
+    "get_depmap_gene_dependency": "depmap.org serves a bot-challenge page to scripted clients.",
+    "get_depmap_expression_subset_mean": "depmap.org serves a bot-challenge page to scripted clients.",
+    "get_depmap_sample_top_expression_gene": "depmap.org serves a bot-challenge page to scripted clients.",
+    "get_open_targets_l2g": "Release files were renamed (HTTP 404); a cold lookup downloads about 2 GB.",
+    "query_neurobagel_cohorts": "The public Neurobagel /query endpoint was removed (HTTP 404).",
+    "get_geo_cell_type_proportions": "Downloads whole GEO RAW archives and exceeds the 90 s tool timeout.",
+}
+
+# Guide to Pharmacology web services require a registered API key.
+GTOPDB_KEY_REQUIRED_TOOLS = ("get_guidetopharmacology_target", "get_gtopdb_ligand_reference")
+
+
+def _env_tool_names(name: str) -> set[str]:
+    return {item.strip() for item in os.environ.get(name, "").split(",") if item.strip()}
+
+
+def disabled_tools() -> frozenset[str]:
+    """Tool names that agents must not see in this environment."""
+    disabled = (set(DEFAULT_DISABLED_TOOLS) - _env_tool_names("ADK_REENABLE_TOOLS")) | _env_tool_names(
+        "ADK_DISABLED_TOOLS"
+    )
+    if not os.environ.get("GTOPDB_API_KEY", "").strip():
+        disabled.update(GTOPDB_KEY_REQUIRED_TOOLS)
+    return frozenset(disabled)
 
 
 TOOL_DOMAINS: dict[str, list[str]] = {
@@ -950,11 +985,13 @@ def iter_active_source_precedence_rules(tool_hints: list[str]) -> list[dict[str,
 __all__ = [
     "ALL_DOMAIN_NAMES",
     "ALWAYS_AVAILABLE_DOMAINS",
+    "DEFAULT_DISABLED_TOOLS",
     "SOURCE_PRECEDENCE_RULES",
     "TOOL_DESCRIPTIONS",
     "TOOL_DOMAINS",
     "TOOL_ROUTING_METADATA",
     "TOOL_SOURCE_NAMES",
     "TOOL_TO_DOMAINS",
+    "disabled_tools",
     "iter_active_source_precedence_rules",
 ]

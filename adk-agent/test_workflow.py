@@ -15,6 +15,9 @@ import co_scientist.workflow as workflow
 from co_scientist.skill_loader import load_planner_skill_frontmatters
 from co_scientist.workflow import create_workflow_agent
 
+# Resolve repository files relative to this module so the tests pass from any working directory.
+ADK_AGENT_DIR = Path(__file__).resolve().parent
+
 
 def test_native_workflow_graph_shape():
     root_agent, mcp_tools = create_workflow_agent(tool_filter=[])
@@ -38,7 +41,7 @@ def test_native_workflow_graph_shape():
 
     planner_agent = research_workflow.sub_agents[0]
     assert isinstance(planner_agent, LlmAgent)
-    assert planner_agent.model == workflow.PLANNER_MODEL
+    assert planner_agent.model.model == workflow.PLANNER_MODEL
     assert len(planner_agent.tools) == 1
     assert isinstance(planner_agent.tools[0], SkillToolset)
     assert planner_agent.before_model_callback is not None
@@ -51,7 +54,9 @@ def test_native_workflow_graph_shape():
 
     step_executor = react_loop.sub_agents[0]
     assert isinstance(step_executor, LlmAgent)
-    assert step_executor.model == workflow.DEFAULT_MODEL
+    assert step_executor.model.model == workflow.DEFAULT_MODEL
+    assert step_executor.model.retry_options.attempts == workflow.RATE_LIMIT_MAX_RETRIES + 1
+    assert 503 in step_executor.model.retry_options.http_status_codes
     assert len(step_executor.tools) == 1
     assert isinstance(step_executor.tools[0], SkillToolset)
     assert step_executor.include_contents == "none"
@@ -60,7 +65,7 @@ def test_native_workflow_graph_shape():
 
     report_agent = research_workflow.sub_agents[2]
     assert isinstance(report_agent, LlmAgent)
-    assert report_agent.model == workflow.SYNTHESIZER_MODEL
+    assert report_agent.model.model == workflow.SYNTHESIZER_MODEL
     assert report_agent.include_contents == "none"
     assert report_agent.before_model_callback is not None
     assert report_agent.after_model_callback is not None
@@ -2396,8 +2401,8 @@ def test_step_executor_instruction_limits_fallbacks_by_evidence_type():
 
 def test_bigquery_executor_policy_is_a_pointer_to_skill_playbook():
     policy = workflow.BQ_EXECUTOR_POLICY
-    playbook = Path(
-        "adk-agent/co_scientist/skills/structured-data-execution/references/bigquery-execution-playbook.md"
+    playbook = (
+        ADK_AGENT_DIR / "co_scientist/skills/structured-data-execution/references/bigquery-execution-playbook.md"
     ).read_text(encoding="utf-8")
 
     assert "structured-data-execution" in policy
@@ -2630,8 +2635,8 @@ def test_planner_groups_named_comparison_items_by_shared_source():
     assert "never insert a universal shortlist size" in instruction
     assert "top 5" not in instruction.lower()
 
-    comparison_skill = Path(
-        "adk-agent/co_scientist/skills/comparative-assessment-planning/SKILL.md"
+    comparison_skill = (
+        ADK_AGENT_DIR / "co_scientist/skills/comparative-assessment-planning/SKILL.md"
     ).read_text(encoding="utf-8")
     assert "Apply each evidence step across all compared entities" in comparison_skill
     assert "do not add a synthesis-only plan step" in comparison_skill
@@ -3427,11 +3432,6 @@ def test_on_model_error_surfaces_vertex_rate_limit_without_hidden_retry(monkeypa
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
     monkeypatch.setattr(workflow, "RATE_LIMIT_AUTO_RETRY", False)
 
-    def fail_sleep(_: int) -> None:
-        raise AssertionError("time.sleep should not be called when auto-retry is disabled")
-
-    monkeypatch.setattr(workflow.time, "sleep", fail_sleep)
-
     response = workflow._on_model_error(
         callback_context=callback_context,
         llm_request=None,
@@ -3444,6 +3444,7 @@ def test_on_model_error_surfaces_vertex_rate_limit_without_hidden_retry(monkeypa
     assert "Please try again later" in text
     assert "USE_VERTEX_AI=false" in text
     assert callback_context.state[workflow.STATE_MODEL_ERROR_PASSTHROUGH] is True
+    assert callback_context.state[workflow.STATE_TURN_ABORT_REASON] == "model_error"
 
 
 def test_on_model_error_surfaces_ai_studio_rate_limit_and_clears_partial_buffers(monkeypatch):
@@ -3459,11 +3460,6 @@ def test_on_model_error_surfaces_ai_studio_rate_limit_and_clears_partial_buffers
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "false")
     monkeypatch.setattr(workflow, "RATE_LIMIT_AUTO_RETRY", True)
 
-    def fail_sleep(_: int) -> None:
-        raise AssertionError("time.sleep should not be called for terminal 429 handling")
-
-    monkeypatch.setattr(workflow.time, "sleep", fail_sleep)
-
     response = workflow._on_model_error(
         callback_context=callback_context,
         llm_request=None,
@@ -3477,7 +3473,48 @@ def test_on_model_error_surfaces_ai_studio_rate_limit_and_clears_partial_buffers
     assert callback_context.state[workflow.STATE_EXECUTOR_BUFFER] == ""
     assert callback_context.state[workflow.STATE_EXECUTOR_REASONING_TRACE] == ""
     assert callback_context.state[workflow.STATE_SYNTH_BUFFER] == ""
-    assert callback_context.state[workflow.STATE_RATE_LIMIT_RETRY_COUNT] == 0
+    assert callback_context.state[workflow.STATE_TURN_ABORT_REASON] == "model_error"
+    assert "within a minute or two" in text
+
+
+def test_on_model_error_reports_daily_quota_separately(monkeypatch):
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {}
+
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "false")
+    response = workflow._on_model_error(
+        callback_context=DummyCallbackContext(),
+        llm_request=None,
+        error=RuntimeError("429 RESOURCE_EXHAUSTED: GenerateRequestsPerDayPerProjectPerModel"),
+    )
+
+    assert "daily Google AI Studio quota" in workflow._llm_response_text(response)
+
+
+def test_on_model_error_stops_the_turn_on_backend_overload_without_blocking(monkeypatch):
+    # Retries for 429/5xx happen inside the async genai client; the callback must neither sleep
+    # (the event loop is shared by every visitor) nor emit a "retry 1/5" placeholder.
+    class DummyCallbackContext:
+        def __init__(self) -> None:
+            self.state = {workflow.STATE_EXECUTOR_BUFFER: "partial"}
+
+    callback_context = DummyCallbackContext()
+    monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "false")
+
+    response = workflow._on_model_error(
+        callback_context=callback_context,
+        llm_request=None,
+        error=RuntimeError("503 UNAVAILABLE. This model is currently experiencing high demand."),
+    )
+
+    text = workflow._llm_response_text(response)
+    assert text.startswith("## Execution Error")
+    assert "temporarily overloaded" in text
+    assert "retry 1/" not in text
+    assert callback_context.state[workflow.STATE_TURN_ABORT_REASON] == "model_error"
+    assert callback_context.state[workflow.STATE_EXECUTOR_BUFFER] == ""
+    assert not hasattr(workflow, "time")
 
 
 def test_postprocess_synth_markdown_renders_structured_sections_from_claims():
@@ -3973,7 +4010,10 @@ MyGene.info confirmed LRRK2 maps to Entrez ID 120892.
 
     final_markdown = workflow._postprocess_synth_markdown(task_state, raw_markdown)
 
-    assert "Recommended Next Steps" in final_markdown
+    # With no open gaps and no model suggestions there is nothing specific to recommend, so the
+    # report omits the section instead of padding it with template advice.
+    assert "Recommended Next Steps" not in final_markdown
+    assert "decision readiness" not in final_markdown
     assert "## Evidence Breakdown" in final_markdown
     assert "## Evidence and Methodology" not in final_markdown
 
@@ -4423,7 +4463,7 @@ def test_collect_final_report_literature_ids_dedupes_pmid_doi_aliases(monkeypatc
     ids = workflow._collect_final_report_literature_ids(
         task_state,
         {"model_references_text": "", "claim_synthesis_summary": {}},
-        "",
+        "Kinase activity rises in carriers (DOI:10.1000/example).",
     )
 
     assert ids == ["PMID:12345678"]
@@ -4464,7 +4504,7 @@ def test_synthesis_constraints_come_from_source_evidence_contracts():
     assert any("Frequency or prevalence requires a cohort denominator" in item for item in mutation_constraints)
 
 
-def test_final_synthesis_adds_contract_limitations_without_rewriting_prose():
+def test_final_synthesis_keeps_prose_and_leaves_contract_rules_to_the_synthesizer():
     task_state = {
         "objective": "Compare two molecular contexts",
         "plan_status": "completed",
@@ -4495,8 +4535,11 @@ def test_final_synthesis_adds_contract_limitations_without_rewriting_prose():
     synthesis = workflow._build_structured_final_synthesis(task_state, raw)
 
     assert synthesis["model_findings_text"].endswith("Registry records and absolute mutation counts were returned.")
-    assert any("posted outcomes" in item for item in synthesis["limitations"])
-    assert any("cohort denominator" in item for item in synthesis["limitations"])
+    # Tool interpretation rules are written as instructions for the synthesizer (they reach it as
+    # interpretation_constraints); they are not appended verbatim to reader-facing limitations.
+    assert not any("Source scope" in item for item in synthesis["limitations"])
+    constraints = workflow._synthesis_step_interpretation_constraints(task_state["steps"][0])
+    assert any("posted" in item for item in constraints)
 
 
 def test_generic_search_contract_covers_retrieval_counts_and_absence():
@@ -4593,11 +4636,13 @@ def test_build_deterministic_step_result_marks_blocked_steps_as_partial_when_suc
     assert "Error in run_bigquery_select_query" in result["result_summary"]
 
 
-def test_render_final_synthesis_markdown_injects_key_literature_when_body_has_no_citations(monkeypatch):
+def test_render_final_synthesis_markdown_does_not_present_uncited_evidence_ids_as_literature(monkeypatch):
+    # Evidence IDs mined from tool payloads (for example PMIDs attached to DGIdb interaction
+    # records) are often off-topic; a body that cites nothing must not grow a literature list.
     monkeypatch.setattr(
         workflow,
         "_fetch_reference_meta",
-        lambda eid: {"authors": ["Ng X. Y.", "Cao M."], "year": "2024", "title": "Example paper"},
+        lambda eid: {"authors": ["Ng X. Y.", "Cao M."], "year": "2004", "title": "Unrelated prostate paper"},
     )
 
     task_state = {"objective": "Assess LRRK2 evidence", "steps": [{"evidence_ids": ["PMID:12345678"]}]}
@@ -4612,9 +4657,66 @@ def test_render_final_synthesis_markdown_injects_key_literature_when_body_has_no
 
     rendered = workflow._render_final_synthesis_markdown(task_state, synthesis)
 
-    assert "### Key Literature" in rendered
-    assert "[Ng & Cao, 2024](#ref-1)" in rendered
+    assert "Key Literature" not in rendered
+    assert "Supporting literature includes" not in rendered
+    assert "## References" not in rendered
+    assert "Ng & Cao" not in rendered
+
+
+def test_render_final_synthesis_markdown_lists_references_the_body_cites(monkeypatch):
+    monkeypatch.setattr(
+        workflow,
+        "_fetch_reference_meta",
+        lambda eid: {"authors": ["Ng X. Y.", "Cao M."], "year": "2024", "title": "Example paper"},
+    )
+
+    task_state = {"objective": "Assess LRRK2 evidence", "steps": [{"evidence_ids": ["PMID:12345678"]}]}
+    synthesis = {
+        "answer": "LRRK2 kinase activity is elevated in carriers (PMID:12345678).",
+        "model_findings_text": "Mechanistic and preclinical evidence support target relevance.",
+        "model_references_text": "",
+        "claim_synthesis_summary": {},
+        "limitations": [],
+        "next_actions": [],
+    }
+
+    rendered = workflow._render_final_synthesis_markdown(task_state, synthesis)
+
     assert "## References" in rendered
+    assert "(#ref-1)" in rendered
+
+
+def test_structured_limitations_do_not_include_internal_tool_rules():
+    task_state = {
+        "steps": [
+            {"id": "S1", "status": "completed", "tool_hint": "search_gwas_associations",
+             "tools_called": ["search_gwas_associations"], "open_gaps": []},
+        ],
+    }
+
+    limitations = workflow._build_structured_limitations(task_state, {}, ["Model-stated limitation."])
+
+    assert limitations == ["Model-stated limitation."]
+    assert not any("Source scope" in item for item in limitations)
+
+
+def test_structured_next_actions_prefer_model_suggestions_over_templates():
+    task_state = {
+        "plan_status": "completed",
+        "steps": [{"id": "S1", "status": "completed", "open_gaps": ["No posted results for NCT01234567."]}],
+    }
+
+    actions = workflow._build_structured_next_actions(
+        task_state,
+        {},
+        ["Query DailyMed for the tofacitinib boxed warning.", "Compare MACE rates in ORAL Surveillance."],
+    )
+
+    assert actions == [
+        "Query DailyMed for the tofacitinib boxed warning.",
+        "Compare MACE rates in ORAL Surveillance.",
+    ]
+    assert workflow._fallback_next_actions_from_task_state({"plan_status": "completed", "steps": []}) == []
 
 
 def test_report_assistant_before_model_callback_includes_legacy_lookup_provenance_for_expansion_requests():
@@ -4743,7 +4845,7 @@ def test_router_before_model_callback_forces_research_workflow_for_scoped_safety
 
 
 def test_router_before_model_callback_forces_research_workflow_for_all_landing_page_example_queries():
-    ui_html = Path("adk-agent/ui/index.html").read_text(encoding="utf-8")
+    ui_html = (ADK_AGENT_DIR / "ui/index.html").read_text(encoding="utf-8")
     queries = [
         html.unescape(match)
         for match in re.findall(r'data-query="([^"]+)"', ui_html)
@@ -4770,7 +4872,7 @@ def test_router_before_model_callback_forces_research_workflow_for_all_landing_p
 
 
 def test_pending_query_ui_stays_in_planning_state_until_plan_is_ready():
-    app_js = Path("adk-agent/ui/app.js").read_text(encoding="utf-8")
+    app_js = (ADK_AGENT_DIR / "ui/app.js").read_text(encoding="utf-8")
 
     assert 'return state.pendingUserMessage ? "Planning\\u2026" : "";' in app_js
     assert "hasResearchProgress" not in app_js
@@ -4779,7 +4881,7 @@ def test_pending_query_ui_stays_in_planning_state_until_plan_is_ready():
 
 
 def test_live_activity_updates_do_not_rebuild_the_entire_message_timeline():
-    app_js = Path("adk-agent/ui/app.js").read_text(encoding="utf-8")
+    app_js = (ADK_AGENT_DIR / "ui/app.js").read_text(encoding="utf-8")
 
     assert "calculatePreservedScrollTop" in app_js
     assert "nextScrollHeight: detailsEl.scrollHeight" in app_js

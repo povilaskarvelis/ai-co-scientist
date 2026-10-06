@@ -311,3 +311,32 @@ def test_iter_active_source_precedence_rules_include_depmap_expression_subset_to
     )
     topics = [rule["topic"] for rule in active]
     assert "Functional screening vs drug response" in topics
+
+
+def test_dead_upstream_tools_are_hidden_from_agents_by_default(monkeypatch):
+    from co_scientist import tool_registry, workflow
+
+    for name in ("ADK_DISABLED_TOOLS", "ADK_REENABLE_TOOLS", "GTOPDB_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+    disabled = tool_registry.disabled_tools()
+    assert "get_screen_nearest_ccre_assay" in disabled
+    assert "get_guidetopharmacology_target" in disabled  # needs GTOPDB_API_KEY
+    active = workflow._active_mcp_tools()
+    assert "get_screen_nearest_ccre_assay" not in active
+    assert "search_pubmed" in active
+    assert "`get_screen_nearest_ccre_assay`" not in workflow._format_domain_catalog()
+
+
+def test_disabled_tool_set_honours_environment_overrides(monkeypatch):
+    from co_scientist import tool_registry
+
+    monkeypatch.setenv("GTOPDB_API_KEY", "test-key-value")
+    monkeypatch.setenv("ADK_REENABLE_TOOLS", "get_biogrid_interactions")
+    monkeypatch.setenv("ADK_DISABLED_TOOLS", "search_iedb_epitope_evidence")
+
+    disabled = tool_registry.disabled_tools()
+    assert "get_guidetopharmacology_target" not in disabled
+    assert "get_biogrid_interactions" not in disabled
+    assert "search_iedb_epitope_evidence" in disabled
+    assert "get_screen_nearest_ccre_assay" in disabled

@@ -1,16 +1,26 @@
 .git
 .gitignore
-.DS_Store
+.github
+**/.DS_Store
 .pytest_cache
+.ruff_cache
 .venv
 **/.venv
 **/__pycache__
 **/*.pyc
 **/.pytest_cache
+**/.ruff_cache
+# Local ADK session databases (they contain past conversations) must never ship in the image.
+**/.adk
 adk-agent/.env
-adk-agent/.adk
 adk-agent/reports
 adk-agent/state
 adk-agent/state/**
-node_modules
-research-mcp/node_modules
+adk-agent/co_scientist_analysis
+# The image installs its own Node dependencies with `npm ci`.
+**/node_modules
+# Not used by the web service.
+packages
+examples
+tmp
+*.png

@@ -1,3 +1,8 @@
+// The raw workflow-state debug panel is a developer tool; show it only with ?debug=1.
+const DEBUG_UI_ENABLED = new URLSearchParams(window.location.search).has("debug");
+const TERMINAL_RUN_STATES = new Set(["completed", "failed", "awaiting_hitl", "needs_clarification"]);
+const MAX_CONSECUTIVE_POLL_FAILURES = 5;
+
 const state = {
   conversations: [],
   selectedConversationId: null,
@@ -9,6 +14,7 @@ const state = {
   pendingRunId: null,
   pollTimer: null,
   pollInFlight: false,
+  pollFailuresByRunId: {},
   isLoading: false,
   health: null,
   clarificationMessage: "",
@@ -97,22 +103,40 @@ function formatDate(iso) {
 }
 
 function escapeHtml(text) {
+  // Quotes must be escaped too: report text (built from third-party records) is placed inside
+  // href="..." attributes, where a raw quote would let it inject attributes.
   return String(text || "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function inlineEmphasis(value) {
+  return value
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>");
 }
 
 function inlineMarkdown(text) {
   let value = text.replace(/<a\s+id="[^"]*">\s*<\/a>/gi, "");
   value = escapeHtml(value);
-  value = value.replace(/\[([^\]]+)\]\((#[^)\s]+)\)/g, '<a href="$2">$1</a>');
-  value = value.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
-  value = value.replace(/(^|[\s(])((?:https?:\/\/)[^\s<)]+)(?=$|[\s).,;:!?])/g, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
-  value = value.replace(/`([^`]+)`/g, "<code>$1</code>");
-  value = value.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  value = value.replace(/\*([^*]+)\*/g, "<em>$1</em>");
-  return value;
+  // Code spans and links become placeholders before the emphasis pass, so `*` or `_` inside a URL
+  // (for example a_b*c*d) cannot be rewritten into markup.
+  const tokens = [];
+  const stash = (html) => `\u0000${tokens.push(html) - 1}\u0000`;
+  const externalLink = (href, label) =>
+    `<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+  value = value.replace(/`([^`]+)`/g, (_, code) => stash(`<code>${code}</code>`));
+  value = value.replace(/\[([^\]]+)\]\((#[^)\s]+)\)/g, (_, label, href) => stash(`<a href="${href}">${inlineEmphasis(label)}</a>`));
+  value = value.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, label, href) => stash(externalLink(href, inlineEmphasis(label))));
+  value = value.replace(
+    /(^|[\s(])((?:https?:\/\/)[^\s<)]*[^\s<).,;:!?])(?=$|[\s).,;:!?])/g,
+    (_, lead, href) => `${lead}${stash(externalLink(href, href))}`,
+  );
+  value = inlineEmphasis(value);
+  return value.replace(/\u0000(\d+)\u0000/g, (_, index) => tokens[Number(index)]);
 }
 
 function markdownToHtml(markdown) {
@@ -2371,7 +2395,7 @@ function renderReportPanel() {
   const showPanel = Boolean(state.selectedConversationId && iteration && iteration?.report?.has_report);
   const debugTaskId = currentDebugTaskId();
   const debugEntry = debugTaskId ? state.debugByTaskId[debugTaskId] : null;
-  const showDebugToggle = Boolean(showPanel && debugTaskId);
+  const showDebugToggle = Boolean(DEBUG_UI_ENABLED && showPanel && debugTaskId);
   const showDebugPanel = Boolean(showPanel && state.debugOpen && debugTaskId);
   const graphTaskId = currentGraphTaskId();
   const graphEntry = graphTaskId ? state.graphByTaskId[graphTaskId] : null;
@@ -2647,10 +2671,17 @@ function ensurePollTimerRunning() {
         const runId = ids[i];
         const r = results[i];
         if (r.status === "rejected") {
-          state.activeRunIds.delete(runId);
-          setNotice(`Run polling failed: ${r.reason?.message || "Unknown error"}`, true);
+          // A single failed poll (network blip, instance restart) should not abandon a live run.
+          const failures = (state.pollFailuresByRunId[runId] || 0) + 1;
+          state.pollFailuresByRunId[runId] = failures;
+          if (failures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+            state.activeRunIds.delete(runId);
+            delete state.pollFailuresByRunId[runId];
+            setNotice(`Lost contact with the run: ${r.reason?.message || "Unknown error"}. Reload to check on it.`, true);
+          }
           continue;
         }
+        delete state.pollFailuresByRunId[runId];
         const run = r.value;
         storeRunData(run);
         updateInlineActivityCard(run);
@@ -2681,8 +2712,7 @@ async function handleTerminalRunState(run) {
   const status = String(run.status || "");
   const kind = String(run.kind || "");
   const isQueuedFeedbackAck = status === "queued" && kind === "feedback_task";
-  const terminalStates = new Set(["completed", "failed", "awaiting_hitl", "needs_clarification"]);
-  if (!terminalStates.has(status) && !isQueuedFeedbackAck) return;
+  if (!TERMINAL_RUN_STATES.has(status) && !isQueuedFeedbackAck) return;
   if (state.handlingTerminalRunIds.has(run.run_id)) return;
 
   state.handlingTerminalRunIds.add(run.run_id);
@@ -2754,6 +2784,19 @@ async function handleTerminalRunState(run) {
   }
 }
 
+function isTerminalRun(run) {
+  const status = String(run?.status || "");
+  return TERMINAL_RUN_STATES.has(status) || (status === "queued" && run?.kind === "feedback_task");
+}
+
+// The server keeps running an investigation when the browser's stream drops (phone sleeps,
+// network change, proxy timeout). Follow it by polling instead of leaving a dead spinner.
+function followRunAfterStream(runId, { interrupted = false } = {}) {
+  if (!runId) return;
+  if (interrupted) setNotice("Connection interrupted. Reconnecting to the running investigation…");
+  startRunPolling(runId);
+}
+
 async function submitNewQuery(query, { conversationId = null, parentTaskId = null } = {}) {
   state.pendingUserMessage = String(query || "").trim();
   state.clarificationMessage = "";
@@ -2765,6 +2808,7 @@ async function submitNewQuery(query, { conversationId = null, parentTaskId = nul
   if (parentTaskId) requestBody.parent_task_id = parentTaskId;
 
   setLoading(true);
+  let streamedRunId = null;
   try {
     const payload = await streamRunApi(
       "/api/query",
@@ -2773,6 +2817,7 @@ async function submitNewQuery(query, { conversationId = null, parentTaskId = nul
         body: JSON.stringify(requestBody),
       },
       (run) => {
+        streamedRunId = run.run_id;
         state.pendingRunId = run.run_id;
         state.activeRunIds.add(run.run_id);
         storeRunData(run);
@@ -2780,9 +2825,23 @@ async function submitNewQuery(query, { conversationId = null, parentTaskId = nul
         updateLoadingSpinnerLabel();
       },
     );
-    await handleTerminalRunState(payload);
+    if (isTerminalRun(payload)) {
+      await handleTerminalRunState(payload);
+    } else {
+      followRunAfterStream(payload.run_id);
+    }
   } catch (err) {
+    if (streamedRunId) {
+      followRunAfterStream(streamedRunId, { interrupted: true });
+      return;
+    }
+    // The request was rejected before a run started (rate limit, server busy): put the question
+    // back in the composer instead of leaving a pending bubble and a spinner behind.
+    state.pendingUserMessage = "";
+    if (!el.promptInput.value.trim()) el.promptInput.value = String(query || "");
+    updateSendVisibility();
     setLoading(false);
+    renderAll();
     throw err;
   }
 }
@@ -2799,6 +2858,7 @@ async function submitContinue(taskId) {
   setLoading(true);
   renderMessages();
   let payload;
+  let streamedRunId = null;
   try {
     try {
       payload = await streamRunApi(
@@ -2808,6 +2868,7 @@ async function submitContinue(taskId) {
           body: JSON.stringify({ plan_version_id: planVersionId }),
         },
         (run) => {
+          streamedRunId = run.run_id;
           state.activeRunIds.add(run.run_id);
           storeRunData(run);
           updateInlineActivityCard(run);
@@ -2825,6 +2886,7 @@ async function submitContinue(taskId) {
           body: JSON.stringify({}),
         },
         (run) => {
+          streamedRunId = run.run_id;
           state.activeRunIds.add(run.run_id);
           storeRunData(run);
           updateInlineActivityCard(run);
@@ -2833,6 +2895,12 @@ async function submitContinue(taskId) {
       );
     }
   } catch (err) {
+    if (streamedRunId) {
+      followRunAfterStream(streamedRunId, { interrupted: true });
+      return;
+    }
+    // The run never started, so the plan is still waiting: bring the Start button back.
+    if (task) task.awaiting_hitl = true;
     state.startingTaskIds.delete(normalizedTaskId);
     setLoading(false);
     renderMessages();
@@ -2840,12 +2908,17 @@ async function submitContinue(taskId) {
   }
   storeRunData(payload);
   updateInlineActivityCard(payload);
-  await handleTerminalRunState(payload);
+  if (isTerminalRun(payload)) {
+    await handleTerminalRunState(payload);
+  } else {
+    followRunAfterStream(payload.run_id);
+  }
 }
 
 async function submitFeedback(taskId, message) {
   setLoading(true);
   let payload;
+  let streamedRunId = null;
   try {
     try {
       payload = await streamRunApi(
@@ -2855,6 +2928,7 @@ async function submitFeedback(taskId, message) {
           body: JSON.stringify({ message }),
         },
         (run) => {
+          streamedRunId = run.run_id;
           state.activeRunIds.add(run.run_id);
           storeRunData(run);
           updateInlineActivityCard(run);
@@ -2870,6 +2944,7 @@ async function submitFeedback(taskId, message) {
           body: JSON.stringify({ scope: message }),
         },
         (run) => {
+          streamedRunId = run.run_id;
           state.activeRunIds.add(run.run_id);
           storeRunData(run);
           updateInlineActivityCard(run);
@@ -2879,8 +2954,16 @@ async function submitFeedback(taskId, message) {
     }
     storeRunData(payload);
     updateInlineActivityCard(payload);
-    await handleTerminalRunState(payload);
+    if (isTerminalRun(payload)) {
+      await handleTerminalRunState(payload);
+    } else {
+      followRunAfterStream(payload.run_id);
+    }
   } catch (err) {
+    if (streamedRunId) {
+      followRunAfterStream(streamedRunId, { interrupted: true });
+      return;
+    }
     setLoading(false);
     throw err;
   }
@@ -2897,6 +2980,7 @@ function clearDraft() {
   state.graphSearchByTaskId = {};
   state.graphSelectionByTaskId = {};
   stopRunPolling();
+  state.pollFailuresByRunId = {};
   state.runsByRunId = {};
   state.runsByTaskId = {};
   state.pendingRunId = null;
@@ -2989,6 +3073,9 @@ function bindEvents() {
     event.preventDefault();
     const query = el.promptInput.value.trim();
     if (!query) return;
+    // Enter calls requestSubmit(), which ignores the disabled Send button. Without this guard a
+    // keypress during a run would start a second (paid) run. The text stays in the composer.
+    if (state.isLoading || state.startingTaskIds.size > 0 || !state.health?.ok) return;
 
     const detail = state.selectedConversationDetail;
     const active = latestIteration(detail);
@@ -3020,7 +3107,7 @@ function bindEvents() {
 
   el.promptInput.addEventListener("input", () => updateSendVisibility());
   el.promptInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey) {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       el.composerForm.requestSubmit();
     }
@@ -3079,9 +3166,14 @@ function bindEvents() {
       const chip = event.target.closest(".example-query");
       if (!chip) return;
       const query = chip.dataset.query || chip.textContent.trim();
-      el.promptInput.value = query;
-      updateSendVisibility();
-      el.promptInput.focus();
+      if (state.isLoading || !state.health?.ok) {
+        el.promptInput.value = query;
+        updateSendVisibility();
+        el.promptInput.focus();
+        return;
+      }
+      setNotice("");
+      submitNewQuery(query).catch((err) => setNotice(`Failed to start query: ${err.message}`, true));
     });
   }
 }

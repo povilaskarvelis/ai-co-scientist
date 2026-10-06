@@ -457,11 +457,15 @@ The full tool catalog above is the authoritative source. The lists below highlig
 
 ## Testing
 
+Run from the repository root (`pytest.ini` lists the test paths):
+
 ```bash
-cd adk-agent
-python -m py_compile agent.py server.py ui_server.py report_pdf.py state_store.py co_scientist/workflow.py
-python -m pytest test_tool_registry.py test_report_pdf.py test_ui_server_state.py test_workflow.py
+python -m pytest
+npm test --prefix research-mcp
+node --test adk-agent/ui/activity_state.test.js
 ```
+
+The same checks run in CI (`.github/workflows/ci.yml`) on every push and pull request.
 
 Notes:
 - External network tests were removed from the default suite to keep CI/dev runs deterministic and fast.

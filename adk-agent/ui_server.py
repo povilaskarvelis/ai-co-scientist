@@ -32,6 +32,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from google.adk import Runner
+from google.adk.agents.run_config import RunConfig
 from google.adk.sessions import InMemorySessionService
 from google.genai.types import Content, Part
 from pydantic import BaseModel, Field
@@ -71,6 +72,9 @@ RATE_LIMIT_TRUSTED_PROXY_HOPS = max(
     int(os.environ.get("RATE_LIMIT_TRUSTED_PROXY_HOPS", "0")),
 )
 MAX_CONCURRENT_TURNS = int(os.environ.get("ADK_MAX_CONCURRENT_TURNS", "6"))
+# Hard ceiling on model calls per workflow turn. ADK's default (500) would let a looping step keep
+# spending on the owner's API key long after the visitor has left.
+MAX_LLM_CALLS_PER_TURN = max(1, int(os.environ.get("ADK_MAX_LLM_CALLS_PER_TURN", "80")))
 MAX_RETAINED_CONVERSATIONS = max(
     0,
     int(os.environ.get("ADK_MAX_RETAINED_CONVERSATIONS", str(MAX_CONCURRENT_TURNS))),
@@ -1434,6 +1438,7 @@ class UiRuntime:
             session_id=cs.session_id,
             user_id=self.user_id,
             new_message=current_message,
+            run_config=RunConfig(max_llm_calls=MAX_LLM_CALLS_PER_TURN),
         ):
             content = getattr(event, "content", None)
             parts = getattr(content, "parts", None)
@@ -2221,6 +2226,7 @@ class UiRuntime:
                 human_line=f"Run failed: {error}",
             )
             await self._update_run(run_id, status="failed", error=error)
+            await self._fail_task_after_crash(task_id, run_id)
             traceback.print_exc()
         finally:
             if conversation_acquired:
@@ -2228,6 +2234,24 @@ class UiRuntime:
                     conv_id,
                     task_id=task_id,
                 )
+
+    async def _fail_task_after_crash(self, task_id: str | None, run_id: str) -> None:
+        """Mark a crashed run's task failed so it does not stay ``in_progress`` forever.
+
+        A plan that is still awaiting approval is left alone: the visitor can approve or revise it.
+        """
+        if not task_id:
+            return
+        try:
+            task = self.store.get_task(task_id)
+            if not task or task.get("awaiting_hitl"):
+                return
+            if str(task.get("status", "")).strip() in {"completed", "failed"}:
+                return
+            task["status"] = "failed"
+            await self._save_task_with_progress(task, run_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not mark task %s failed after run %s crashed", task_id, run_id)
 
     async def _run_start_task(self, run_id: str, task_id: str) -> None:
         await self._update_run(run_id, status="running")
@@ -2443,6 +2467,7 @@ class UiRuntime:
                 task_id=task_id,
             )
             await self._update_run(run_id, status="failed", error=error)
+            await self._fail_task_after_crash(task_id, run_id)
             traceback.print_exc()
         finally:
             if conversation_acquired:
@@ -2598,6 +2623,7 @@ class UiRuntime:
                 task_id=task_id,
             )
             await self._update_run(run_id, status="failed", error=error)
+            await self._fail_task_after_crash(task_id, run_id)
             traceback.print_exc()
         finally:
             if conversation_acquired:
@@ -2951,12 +2977,12 @@ async def _shutdown() -> None:
     await runtime.shutdown()
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def index() -> HTMLResponse:
     return _render_ui_page("index.html")
 
 
-@app.get("/about")
+@app.api_route("/about", methods=["GET", "HEAD"])
 async def about() -> HTMLResponse:
     return _render_ui_page("about.html")
 

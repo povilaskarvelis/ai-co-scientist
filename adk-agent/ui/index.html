@@ -3,7 +3,15 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AI Co-Scientist UI</title>
+    <title>AI Co-Scientist: cited answers from biomedical databases</title>
+    <meta name="description" content="Ask a biomedical question in plain English. AI Co-Scientist plans an investigation, queries dozens of live databases such as PubMed, ClinicalTrials.gov and FDA labels, and returns a cited report." />
+    <meta name="theme-color" content="#070707" />
+    <meta name="color-scheme" content="dark" />
+    <meta property="og:title" content="AI Co-Scientist: cited answers from biomedical databases" />
+    <meta property="og:description" content="Ask a biomedical question in plain English. AI Co-Scientist plans an investigation, queries dozens of live databases such as PubMed, ClinicalTrials.gov and FDA labels, and returns a cited report." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b0d0c'/%3E%3Cpath d='M16 6l8.66 5v10L16 26l-8.66-5V11z' fill='none' stroke='%238cf7c2' stroke-width='2.4' stroke-linejoin='round'/%3E%3Ccircle cx='16' cy='16' r='3.2' fill='%238cf7c2'/%3E%3C/svg%3E" />
     <link rel="stylesheet" href="/static/styles.css?v=__UI_VERSION__" />
     <!-- GA4_SNIPPET -->
   </head>
@@ -12,7 +20,7 @@
       <aside class="sidebar">
         <div class="sidebar-head">
           <div class="brand-block">
-            <h1 class="brand-title">AI Co-Scientist</h1>
+            <p class="brand-title">AI Co-Scientist</p>
           </div>
           <div class="sidebar-actions">
             <button id="newChatBtn" class="ghost-btn">New Chat</button>
@@ -32,7 +40,7 @@
           </div>
         </header>
 
-        <div id="notice" class="notice hidden"></div>
+        <div id="notice" class="notice hidden" role="status" aria-live="polite"></div>
 
         <div id="workspace" class="workspace">
           <section class="chat-panel">
@@ -108,6 +116,7 @@
             <form id="composerForm" class="composer">
               <textarea
                 id="promptInput"
+                aria-label="Ask a biomedical question"
                 placeholder="Ask any biomedical question..."
                 rows="3"
               ></textarea>
@@ -124,18 +133,18 @@
             <div id="exampleQueries" class="example-queries">
               <span class="example-queries-label">Example queries</span>
               <div class="example-queries-grid">
-                <div class="example-query" data-query="Among amylin, glucagon, MC4R, and GDF15-based approaches, which obesity mechanisms look strongest beyond GLP-1?">Which obesity mechanisms look strongest beyond GLP-1?</div>
-                <div class="example-query" data-query="Why does KRAS G12C inhibition work better in lung cancer than colorectal cancer?">Why KRAS G12C monotherapy is weaker in colorectal cancer</div>
-                <div class="example-query" data-query="Among IL31RA, OX40, OX40L, TSLP, and CCR4, which target looks best for atopic dermatitis based on tissue selectivity and clinical data?">Which dermatitis targets look most skin-selective?</div>
-                <div class="example-query" data-query="Across well-characterized SCN2A missense variants in children with seizures and developmental delay, what evidence distinguishes pathogenic gain-of-function from loss-of-function?">How should we triage a new SCN2A variant?</div>
-                <div class="example-query" data-query="Are TYK2 inhibitors safer than JAK inhibitors in psoriasis and psoriatic arthritis?">Are TYK2 inhibitors really safer than JAK inhibitors?</div>
-                <div class="example-query" data-query="Among SHP2, SOS1, EGFR, and CDK4/6, which KRAS co-targets look most credible in lung and colorectal cancer?">Which KRAS co-dependencies look real?</div>
-                <div class="example-query" data-query="For sickle cell disease, compare Casgevy and Lyfgenia using DailyMed label warnings, ClinicalTrials.gov records, and published follow-up. Focus on efficacy, durability, conditioning burden, toxicity, and likely access constraints.">CRISPR versus lentiviral therapy for sickle cell disease</div>
-                <div class="example-query" data-query="After osimertinib resistance in EGFR-mutant NSCLC, which approved drugs look most plausible to repurpose based on LINCS perturbation signatures, PRISM or PharmacoDB sensitivity patterns, mechanism fit, and any supporting clinical evidence?">Which approved drugs look repurposable after osimertinib?</div>
-                <div class="example-query" data-query="For SHP2, which inhibitor chemotypes still look differentiated once you compare ChEMBL potency data, available co-crystal structures from RCSB PDB, and the recent literature? Summarize the leading series and the main liability for each.">Which SHP2 chemotypes still look differentiated?</div>
-                <div class="example-query" data-query="For a Rett-like neurodevelopmental phenotype with developmental delay, seizures, and hand stereotypies but no MECP2 diagnosis, which genes should we prioritize next using HPO, Orphanet, Monarch, ClinGen, and model-organism evidence?">Which genes fit a Rett-like phenotype best?</div>
-                <div class="example-query" data-query="Find public schizophrenia MRI, resting-state fMRI, EEG, and MEG datasets and rank them by sample size, control availability, metadata quality, access requirements, and readiness for analysis.">Find and rank schizophrenia datasets</div>
-                <div class="example-query" data-query="Find publicly downloadable NEMAR EEG and iEEG epilepsy datasets and rank them by subject count, seizure or event annotations, recording modality, BIDS or HED metadata quality, download requirements, and readiness for seizure-detection analysis. Also note whether OpenNeuro, DANDI, or Brain-CODE offer comparable public alternatives.">Find and rank epilepsy EEG datasets</div>
+                <button type="button" class="example-query" data-query="Among amylin, glucagon, MC4R, and GDF15-based approaches, which obesity mechanisms look strongest beyond GLP-1?">Which obesity mechanisms look strongest beyond GLP-1?</button>
+                <button type="button" class="example-query" data-query="Why does KRAS G12C inhibition work better in lung cancer than colorectal cancer?">Why KRAS G12C monotherapy is weaker in colorectal cancer</button>
+                <button type="button" class="example-query" data-query="Among IL31RA, OX40, OX40L, TSLP, and CCR4, which target looks best for atopic dermatitis based on tissue selectivity and clinical data?">Which dermatitis targets look most skin-selective?</button>
+                <button type="button" class="example-query" data-query="Across well-characterized SCN2A missense variants in children with seizures and developmental delay, what evidence distinguishes pathogenic gain-of-function from loss-of-function?">How should we triage a new SCN2A variant?</button>
+                <button type="button" class="example-query" data-query="Are TYK2 inhibitors safer than JAK inhibitors in psoriasis and psoriatic arthritis?">Are TYK2 inhibitors really safer than JAK inhibitors?</button>
+                <button type="button" class="example-query" data-query="Among SHP2, SOS1, EGFR, and CDK4/6, which KRAS co-targets look most credible in lung and colorectal cancer?">Which KRAS co-dependencies look real?</button>
+                <button type="button" class="example-query" data-query="For sickle cell disease, compare Casgevy and Lyfgenia using DailyMed label warnings, ClinicalTrials.gov records, and published follow-up. Focus on efficacy, durability, conditioning burden, toxicity, and likely access constraints.">CRISPR versus lentiviral therapy for sickle cell disease</button>
+                <button type="button" class="example-query" data-query="After osimertinib resistance in EGFR-mutant NSCLC, which approved drugs look most plausible to repurpose based on LINCS perturbation signatures, PRISM or PharmacoDB sensitivity patterns, mechanism fit, and any supporting clinical evidence?">Which approved drugs look repurposable after osimertinib?</button>
+                <button type="button" class="example-query" data-query="For SHP2, which inhibitor chemotypes still look differentiated once you compare ChEMBL potency data, available co-crystal structures from RCSB PDB, and the recent literature? Summarize the leading series and the main liability for each.">Which SHP2 chemotypes still look differentiated?</button>
+                <button type="button" class="example-query" data-query="For a Rett-like neurodevelopmental phenotype with developmental delay, seizures, and hand stereotypies but no MECP2 diagnosis, which genes should we prioritize next using HPO, Orphanet, Monarch, ClinGen, and model-organism evidence?">Which genes fit a Rett-like phenotype best?</button>
+                <button type="button" class="example-query" data-query="Find public schizophrenia MRI, resting-state fMRI, EEG, and MEG datasets and rank them by sample size, control availability, metadata quality, access requirements, and readiness for analysis.">Find and rank schizophrenia datasets</button>
+                <button type="button" class="example-query" data-query="Find publicly downloadable NEMAR EEG and iEEG epilepsy datasets and rank them by subject count, seizure or event annotations, recording modality, BIDS or HED metadata quality, download requirements, and readiness for seizure-detection analysis. Also note whether OpenNeuro, DANDI, or Brain-CODE offer comparable public alternatives.">Find and rank epilepsy EEG datasets</button>
               </div>
             </div>
           </section>
