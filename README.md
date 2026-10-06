@@ -313,7 +313,8 @@ Opens the custom web interface at `http://localhost:8080` with conversation mana
 **Runtime notes:**
 
 - The UI server binds to `127.0.0.1:8080` by default. Override with `CO_SCI_UI_HOST` and `CO_SCI_UI_PORT`.
-- Local task and conversation state is stored in `adk-agent/state/workflow_tasks.json` by default.
+- Local task and conversation state is stored in `adk-agent/state/workflow_tasks.json` by default. Set `AI_CO_SCIENTIST_STATE_PATH` to keep it outside synced folders such as Dropbox.
+- Progress is stored compactly: one step snapshot per run plus the most recent 300 progress events. State files written by older versions are compacted the first time the server loads them (a 483 MB development file shrank to about 73 MB).
 - To use Postgres-backed persistence instead of local JSON, set `AI_CO_SCIENTIST_POSTGRES_DSN` (or `POSTGRES_DSN` / `DATABASE_URL`).
 - Set `AI_CO_SCIENTIST_SESSION_SECRET` to at least 32 random characters when browser ownership must remain stable across server restarts. Cloud Run deployment manages this secret automatically.
 - Generated Markdown/PDF reports are written to `adk-agent/reports/`. The runtime keeps the newest 100 report groups by default; override with `ADK_MAX_RETAINED_REPORTS`.

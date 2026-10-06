@@ -16,9 +16,82 @@ logger = logging.getLogger(__name__)
 WORKFLOW_SNAPSHOT_SCHEMA = "workflow_session_state.v1"
 INCOMPLETE_RUN_STATUSES = frozenset({"queued", "running", "in_progress"})
 
+# Progress is stored once per run and task: the latest step snapshot plus a bounded event log.
+# Earlier versions appended a full all-steps snapshot (reasoning traces included) on every tool call
+# and kept up to 80 per task, which grew quadratically and pushed the local state file to ~0.5 GB.
+MAX_PROGRESS_EVENTS = 300
+MAX_PROGRESS_LOGS = 300
+_STEP_TEXT_LIMIT = 600
+_TOOL_TEXT_LIMIT = 240
+_TOOL_LOG_ENTRIES = 8
+# Event metrics fields the UI never reads; step.completed events used to carry the full step markdown.
+_HEAVY_EVENT_METRIC_KEYS = frozenset({"rendered_step_markdown", "react_trace", "react_phases"})
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _clip(value: Any, limit: int) -> str:
+    text = str(value or "").strip()
+    return text if len(text) <= limit else f"{text[: limit - 1].rstrip()}…"
+
+
+def compact_step_detail(step: dict[str, Any]) -> dict[str, Any]:
+    """Keep the fields the progress UI renders for one plan step, with bounded text."""
+    tool_log = [entry for entry in list(step.get("tool_log") or []) if isinstance(entry, dict)]
+    return {
+        "id": str(step.get("id", "") or ""),
+        "goal": _clip(step.get("goal"), _STEP_TEXT_LIMIT),
+        "status": str(step.get("status", "pending") or "pending"),
+        "tool_hint": str(step.get("tool_hint", "") or ""),
+        "source": str(step.get("source", "") or ""),
+        "data_sources": [str(item) for item in list(step.get("data_sources") or [])[:6]],
+        "step_progress_note": _clip(step.get("step_progress_note"), _TOOL_TEXT_LIMIT),
+        "result_summary": _clip(step.get("result_summary"), _STEP_TEXT_LIMIT),
+        "evidence_ids": [str(item) for item in list(step.get("evidence_ids") or [])[:12]],
+        "open_gaps": [_clip(item, _TOOL_TEXT_LIMIT) for item in list(step.get("open_gaps") or [])[:4]],
+        "tool_log": [
+            {
+                "tool": str(entry.get("tool", "") or ""),
+                "raw_tool": str(entry.get("raw_tool", "") or ""),
+                "status": str(entry.get("status", "") or ""),
+                "summary": _clip(entry.get("summary"), _TOOL_TEXT_LIMIT),
+                "result": _clip(entry.get("result"), _TOOL_TEXT_LIMIT),
+            }
+            for entry in tool_log[-_TOOL_LOG_ENTRIES:]
+        ],
+    }
+
+
+def compact_progress_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    compacted = {key: value for key, value in summary.items() if key != "step_details"}
+    compacted["step_details"] = [
+        compact_step_detail(step) for step in list(summary.get("step_details") or []) if isinstance(step, dict)
+    ]
+    return compacted
+
+
+def compact_progress_event(event: dict[str, Any]) -> dict[str, Any]:
+    metrics = event.get("metrics")
+    if not isinstance(metrics, dict) or not (_HEAVY_EVENT_METRIC_KEYS & metrics.keys()):
+        return event
+    compacted = dict(event)
+    compacted["metrics"] = {key: value for key, value in metrics.items() if key not in _HEAVY_EVENT_METRIC_KEYS}
+    return compacted
+
+
+def compact_progress_state(record: dict[str, Any]) -> dict[str, Any]:
+    """Bound the progress fields of a stored task or run in place and return it."""
+    summaries = [item for item in list(record.get("progress_summaries") or []) if isinstance(item, dict)]
+    if "progress_summaries" in record:
+        record["progress_summaries"] = [compact_progress_summary(summaries[-1])] if summaries else []
+    if "progress_events" in record:
+        events = [item for item in list(record.get("progress_events") or []) if isinstance(item, dict)]
+        record["progress_events"] = [compact_progress_event(item) for item in events[-MAX_PROGRESS_EVENTS:]]
+    if "logs" in record:
+        record["logs"] = list(record.get("logs") or [])[-MAX_PROGRESS_LOGS:]
+    return record
 
 
 class SupportsWorkflowStateStore(Protocol):
@@ -72,10 +145,14 @@ class JsonTaskStore:
                     self._data["tasks"] = dict(loaded.get("tasks") or {})
                     self._data["runs"] = dict(loaded.get("runs") or {})
                     self._data["workflow_sessions"] = dict(loaded.get("workflow_sessions") or {})
+                    for record in [*self._data["tasks"].values(), *self._data["runs"].values()]:
+                        if isinstance(record, dict):
+                            compact_progress_state(record)
 
     def _save(self) -> None:
         with self._lock:
-            payload = json.dumps(self._data, indent=2, ensure_ascii=False, default=str)
+            # Compact separators: the file is machine state, and indentation alone added ~25% to it.
+            payload = json.dumps(self._data, ensure_ascii=False, default=str, separators=(",", ":"))
             temporary_path: Path | None = None
             try:
                 with tempfile.NamedTemporaryFile(
@@ -101,7 +178,7 @@ class JsonTaskStore:
 
     def save_task(self, task: dict[str, Any], *, owner_ip: str = "", flush: bool = True) -> None:
         with self._lock:
-            stored_task = copy.deepcopy(task)
+            stored_task = compact_progress_state(copy.deepcopy(task))
             stored_task["updated_at"] = _utc_now()
             self._data["tasks"][stored_task["task_id"]] = stored_task
             conv_id = str(stored_task.get("conversation_id", "") or "").strip()
@@ -170,7 +247,7 @@ class JsonTaskStore:
 
     def save_run(self, run: dict[str, Any], *, flush: bool = False) -> None:
         with self._lock:
-            stored_run = copy.deepcopy(run)
+            stored_run = compact_progress_state(copy.deepcopy(run))
             stored_run["updated_at"] = _utc_now()
             self._data["runs"][stored_run["run_id"]] = stored_run
             if flush:
@@ -412,7 +489,7 @@ class PostgresTaskStore:
 
     def save_task(self, task: dict[str, Any], *, owner_ip: str = "", flush: bool = True) -> None:
         _, _, Jsonb = _require_psycopg()
-        stored_task = copy.deepcopy(task)
+        stored_task = compact_progress_state(copy.deepcopy(task))
         stored_task["updated_at"] = _utc_now()
         conversation_id = str(stored_task.get("conversation_id", "") or "").strip()
         self._upsert_conversation(
@@ -531,7 +608,7 @@ class PostgresTaskStore:
 
     def save_run(self, run: dict[str, Any], *, flush: bool = False) -> None:
         _, _, Jsonb = _require_psycopg()
-        stored_run = copy.deepcopy(run)
+        stored_run = compact_progress_state(copy.deepcopy(run))
         stored_run["updated_at"] = _utc_now()
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -774,11 +851,11 @@ def interrupt_run_payload(
 
     progress_events = list(run.get("progress_events") or [])
     progress_events.append(event)
-    run["progress_events"] = progress_events[-600:]
+    run["progress_events"] = progress_events[-MAX_PROGRESS_EVENTS:]
 
     logs = list(run.get("logs") or [])
     logs.append({"at": timestamp, "message": human_line})
-    run["logs"] = logs[-300:]
+    run["logs"] = logs[-MAX_PROGRESS_LOGS:]
     return True
 
 
@@ -797,7 +874,8 @@ def interrupt_task_payload(
         task["status"] = "failed"
         task["awaiting_hitl"] = False
     task["interruption_reason"] = str(reason or "Run interrupted before completion.").strip()
-    task["progress_events"] = copy.deepcopy(list(run.get("progress_events") or [])[-600:])
-    task["progress_summaries"] = copy.deepcopy(list(run.get("progress_summaries") or [])[-80:])
+    task["progress_events"] = copy.deepcopy(list(run.get("progress_events") or []))
+    task["progress_summaries"] = copy.deepcopy(list(run.get("progress_summaries") or []))
+    compact_progress_state(task)
     task["updated_at"] = str(run.get("updated_at", "") or _utc_now())
     return True

@@ -821,6 +821,7 @@ List actionable follow-ups justified by unresolved decisions or evidence gaps. D
 Writing criteria
 - Be specific, concise, and useful to a biomedical researcher.
 - Translate internal predicates and tool names into plain scientific language.
+- Cite only human-readable source names and record identifiers. Step ids (S1, S2), open gaps and interpretation constraints are internal context, not sources; never cite them.
 - Keep stable database URLs only when they are the source's citable record identifier; omit API endpoints and raw JSON links.
 - Return Markdown only.
 """
@@ -1049,6 +1050,16 @@ def _dedupe_str_list(values: list[Any], *, limit: int = 20) -> list[str]:
 
 def _normalize_user_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip()).lower()
+
+
+def _normalize_for_term_matching(text: str) -> str:
+    """Lowercase text padded with spaces, with sentence punctuation turned into spaces.
+
+    Routing heuristics match space-delimited terms, so "evidence," or "(Leqembi)" must not hide a
+    term. Punctuation inside a token (clinicaltrials.gov, gain-of-function) is kept.
+    """
+    spaced = re.sub(r"[,.;:!?)\]\"]+(?=\s|$)|[(\[\"]", " ", _normalize_user_text(text))
+    return f" {re.sub(r'\s+', ' ', spaced).strip()} "
 
 
 def _is_finalize_command(text: str) -> bool:
@@ -1288,7 +1299,7 @@ def _is_lookup_expansion_request(user_text: str) -> bool:
 
 def _is_obvious_general_qa_query(user_text: str) -> bool:
     """Return True only for narrow textbook-style questions suitable for direct Q&A."""
-    normalized = f" {_normalize_user_text(user_text)} "
+    normalized = _normalize_for_term_matching(user_text)
     stripped = normalized.strip()
     if len(stripped) < 8:
         return False
@@ -1356,7 +1367,7 @@ def _is_obvious_general_qa_query(user_text: str) -> bool:
 
 def _is_obvious_research_workflow_query(user_text: str) -> bool:
     """Return True for clearly evidence-driven research asks that should bypass general QA."""
-    normalized = f" {_normalize_user_text(user_text)} "
+    normalized = _normalize_for_term_matching(user_text)
     stripped = normalized.strip()
     if len(stripped) < 40:
         return False
@@ -1462,9 +1473,22 @@ def _is_obvious_research_workflow_query(user_text: str) -> bool:
         " eeg ",
         " meg ",
     )
+    # A question that names specific evidence sources is asking for retrieval, not a textbook answer.
+    # Prefix-style entries (no trailing space) also match plurals and following punctuation.
     source_terms = (
         " dailymed ",
         " clinicaltrials.gov ",
+        " fda label",
+        " adverse-event report",
+        " adverse event report",
+        " faers",
+        " pubmed",
+        " europe pmc",
+        " civic ",
+        " gwas catalog",
+        " gnomad",
+        " open targets",
+        " uniprot",
         " lincs ",
         " prism ",
         " pharmacodb ",
@@ -3026,6 +3050,8 @@ _EXECUTOR_SECTION_ALIASES = {
     "summary": "summary",
     "key findings": "summary",
     "findings": "summary",
+    "findings summary": "summary",
+    "detailed findings": "summary",
     "evidence": "evidence",
     "evidence ids": "evidence",
     "references": "evidence",
@@ -3102,7 +3128,7 @@ _SUMMARY_ACTIVITY_PREFIX_RE = re.compile(
 
 def _normalize_executor_section_title(text: str) -> str:
     cleaned = re.sub(r"^#{1,6}\s*", "", str(text or "").strip())
-    cleaned = cleaned.strip().strip(":").lower()
+    cleaned = cleaned.strip().strip("*_").strip().strip(":").lower()
     return re.sub(r"\s+", " ", cleaned)
 
 
@@ -3154,10 +3180,12 @@ def _normalize_summary_activity_line(line: str) -> str:
 
 _EXECUTOR_INTERNAL_JSON_KEYS = {
     "data_sources_queried",
+    "entities",
     "evidence_ids",
     "handoff",
     "open_gaps",
     "reasoning_trace",
+    "result",
     "result_summary",
     "schema",
     "step_id",
@@ -3231,6 +3259,14 @@ def _clean_executor_summary_text(text: str) -> str:
             continue
         if _normalize_executor_section_title(line) in _EXECUTOR_SECTION_ALIASES:
             continue
+        # A heading line (markdown or a fully bold line) would otherwise run into the next sentence
+        # once lines are joined ("Findings from the FDA label The label warns ...").
+        heading = re.match(r"^#{1,6}\s+(.+)$", line) or re.match(r"^\*\*(.+?)\*\*:?$", line)
+        if heading:
+            title = heading.group(1).strip().strip("*").strip()
+            if re.match(r"(?i)^(?:key |detailed )?(?:findings|summary|results|overview)\b", title):
+                continue
+            line = title if re.search(r"[.:!?]$", title) else f"{title}:"
         line = re.sub(r"^#{1,6}\s+", "", line)
         line = re.sub(r"\s+#{1,6}\s+", ". ", line)
         line = re.sub(r"^(?:[-*+]\s+|\d+\.\s+)", "", line)
@@ -8831,10 +8867,33 @@ def _fallback_next_actions_from_task_state(task_state: dict[str, Any]) -> list[s
     return actions[:5]
 
 
+_INTERNAL_CITATION_LABEL = re.compile(
+    r"^(?:S\d+|.*\binterpretation constraints?\b.*|.*\bopen gaps?\b.*)$",
+    re.IGNORECASE,
+)
+
+
+def _strip_internal_citation_labels(markdown: str) -> str:
+    """Drop citations of internal context labels such as "[S2 open gap]" or "[PubMed interpretation constraint]".
+
+    The synthesizer sees step ids, open gaps and interpretation constraints as context and sometimes
+    cites them like sources. Real sources inside the same brackets are kept; markdown links are untouched.
+    """
+    def _clean(match: re.Match[str]) -> str:
+        lead, inner = match.group(1), match.group(2)
+        parts = [part.strip() for part in re.split(r"[,;]", inner)]
+        kept = [part for part in parts if part and not _INTERNAL_CITATION_LABEL.match(part)]
+        if len(kept) == len(parts):
+            return match.group(0)
+        return f"{lead}[{', '.join(kept)}]" if kept else ""
+
+    return re.sub(r"([ \t]?)\[([^\[\]\n]+)\](?!\()", _clean, markdown)
+
+
 def _postprocess_synth_markdown(task_state: dict[str, Any], raw_markdown: str) -> str:
     """Post-process the LLM's markdown output into the final report format."""
     synthesis = _build_structured_final_synthesis(task_state, raw_markdown)
-    return _render_final_synthesis_markdown(task_state, synthesis)
+    return _strip_internal_citation_labels(_render_final_synthesis_markdown(task_state, synthesis))
 
 
 def _repair_generated_markdown_layout(text: str) -> str:

@@ -1466,3 +1466,90 @@ def test_crashed_run_keeps_a_plan_that_is_still_awaiting_approval(runtime):
     stored = runtime.store.get_task("task_plan")
     assert stored["status"] == "in_progress"
     assert stored["awaiting_hitl"] is True
+
+
+def _heavy_wf_state(step_status: str = "in_progress") -> dict:
+    return {
+        "plan_status": "ready",
+        "steps": [
+            {
+                "id": "S1",
+                "goal": "Search trials",
+                "status": step_status,
+                "tool_hint": "search_clinical_trials",
+                "result_summary": "x" * 5000,
+                "reasoning_trace": "r" * 20000,
+                "structured_observations": [{"subject": "a"}] * 50,
+                "tool_log": [{"tool": "ClinicalTrials.gov", "summary": "s" * 1000, "result": "y" * 1000}] * 30,
+            },
+        ],
+    }
+
+
+def test_step_summaries_keep_one_compact_snapshot_per_run(runtime):
+    async def scenario():
+        run = await runtime._create_run("start_task", query="q", owner_id="owner")
+        for _ in range(5):
+            await runtime._emit_step_summary(run.run_id, _heavy_wf_state(), 1)
+        return runtime.runs[run.run_id]
+
+    run = asyncio.run(scenario())
+
+    assert len(run.progress_summaries) == 1
+    step = run.progress_summaries[0]["step_details"][0]
+    assert "reasoning_trace" not in step and "structured_observations" not in step
+    assert len(step["result_summary"]) <= 600
+    assert len(step["tool_log"]) <= 8
+    assert len(json.dumps(run.progress_summaries)) < 6000
+
+
+def test_public_run_payload_omits_owner_and_duplicate_logs():
+    payload = ui_server._public_run_payload(
+        {"run_id": "run_x", "owner_id": "secret-owner", "logs": [{"message": "m"}], "progress_events": []}
+    )
+
+    assert "owner_id" not in payload
+    assert "logs" not in payload
+    assert payload["progress_events"] == []
+
+
+def test_conversation_iteration_does_not_duplicate_progress_or_report_inside_task():
+    task = ui_server._make_task("task_slim", "Assess LRRK2", "conv_slim")
+    task["progress_events"] = [{"type": "step.completed"}]
+    task["progress_summaries"] = [{"steps_total": 1}]
+    task["report_markdown"] = "# Report"
+
+    iteration = ui_server._iteration_from_task(task)
+
+    assert "progress_events" not in iteration["task"]
+    assert "progress_summaries" not in iteration["task"]
+    assert "report_markdown" not in iteration["task"]
+    assert iteration["research_log"]["events"] == [{"type": "step.completed"}]
+    assert iteration["report"]["report_markdown"] == "# Report"
+
+
+def test_json_store_compacts_bloated_progress_on_load(tmp_path):
+    path = tmp_path / "workflow_tasks.json"
+    heavy_summary = {"steps_total": 1, "step_details": _heavy_wf_state()["steps"]}
+    heavy_event = {"type": "step.completed", "metrics": {"step_id": "S1", "rendered_step_markdown": "m" * 10000}}
+    path.write_text(json.dumps({
+        "conversations": {},
+        "tasks": {"task_big": {
+            "task_id": "task_big",
+            "progress_summaries": [heavy_summary] * 40,
+            "progress_events": [heavy_event] * 700,
+        }},
+        "runs": {"run_big": {"run_id": "run_big", "progress_summaries": [heavy_summary] * 40, "logs": [{}] * 500}},
+        "workflow_sessions": {},
+    }), encoding="utf-8")
+    size_before = path.stat().st_size
+
+    store = JsonTaskStore(path)
+    task = store.get_task("task_big")
+    store.save_run(store.get_run("run_big"), flush=True)
+
+    assert len(task["progress_summaries"]) == 1
+    assert len(task["progress_events"]) == 300
+    assert "rendered_step_markdown" not in task["progress_events"][-1]["metrics"]
+    assert len(store.get_run("run_big")["logs"]) == 300
+    assert path.stat().st_size < size_before / 20

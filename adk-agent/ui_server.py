@@ -39,7 +39,10 @@ from pydantic import BaseModel, Field
 
 from agent import validate_runtime_configuration
 from state_store import (
+    MAX_PROGRESS_EVENTS,
+    MAX_PROGRESS_LOGS,
     SupportsWorkflowStateStore,
+    compact_step_detail,
     create_state_store,
     interrupt_run_payload,
     interrupt_task_payload,
@@ -426,9 +429,6 @@ def _build_step_completed_event_metrics(text: str) -> dict | None:
         "tools": list(step_info.get("tools", []) or []),
         "evidence": list(step_info.get("evidence", []) or []),
         "progress": str(step_info.get("progress", "") or "").strip(),
-        "react_trace": str(step_info.get("react_trace", "") or "").strip(),
-        "react_phases": step_info.get("react_phases", {}) if isinstance(step_info.get("react_phases", {}), dict) else {},
-        "rendered_step_markdown": text,
     }
 
 
@@ -469,6 +469,13 @@ def _extract_tool_error_metrics(function_response) -> dict | None:
     }
 
 
+
+
+def _public_run_payload(payload: dict) -> dict:
+    public_payload = dict(payload)
+    public_payload.pop("owner_id", None)
+    public_payload.pop("logs", None)
+    return public_payload
 
 
 def _generate_chat_title(query: str) -> str:
@@ -826,9 +833,14 @@ def _iteration_from_task(task: dict, idx: int = 1) -> dict:
     report_md = task.get("report_markdown", "") if not is_direct else ""
     direct_response_text = task.get("direct_response_text", "") if is_direct else ""
 
+    task_view = {
+        key: value
+        for key, value in task.items()
+        if key not in {"progress_events", "progress_summaries", "report_markdown"}
+    }
     return {
         "iteration_index": idx,
-        "task": _task_detail(task),
+        "task": _task_detail(task_view),
         "task_summary": _task_summary(task),
         "active_plan_version": active_plan,
         "latest_plan_delta": None,
@@ -1477,17 +1489,11 @@ class UiRuntime:
                 human = _describe_tool_call(name, args)
                 if not human:
                     continue
-                _fire_progress(
-                    phase="execute",
-                    event_type="tool.called",
-                    status="progress",
-                    human_line=human,
-                    metrics={"tool": name},
-                )
                 # Emit step.started + live step summary so frontend gets tool_log in real time
+                wf_state = None
+                sid = ""
                 if author == "step_executor":
                     wf_state = await self._read_workflow_state(conversation_id)
-                    sid = ""
                     if wf_state:
                         for s in (wf_state.get("steps") or []):
                             st = str(s.get("status", "")).strip()
@@ -1515,6 +1521,14 @@ class UiRuntime:
                             human_line=human_step,
                             metrics={"step_id": sid},
                         )
+                _fire_progress(
+                    phase="execute",
+                    event_type="tool.called",
+                    status="progress",
+                    human_line=human,
+                    metrics={"tool": name, "step_id": sid} if sid else {"tool": name},
+                )
+                if author == "step_executor":
                     # Emit a live summary snapshot so the frontend has step_details + tool_log
                     if wf_state:
                         _fire_and_forget_threadsafe(
@@ -1720,23 +1734,12 @@ class UiRuntime:
         step_details = []
         for s in steps:
             tool_hint = str(s.get("tool_hint", "")).strip()
-            source = _resolve_source_label(tool_hint) if tool_hint else ""
-            step_details.append({
-                "id": s.get("id", ""),
-                "goal": s.get("goal", ""),
-                "status": s.get("status", "pending"),
+            step_details.append(compact_step_detail({
+                **s,
                 "tool_hint": tool_hint,
-                "source": source,
+                "source": _resolve_source_label(tool_hint) if tool_hint else "",
                 "data_sources": _derive_step_data_sources(s),
-                "result_summary": s.get("result_summary", ""),
-                "tool_reasoning": s.get("tool_reasoning", ""),
-                "evidence_ids": s.get("evidence_ids", []),
-                "tools_called": s.get("tools_called", []),
-                "open_gaps": s.get("open_gaps", []),
-                "reasoning_trace": s.get("reasoning_trace", ""),
-                "tool_log": s.get("tool_log", []),
-                "structured_observations": s.get("structured_observations", []),
-            })
+            }))
 
         summary = {
             "snapshot_id": f"snap_{uuid.uuid4().hex[:10]}",
@@ -1757,7 +1760,8 @@ class UiRuntime:
                 return
             run = self.runs.get(run_id)
             if run:
-                run.progress_summaries.append(summary)
+                # Only the latest snapshot is ever rendered, so keep exactly one.
+                run.progress_summaries = [summary]
                 run.updated_at = _utc_now()
 
     async def _save_task_with_progress(
@@ -1771,8 +1775,8 @@ class UiRuntime:
             async with self.runs_lock:
                 run = self.runs.get(run_id)
                 if run:
-                    task["progress_events"] = list(run.progress_events[-600:])
-                    task["progress_summaries"] = list(run.progress_summaries[-80:])
+                    task["progress_events"] = list(run.progress_events[-MAX_PROGRESS_EVENTS:])
+                    task["progress_summaries"] = list(run.progress_summaries[-1:])
                     if run.status in self._ACTIVE_RUN_STATUSES:
                         active_run_id = run.run_id
         elif run_id:
@@ -1889,12 +1893,12 @@ class UiRuntime:
             if task_id and not run.task_id:
                 run.task_id = task_id
             run.progress_events.append(event)
-            if len(run.progress_events) > 600:
-                run.progress_events = run.progress_events[-600:]
+            if len(run.progress_events) > MAX_PROGRESS_EVENTS:
+                run.progress_events = run.progress_events[-MAX_PROGRESS_EVENTS:]
             if event["human_line"]:
                 run.logs.append({"at": event["at"], "message": event["human_line"]})
-                if len(run.logs) > 300:
-                    run.logs = run.logs[-300:]
+                if len(run.logs) > MAX_PROGRESS_LOGS:
+                    run.logs = run.logs[-MAX_PROGRESS_LOGS:]
             run.updated_at = _utc_now()
             run_payload = run.to_dict()
         if run_payload:
@@ -1921,25 +1925,26 @@ class UiRuntime:
     async def stream_run(self, run_id: str):
         """Yield run snapshots while keeping the initiating HTTP request active."""
         last_snapshot = ""
+        last_marker: tuple | None = None
         last_write = time.monotonic()
         while True:
             payload = await self.get_run(run_id)
             if payload is None:
                 return
-            public_payload = dict(payload)
-            public_payload.pop("owner_id", None)
-            snapshot = json.dumps(public_payload, ensure_ascii=False, separators=(",", ":"))
-            if snapshot != last_snapshot:
-                yield f"{snapshot}\n"
-                last_snapshot = snapshot
-                last_write = time.monotonic()
+            marker = (payload.get("updated_at"), payload.get("status"), len(payload.get("progress_events") or []))
+            if marker != last_marker:
+                last_marker = marker
+                snapshot = json.dumps(_public_run_payload(payload), ensure_ascii=False, separators=(",", ":"))
+                if snapshot != last_snapshot:
+                    yield f"{snapshot}\n"
+                    last_snapshot = snapshot
+                    last_write = time.monotonic()
 
             task = self.run_tasks.get(run_id)
             if task is None or task.done():
                 final_payload = await self.wait_for_run(run_id)
                 if final_payload is not None:
-                    final_payload = dict(final_payload)
-                    final_payload.pop("owner_id", None)
+                    final_payload = _public_run_payload(final_payload)
                     final_snapshot = json.dumps(
                         final_payload,
                         ensure_ascii=False,
@@ -2889,7 +2894,8 @@ def _strip_next_steps_section(markdown: str) -> str:
 
 ROOT_DIR = Path(__file__).resolve().parent
 UI_DIR = ROOT_DIR / "ui"
-STATE_PATH = ROOT_DIR / "state" / "workflow_tasks.json"
+# Override to keep local state outside synced folders (Dropbox re-uploads the file on every save).
+STATE_PATH = Path(os.environ.get("AI_CO_SCIENTIST_STATE_PATH") or ROOT_DIR / "state" / "workflow_tasks.json").expanduser()
 
 runtime = UiRuntime(STATE_PATH)
 app = FastAPI(title="AI Co-Scientist UI", version="0.2.0")
@@ -3148,9 +3154,7 @@ async def _run_response(run_id: str, request: Request):
     payload = await runtime.wait_for_run(run_id)
     if not payload:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found.")
-    public_payload = dict(payload)
-    public_payload.pop("owner_id", None)
-    return public_payload
+    return _public_run_payload(payload)
 
 
 @app.post("/api/tasks/{task_id}/start")
@@ -3215,9 +3219,7 @@ async def rollback_task(task_id: str, payload: RollbackRequest) -> dict:
 @app.get("/api/runs/{run_id}")
 async def get_run(run_id: str, request: Request) -> dict:
     payload = await _check_run_ownership(run_id.strip(), request)
-    public_payload = dict(payload)
-    public_payload.pop("owner_id", None)
-    return public_payload
+    return _public_run_payload(payload)
 
 
 @app.get("/api/tasks/{task_id}/report.pdf")

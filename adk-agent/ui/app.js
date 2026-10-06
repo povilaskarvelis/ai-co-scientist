@@ -15,6 +15,8 @@ const state = {
   pollTimer: null,
   pollInFlight: false,
   pollFailuresByRunId: {},
+  pendingStartedAt: 0,
+  liveTimer: null,
   isLoading: false,
   health: null,
   clarificationMessage: "",
@@ -540,18 +542,72 @@ function latestCompletedTaskId(detail) {
   return "";
 }
 
-function planHtmlForIteration(iteration) {
+function planStepsForIteration(iteration) {
   const activePlan = iteration?.active_plan_version;
   const task = iteration?.task || {};
-  const steps = Array.isArray(activePlan?.steps)
-    ? activePlan.steps
-    : Array.isArray(task?.steps)
-      ? task.steps
-      : [];
-  if (!steps.length) return "";
+  if (Array.isArray(activePlan?.steps)) return activePlan.steps;
+  return Array.isArray(task?.steps) ? task.steps : [];
+}
 
-  let html = "<p>To answer your query I will:</p><ol class=\"plan-steps\">";
+function planStepId(step, idx) {
+  return String(step?.id || "").trim() || `S${idx + 1}`;
+}
+
+// Live run data when this task has a run in memory, otherwise the saved research log.
+function planProgressForIteration(iteration) {
+  const task = iteration?.task || {};
+  const taskId = String(task.task_id || "").trim();
+  const run = getRunForTask(taskId);
+  const runStatus = String(run?.status || "").trim();
+  const runEvents = Array.isArray(run?.progress_events) ? run.progress_events : [];
+  const useRun = runEvents.length > 0 || ["running", "queued", "in_progress"].includes(runStatus);
+  const researchLog = iteration?.research_log || {};
+  const isStarting = state.startingTaskIds.has(taskId);
+  const steps = planStepsForIteration(iteration).map((step, idx) => ({ ...step, id: planStepId(step, idx) }));
+  const progress = CoScientistActivityState.computePlanProgress({
+    runStatus,
+    taskStatus: String(task.status || ""),
+    awaitingApproval: Boolean(task.awaiting_hitl) && !isStarting,
+    started: taskHasStarted(task) || isStarting,
+    events: useRun ? runEvents : (Array.isArray(researchLog.events) ? researchLog.events : []),
+    summaries: useRun
+      ? (Array.isArray(run?.progress_summaries) ? run.progress_summaries : [])
+      : (Array.isArray(researchLog.summaries) ? researchLog.summaries : []),
+    steps,
+  });
+  progress.fallbackStartedAt = String(run?.created_at || "");
+  return progress;
+}
+
+function planStepStatusClass(status) {
+  if (status === "completed") return "is-done";
+  if (status === "blocked") return "is-blocked";
+  if (status === "in_progress") return "is-running";
+  return "is-pending";
+}
+
+function planStatusAttributes(progress) {
+  const live = progress.phase === "running" || progress.phase === "writing";
+  const startedAt = progress.startedAt || progress.fallbackStartedAt || "";
+  const text = CoScientistActivityState.planStatusText(progress, Date.now(), progress.fallbackStartedAt);
+  return { live, startedAt, text };
+}
+
+function planHtmlForIteration(iteration) {
+  const steps = planStepsForIteration(iteration);
+  if (!steps.length) return "";
+  const taskId = String(iteration?.task?.task_id || "").trim();
+  const progress = planProgressForIteration(iteration);
+  const tracking = progress.phase !== "awaiting";
+  const status = planStatusAttributes(progress);
+
+  let html = `<div class="plan-progress phase-${escapeHtml(progress.phase)}" data-role="plan-progress" data-task-id="${escapeHtml(taskId)}">`;
+  html += `<div class="plan-progress-head"><p class="plan-intro">${tracking ? "Research plan" : "To answer your question I will:"}</p>`;
+  html += `<span class="plan-status" data-role="plan-status" data-phase="${escapeHtml(progress.phase)}" data-started-at="${escapeHtml(status.startedAt)}" data-live="${status.live}"${status.text ? "" : " hidden"}>${escapeHtml(status.text)}</span></div>`;
+  html += `<ol class="plan-steps${tracking ? " is-tracking" : ""}">`;
   steps.forEach((step, idx) => {
+    const stepId = planStepId(step, idx);
+    const stepState = progress.stepStates[stepId] || { status: "pending", line: "" };
     const title = escapeHtml(String(step?.title || `Step ${idx + 1}`).trim());
     let source = String(step?.source || "").trim();
     let completion = String(step?.completion_condition || "").trim();
@@ -569,8 +625,12 @@ function planHtmlForIteration(iteration) {
       }
     }
 
-    html += `<li><span class="plan-step-title">${title}</span>`;
-    if (source || completion) {
+    html += `<li class="plan-step ${planStepStatusClass(stepState.status)}" data-step-id="${escapeHtml(stepId)}" data-status="${escapeHtml(stepState.status)}">`;
+    html += `<span class="plan-step-marker" aria-hidden="true"></span>`;
+    html += `<span class="plan-step-title">${title}</span>`;
+    // Sources and completion criteria help a reviewer approve the plan; once research starts the
+    // live status line replaces them.
+    if (!tracking && (source || completion)) {
       html += `<ul class="plan-step-details">`;
       if (source) {
         html += `<li><span class="plan-step-label">Potential source</span>${escapeHtml(source)}</li>`;
@@ -580,10 +640,98 @@ function planHtmlForIteration(iteration) {
       }
       html += `</ul>`;
     }
+    html += `<p class="plan-step-line" data-role="step-line"${stepState.line ? "" : " hidden"}>${escapeHtml(stepState.line)}</p>`;
     html += `</li>`;
   });
-  html += `</ol><p class="plan-followup">You can revise the plan, share suggestions, or continue when you're ready.</p>`;
+  html += `</ol>`;
+  if (!tracking) {
+    html += `<p class="plan-followup">You can revise the plan, share suggestions, or start the research when you're ready.</p>`;
+  }
+  html += `<span class="sr-only" data-role="plan-announcer" aria-live="polite"></span></div>`;
   return html;
+}
+
+// Patch the plan checklist in place for a streamed run update (no timeline re-render).
+function updateInlinePlanProgress(run) {
+  const taskId = String(run?.task_id || "").trim();
+  if (!taskId || !el.messages) return;
+  const container = Array.from(el.messages.querySelectorAll('[data-role="plan-progress"]'))
+    .find((node) => node.dataset.taskId === taskId);
+  if (!container) return;
+  const iteration = findIteration(state.selectedConversationDetail, taskId);
+  if (!iteration) return;
+  const progress = planProgressForIteration(iteration);
+  const tracking = progress.phase !== "awaiting";
+  if (tracking !== Boolean(container.querySelector(".plan-steps.is-tracking"))) {
+    // Approval changes the plan's structure (details and footer), so redraw it once.
+    renderMessages();
+    return;
+  }
+
+  container.className = `plan-progress phase-${progress.phase}`;
+  const statusEl = container.querySelector('[data-role="plan-status"]');
+  if (statusEl) {
+    const status = planStatusAttributes(progress);
+    statusEl.dataset.phase = progress.phase;
+    statusEl.dataset.startedAt = status.startedAt;
+    statusEl.dataset.live = String(status.live);
+    if (statusEl.textContent !== status.text) statusEl.textContent = status.text;
+    statusEl.hidden = !status.text;
+  }
+
+  const announcements = [];
+  for (const item of container.querySelectorAll("li.plan-step")) {
+    const stepState = progress.stepStates[item.dataset.stepId] || { status: "pending", line: "" };
+    const previous = item.dataset.status;
+    if (previous !== stepState.status) {
+      item.dataset.status = stepState.status;
+      item.className = `plan-step ${planStepStatusClass(stepState.status)}`;
+      if (stepState.status === "completed" || stepState.status === "blocked") {
+        // Animate only live transitions, never a full re-render of already-finished steps.
+        item.classList.add("just-finished");
+        const title = item.querySelector(".plan-step-title")?.textContent || item.dataset.stepId;
+        announcements.push(`${stepState.status === "completed" ? "Finished" : "Blocked"}: ${title}`);
+      }
+    }
+    const lineEl = item.querySelector('[data-role="step-line"]');
+    if (lineEl) {
+      if (lineEl.textContent !== stepState.line) lineEl.textContent = stepState.line;
+      lineEl.hidden = !stepState.line;
+    }
+  }
+  const announcer = container.querySelector('[data-role="plan-announcer"]');
+  if (announcer && announcements.length) announcer.textContent = announcements.join(". ");
+  ensureLiveTimer();
+}
+
+// One timer drives every clock on screen (plan elapsed time and the planning label).
+function refreshLiveTimers() {
+  let active = false;
+  if (el.messages) {
+    for (const node of el.messages.querySelectorAll('[data-role="plan-status"][data-live="true"]')) {
+      const text = CoScientistActivityState.planStatusText(
+        { phase: node.dataset.phase, startedAt: node.dataset.startedAt },
+        Date.now(),
+      );
+      if (node.textContent !== text) node.textContent = text;
+      active = true;
+    }
+  }
+  if (state.pendingUserMessage) {
+    updateLoadingSpinnerLabel();
+    active = true;
+  }
+  return active;
+}
+
+function ensureLiveTimer() {
+  if (state.liveTimer || !refreshLiveTimers()) return;
+  state.liveTimer = setInterval(() => {
+    if (!refreshLiveTimers()) {
+      clearInterval(state.liveTimer);
+      state.liveTimer = null;
+    }
+  }, 1000);
 }
 
 function checkpointHtml(taskId, planHtml, showAction, buttonLabel) {
@@ -804,41 +952,6 @@ function buildActivityDetailsHtml(stepDetails = []) {
   `;
 }
 
-function reactTraceLines({ trace = "", phases = null } = {}) {
-  const lines = [];
-  const normalizedTrace = String(trace || "").trim();
-  const phaseMap = phases && typeof phases === "object" ? phases : null;
-  const order = ["reason", "act", "observe", "conclude"];
-  const hasPhases = phaseMap && order.some((key) => String(phaseMap[key] || "").trim());
-  if (!normalizedTrace && !hasPhases) return lines;
-
-  lines.push("**Tool Trace**");
-  lines.push("");
-
-  if (hasPhases) {
-    for (const key of order) {
-      const value = String(phaseMap[key] || "").trim();
-      if (!value) continue;
-      const label = key.charAt(0).toUpperCase() + key.slice(1);
-      lines.push(`- **${label}:** ${value}`);
-    }
-  } else {
-    for (const rawLine of normalizedTrace.split("\n")) {
-      const line = String(rawLine || "").trim();
-      if (!line) continue;
-      const m = line.match(/^(REASON|ACT|OBSERVE|CONCLUDE)\s*:\s*(.+)$/i);
-      if (m) {
-        const label = m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase();
-        lines.push(`- **${label}:** ${m[2].trim()}`);
-      } else {
-        lines.push(`- ${line}`);
-      }
-    }
-  }
-  lines.push("");
-  return lines;
-}
-
 function buildActivitySnapshot({ taskId = "", status = "", events = [], summaries = [], planApproved = true } = {}) {
   const normalizedStatus = String(status || "").trim();
   const safeEvents = (Array.isArray(events) ? events : []).filter((event) => {
@@ -858,18 +971,10 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
   const stepEvents = safeEvents.filter((e) => e?.type === "step.completed" && e?.metrics?.step_id);
   const toolCalledEvents = safeEvents.filter((e) => e?.type === "tool.called");
   const toolFailedEvents = safeEvents.filter((e) => e?.type === "tool.failed");
-  const stepRetryEvents = safeEvents.filter((e) => e?.type === "step.retry");
-  const stepStartedEvents = safeEvents.filter((e) => e?.type === "step.started" && e?.metrics?.step_id);
-  const latestToolCalled = toolCalledEvents.length ? toolCalledEvents[toolCalledEvents.length - 1] : null;
   const latestToolFailed = toolFailedEvents.length ? toolFailedEvents[toolFailedEvents.length - 1] : null;
-  const latestStepRetry = stepRetryEvents.length ? stepRetryEvents[stepRetryEvents.length - 1] : null;
-  const latestStepStarted = stepStartedEvents.length ? stepStartedEvents[stepStartedEvents.length - 1] : null;
   const stepsCompleted = Number(latestSummary?.steps_completed || stepEvents.length || 0);
   const stepsTotal = Number(latestSummary?.steps_total || 0);
   const stepDetails = Array.isArray(latestSummary?.step_details) ? latestSummary.step_details : [];
-
-  const currentStepFromDetails = stepDetails.find((s) => String(s?.status || "") === "in_progress")
-    || stepDetails.find((s) => String(s?.status || "") === "pending");
 
   const summaryByStatus = {
     queued: "Preparing research workflow.",
@@ -883,55 +988,23 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
 
   const title = "Research log";
 
+  // The plan checklist above shows per-step progress; this card summarizes the log and expands to
+  // every source query and finding.
+  const queryCount = toolCalledEvents.length;
+  const queryLabel = `${queryCount} source ${queryCount === 1 ? "query" : "queries"}`;
   let summary = "";
-  if (normalizedStatus === "completed" && (stepsTotal > 0 || latestSummary?.summary)) {
-    summary = String(latestSummary?.summary || "").trim() || `${stepsCompleted}/${stepsTotal} plan steps executed`;
-  } else if (latestToolFailed) {
-    summary = String(latestToolFailed?.human_line || "").trim() || "A tool call failed.";
-  } else if (latestStepRetry) {
-    summary = String(latestStepRetry?.human_line || "").trim() || "Retrying the current step.";
-  } else if (latestToolCalled) {
-    summary = String(latestToolCalled?.human_line || "").trim() || "Querying sources\u2026";
-  } else if (latestStepStarted) {
-    summary = String(latestStepStarted?.human_line || "").trim() || "Executing step\u2026";
-  } else if (currentStepFromDetails) {
-    const sid = String(currentStepFromDetails?.id || "").trim();
-    const goal = String(currentStepFromDetails?.goal || "").trim();
-    const source = String(currentStepFromDetails?.source || currentStepFromDetails?.tool_hint || "").trim();
-    summary = source ? `Querying ${source}\u2026` : (sid && goal ? `${sid}: ${goal}` : "Executing step\u2026");
-  } else if (stepEvents.length > 0) {
-    summary = String(latestSummary?.summary || "").trim() || summaryByStatus[normalizedStatus] || "Tracking workflow progress.";
+  if (normalizedStatus === "failed") {
+    summary = String(latestToolFailed?.human_line || latestLine || "").trim() || summaryByStatus.failed;
+  } else if (normalizedStatus === "completed") {
+    summary = stepsTotal > 0
+      ? `${queryLabel} across ${stepsCompleted} of ${stepsTotal} steps`
+      : String(latestSummary?.summary || "").trim() || summaryByStatus.completed;
+  } else if (["running", "queued", "in_progress"].includes(normalizedStatus)) {
+    summary = queryCount ? `${queryLabel} so far` : summaryByStatus[normalizedStatus];
   } else {
     summary = String(latestSummary?.summary || "").trim() || latestLine || summaryByStatus[normalizedStatus] || "Tracking workflow progress.";
   }
-
-  let preview = "";
-  const completedStepIds = new Set(stepEvents.map((e) => String(e?.metrics?.step_id || "").trim()).filter(Boolean));
-  const stepPips = stepEvents.map((e) => {
-    const sid = String(e?.metrics?.step_id || "").trim();
-    const st = String(e?.metrics?.step_status || "completed").trim();
-    const icon = st === "completed" ? "✓" : st === "blocked" ? "✗" : "…";
-    return `${sid} ${icon}`;
-  });
-  const inProgressStepId = latestStepStarted && !completedStepIds.has(String(latestStepStarted?.metrics?.step_id || "").trim())
-    ? String(latestStepStarted.metrics?.step_id || "").trim()
-    : "";
-  if (inProgressStepId) {
-    stepPips.push(`${inProgressStepId} …`);
-  }
-  if (stepPips.length) {
-    preview = stepPips.join("  ·  ");
-  } else if (latestLine) {
-    preview = latestLine;
-  } else if (normalizedStatus === "completed") {
-    preview = "Execution finished. Expand to inspect details.";
-  } else {
-    preview = "Click for activity details";
-  }
-
-  if (normalizeActivityText(preview) === normalizeActivityText(summary)) {
-    preview = "";
-  }
+  const preview = "";
 
   return {
     taskId: String(taskId || "").trim() || "pending",
@@ -1038,7 +1111,10 @@ function minimalLoadingSpinnerHtml(label = "") {
 }
 
 function pendingRunLabel() {
-  return state.pendingUserMessage ? "Planning\u2026" : "";
+  if (!state.pendingUserMessage) return "";
+  const elapsed = Date.now() - (state.pendingStartedAt || Date.now());
+  const stage = CoScientistActivityState.planningStageLabel(elapsed);
+  return `${stage}\u2026 ${CoScientistActivityState.formatElapsed(elapsed)}`;
 }
 
 function updateLoadingSpinnerLabel() {
@@ -1124,6 +1200,7 @@ function placeActivityAfterPlan(task, activeRun) {
 
 function updateInlineActivityCard(run) {
   if (!run || !el.messages) return false;
+  updateInlinePlanProgress(run);
   const runTaskId = String(run.task_id || "").trim();
   const snapshot = buildActivitySnapshot({
     taskId: runTaskId || "pending",
@@ -1219,6 +1296,7 @@ function renderMessages() {
       if (setInnerHtmlIfChanged(el.messages, parts.join(""))) {
         el.messages.scrollTop = el.messages.scrollHeight;
       }
+      ensureLiveTimer();
       return;
     }
     setInnerHtmlIfChanged(el.messages, "");
@@ -1274,6 +1352,7 @@ function renderMessages() {
   if (setInnerHtmlIfChanged(el.messages, parts.join(""))) {
     el.messages.scrollTop = el.messages.scrollHeight;
   }
+  ensureLiveTimer();
 }
 
 function setReportStatus(taskId, message = "", isError = false) {
@@ -2799,6 +2878,7 @@ function followRunAfterStream(runId, { interrupted = false } = {}) {
 
 async function submitNewQuery(query, { conversationId = null, parentTaskId = null } = {}) {
   state.pendingUserMessage = String(query || "").trim();
+  state.pendingStartedAt = Date.now();
   state.clarificationMessage = "";
   setActivityExpanded("pending", false);
   renderAll();

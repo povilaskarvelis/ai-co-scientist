@@ -4337,7 +4337,7 @@ CALCR: ENSG00000004948. GFRAL: ENSG00000187871.
 
     assert cleaned == (
         "Canonical identifiers were resolved for CALCR and GFRAL. "
-        "Resolved Gene Identifiers CALCR: ENSG00000004948. GFRAL: ENSG00000187871."
+        "Resolved Gene Identifiers: CALCR: ENSG00000004948. GFRAL: ENSG00000187871."
     )
     assert "Completed step" not in cleaned
     assert "handoff" not in cleaned
@@ -4874,7 +4874,9 @@ def test_router_before_model_callback_forces_research_workflow_for_all_landing_p
 def test_pending_query_ui_stays_in_planning_state_until_plan_is_ready():
     app_js = (ADK_AGENT_DIR / "ui/app.js").read_text(encoding="utf-8")
 
-    assert 'return state.pendingUserMessage ? "Planning\\u2026" : "";' in app_js
+    # While planning there is no streamed progress, so the pending view shows a staged, timed label.
+    assert "if (!state.pendingUserMessage) return \"\";" in app_js
+    assert "CoScientistActivityState.planningStageLabel(elapsed)" in app_js
     assert "hasResearchProgress" not in app_js
     assert "Still preparing the next research step" not in app_js
     assert "No new progress update" not in app_js
@@ -5121,3 +5123,38 @@ def test_report_assistant_after_model_callback_applies_landscape_depth_to_litera
     assert call["name"] == "search_pubmed"
     assert call["args"]["query"] == "LRRK2 Parkinson's disease"
     assert call["args"]["maxResults"] == 40
+
+
+def test_executor_summary_does_not_run_headings_into_the_first_sentence():
+    assert workflow._clean_executor_summary_text(
+        "### Findings from FDA Label for Semaglutide (Ozempic)\nThe label warns about thyroid C-cell tumors."
+    ) == "The label warns about thyroid C-cell tumors."
+    assert workflow._clean_executor_summary_text(
+        "**Findings Summary**\nDailyMed labels for both drugs were retrieved."
+    ) == "DailyMed labels for both drugs were retrieved."
+    assert workflow._clean_executor_summary_text(
+        "### Lecanemab (Leqembi)\nThe label carries a boxed warning for ARIA."
+    ) == "Lecanemab (Leqembi): The label carries a boxed warning for ARIA."
+
+
+def test_executor_summary_drops_handoff_result_payloads():
+    cleaned = workflow._clean_executor_summary_text(
+        'Two trials matched. { "result": [ { "entity_type": "trial", "id": "NCT07617155", "label": "GLP-1" } ] }'
+    )
+    assert cleaned == "Two trials matched."
+
+
+def test_report_drops_internal_context_labels_cited_as_sources():
+    markdown = (
+        "Trials are ongoing [ClinicalTrials.gov interpretation constraint].\n"
+        "Variants were mapped [GWAS Catalog, S2 open gap] and scored [S5 open gap, S6 open gap].\n"
+        "See [Nazarian et al., 2023](#ref-1) and [PubMed].\n"
+    )
+
+    cleaned = workflow._strip_internal_citation_labels(markdown)
+
+    assert cleaned == (
+        "Trials are ongoing.\n"
+        "Variants were mapped [GWAS Catalog] and scored.\n"
+        "See [Nazarian et al., 2023](#ref-1) and [PubMed].\n"
+    )
