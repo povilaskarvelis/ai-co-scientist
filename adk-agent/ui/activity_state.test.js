@@ -8,8 +8,10 @@ const {
   formatElapsed,
   planStatusText,
   planningStageLabel,
+  recordUrl,
   sanitizeDisplaySummary,
   shouldUseStartingPlaceholder,
+  stepDetailView,
 } = require("./activity_state.js");
 
 test("temporary execution placeholder yields to a live run snapshot", () => {
@@ -166,4 +168,58 @@ test("planning labels and elapsed time read naturally", () => {
   assert.equal(planningStageLabel(6000), "Choosing which databases to search");
   assert.equal(planningStageLabel(25000), "Drafting a research plan");
   assert.equal(formatElapsed(65000), "1:05");
+});
+
+test("an expanded step shows its finding, searches, linked records and open questions", () => {
+  const view = stepDetailView({
+    result_summary: "Used ClinicalTrials.gov. Two Phase 3 studies anchor the evidence: **NCT04468659** and NCT03887455.",
+    evidence_ids: ["NCT04468659", "PMID:38253184", "CHEMBL25", "NCT04468659"],
+    open_gaps: ["Pivotal results are not posted yet"],
+    tool_log: [
+      {
+        tool: "ClinicalTrials.gov",
+        raw_tool: "search_clinical_trials",
+        summary: "Searching clinical trials for lecanemab",
+        result: "Fetched 33 ClinicalTrials.gov study records; more may exist.",
+      },
+      { tool: "load_skill", raw_tool: "load_skill", summary: "Loading skill", result: "ok" },
+    ],
+  });
+
+  assert.equal(view.finding, "Two Phase 3 studies anchor the evidence: **NCT04468659** and NCT03887455.");
+  assert.deepEqual(view.sources, ["ClinicalTrials.gov"]);
+  assert.deepEqual(view.searches, [
+    { source: "ClinicalTrials.gov", query: "Searching clinical trials for lecanemab", result: "Fetched 33 ClinicalTrials.gov study records" },
+  ]);
+  assert.deepEqual(view.records.map((record) => record.id), ["NCT04468659", "PMID:38253184", "CHEMBL25"]);
+  assert.equal(view.records[2].url, "");
+  assert.deepEqual(view.gaps, ["Pivotal results are not posted yet"]);
+});
+
+test("record identifiers link to their source pages", () => {
+  assert.equal(recordUrl("PMID:38253184"), "https://pubmed.ncbi.nlm.nih.gov/38253184/");
+  assert.equal(recordUrl("NCT04468659"), "https://clinicaltrials.gov/study/NCT04468659");
+  assert.equal(recordUrl("DOI:10.1016/j.cell.2023.09.023"), "https://doi.org/10.1016/j.cell.2023.09.023");
+  assert.equal(recordUrl("PMC11167451"), "https://pmc.ncbi.nlm.nih.gov/articles/PMC11167451/");
+  assert.equal(recordUrl("rs429358"), "https://www.ncbi.nlm.nih.gov/snp/rs429358");
+  assert.equal(recordUrl("E12"), "");
+});
+
+test("a running step lists its live searches until its step log arrives", () => {
+  const progress = computePlanProgress({
+    runStatus: "running",
+    started: true,
+    events: [
+      { type: "step.started", metrics: { step_id: "S1" } },
+      { type: "tool.called", human_line: "Fetching DailyMed label for Leqembi", metrics: { step_id: "S1" } },
+      { type: "tool.called", human_line: "Fetching DailyMed label for Kisunla", metrics: { step_id: "S1" } },
+    ],
+    steps: PLAN_STEPS,
+  });
+
+  assert.deepEqual(progress.stepViews.S1.searches.map((search) => search.query), [
+    "Fetching DailyMed label for Leqembi",
+    "Fetching DailyMed label for Kisunla",
+  ]);
+  assert.equal(progress.stepViews.S2, undefined);
 });

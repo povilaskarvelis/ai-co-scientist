@@ -78,6 +78,83 @@
     return "";
   }
 
+  const INTERNAL_TOOL_NAMES = new Set(["list_skills", "load_skill", "load_skill_resource"]);
+
+  function isInternalTool(name) {
+    return INTERNAL_TOOL_NAMES.has(String(name || "").trim());
+  }
+
+  function oneLine(text) {
+    return String(text || "").replace(/\s+/g, " ").trim();
+  }
+
+  // Links for the record identifiers steps cite; kinds without a stable page stay plain text.
+  const RECORD_LINKS = [
+    [/^PMID:\s*(\d+)$/i, (m) => `https://pubmed.ncbi.nlm.nih.gov/${m[1]}/`],
+    [/^(PMC\d+)$/i, (m) => `https://pmc.ncbi.nlm.nih.gov/articles/${m[1].toUpperCase()}/`],
+    [/^DOI:\s*(10\.\S+)$/i, (m) => `https://doi.org/${m[1]}`],
+    [/^(NCT\d{8})$/i, (m) => `https://clinicaltrials.gov/study/${m[1].toUpperCase()}`],
+    [/^(rs\d+)$/i, (m) => `https://www.ncbi.nlm.nih.gov/snp/${m[1].toLowerCase()}`],
+    [/^(GCST\d+)$/i, (m) => `https://www.ebi.ac.uk/gwas/studies/${m[1].toUpperCase()}`],
+    [/^UniProt:\s*([A-Z0-9]+)$/i, (m) => `https://www.uniprot.org/uniprotkb/${m[1].toUpperCase()}`],
+    [/^PubChem:\s*(?:CID\s*)?(\d+)$/i, (m) => `https://pubchem.ncbi.nlm.nih.gov/compound/${m[1]}`],
+    [/^PDB:\s*([0-9][A-Z0-9]{3})$/i, (m) => `https://www.rcsb.org/structure/${m[1].toUpperCase()}`],
+  ];
+
+  function recordUrl(id) {
+    const value = oneLine(id);
+    for (const [pattern, build] of RECORD_LINKS) {
+      const match = value.match(pattern);
+      if (match) return build(match);
+    }
+    return "";
+  }
+
+  // Fallback summaries open with "Used <source>."; the step already names its source.
+  function stripSourceBoilerplate(text) {
+    return String(text || "")
+      .replace(/(^|[.!?]\s+)Used [A-Z][\w.-]*(?: [A-Z][\w.-]*)?\.(?=\s|$)\s*/g, "$1")
+      .trim();
+  }
+
+  // What came back from one search, cut to its first clause ("Fetched 33 study records").
+  function shortToolResult(text, maxChars = 150) {
+    let value = oneLine(text).replace(/^Title:\s*/i, "");
+    const clause = value.match(/^(.{20,}?)(?:[.;](?:\s|$)|\s\|\s)/);
+    if (clause) value = clause[1];
+    return value.length > maxChars ? `${value.slice(0, maxChars - 1).trimEnd()}…` : value;
+  }
+
+  // An expanded checklist step: its full finding, the searches behind it, the records it cites and
+  // anything left open. Step ids, goals and status words stay out, since the checklist row shows them.
+  function stepDetailView(detail, liveLines = []) {
+    const finding = stripSourceBoilerplate(sanitizeDisplaySummary(detail?.result_summary || detail?.step_progress_note || ""));
+    const searches = [];
+    for (const entry of Array.isArray(detail?.tool_log) ? detail.tool_log : []) {
+      if (isInternalTool(entry?.raw_tool) || isInternalTool(entry?.tool)) continue;
+      const query = oneLine(entry?.summary);
+      if (query) searches.push({ source: oneLine(entry?.tool), query, result: shortToolResult(entry?.result) });
+    }
+    if (!searches.length) {
+      for (const line of liveLines) searches.push({ source: "", query: line, result: "" });
+    }
+    const sources = [];
+    const candidates = searches.length && searches.some((search) => search.source)
+      ? searches.map((search) => search.source)
+      : (Array.isArray(detail?.data_sources) ? detail.data_sources : []);
+    for (const source of candidates) {
+      const name = oneLine(source);
+      if (name && !isInternalTool(name) && !sources.includes(name)) sources.push(name);
+    }
+    const records = [];
+    for (const raw of Array.isArray(detail?.evidence_ids) ? detail.evidence_ids : []) {
+      const id = oneLine(raw);
+      if (id && !records.some((record) => record.id === id)) records.push({ id, url: recordUrl(id) });
+    }
+    const gaps = (Array.isArray(detail?.open_gaps) ? detail.open_gaps : []).map(oneLine).filter(Boolean);
+    return { finding, sources, searches, records, gaps };
+  }
+
   // Merge the plan's steps with live run data (or the saved research log) into what the plan
   // checklist renders: a phase for the whole run plus a status and one line per step.
   function computePlanProgress({
@@ -99,6 +176,7 @@
     const detailById = new Map(details.map((detail) => [String(detail?.id || ""), detail]));
 
     const liveLineById = new Map();
+    const liveLinesById = new Map();
     let currentStepId = "";
     let startedAt = "";
     let finishedAt = "";
@@ -112,7 +190,11 @@
       if (type === "tool.called") {
         const target = stepId || currentStepId;
         const line = String(event?.human_line || "").trim();
-        if (target && line) liveLineById.set(target, line);
+        if (target && line) {
+          liveLineById.set(target, line);
+          const lines = liveLinesById.get(target) || [];
+          if (!lines.includes(line)) liveLinesById.set(target, [...lines, line]);
+        }
       }
       if (type === "run.completed" || type === "run.failed" || type === "run.interrupted") {
         finishedAt = String(event?.at || "");
@@ -126,6 +208,7 @@
     else if (started && !awaitingApproval) phase = "running";
 
     const stepStates = {};
+    const stepViews = {};
     let finishedCount = 0;
     let runningId = "";
     for (const step of Array.isArray(steps) ? steps : []) {
@@ -145,6 +228,7 @@
         );
       }
       stepStates[stepId] = { status, line };
+      if (status !== "pending") stepViews[stepId] = stepDetailView(detail, liveLinesById.get(stepId) || []);
     }
 
     const stepIds = Object.keys(stepStates);
@@ -153,9 +237,12 @@
     } else if (phase === "running" && !runningId) {
       // The run has started but the first tool call has not arrived yet.
       const nextId = stepIds.find((stepId) => stepStates[stepId].status === "pending");
-      if (nextId) stepStates[nextId] = { status: "in_progress", line: liveLineById.get(nextId) || "Starting…" };
+      if (nextId) {
+        stepStates[nextId] = { status: "in_progress", line: liveLineById.get(nextId) || "Starting…" };
+        stepViews[nextId] = stepDetailView(detailById.get(nextId) || {}, liveLinesById.get(nextId) || []);
+      }
     }
-    return { phase, startedAt, finishedAt, stepStates };
+    return { phase, startedAt, finishedAt, stepStates, stepViews };
   }
 
   function planStatusText(progress, nowMs = Date.now(), fallbackStartedAt = "") {
@@ -177,9 +264,12 @@
     cleanStepFinding,
     computePlanProgress,
     formatElapsed,
+    isInternalTool,
     planStatusText,
     planningStageLabel,
+    recordUrl,
     sanitizeDisplaySummary,
     shouldUseStartingPlaceholder,
+    stepDetailView,
   };
 }));

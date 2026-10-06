@@ -38,6 +38,7 @@ const state = {
   graphRenderedTaskId: "",
   graphRenderedPayload: null,
   activityExpandedByTask: {},
+  expandedPlanSteps: new Set(),
   handlingTerminalRunIds: new Set(),
   startingTaskIds: new Set(),
 };
@@ -586,6 +587,71 @@ function planStepStatusClass(status) {
   return "is-pending";
 }
 
+function planStepKey(taskId, stepId) {
+  return `${String(taskId || "").trim()}:${String(stepId || "").trim()}`;
+}
+
+function isPlanStepExpanded(taskId, stepId) {
+  return state.expandedPlanSteps.has(planStepKey(taskId, stepId));
+}
+
+function setPlanStepExpanded(taskId, stepId, expanded) {
+  const key = planStepKey(taskId, stepId);
+  if (expanded) state.expandedPlanSteps.add(key);
+  else state.expandedPlanSteps.delete(key);
+}
+
+// A step opens only when its log adds something beyond the one line already shown.
+function planStepHasMore(view, line) {
+  if (!view) return false;
+  return Boolean((view.finding && view.finding !== line) || view.searches.length || view.records.length || view.gaps.length);
+}
+
+// The research log for one step: full finding, searches with what came back, linked records, open questions.
+function planStepMoreHtml(view) {
+  if (!view) return "";
+  const parts = [];
+  if (view.finding) parts.push(`<p class="step-more-finding">${inlineMarkdown(view.finding)}</p>`);
+  if (view.searches.length) {
+    const label = view.sources.length ? `Searches · ${view.sources.join(", ")}` : "Searches";
+    const items = view.searches.map((search) => {
+      const result = search.result ? ` <span class="step-more-result">→ ${escapeHtml(search.result)}</span>` : "";
+      return `<li>${escapeHtml(search.query)}${result}</li>`;
+    }).join("");
+    parts.push(`<div class="step-more-section"><p class="step-more-label">${escapeHtml(label)}</p><ul class="step-more-list">${items}</ul></div>`);
+  }
+  if (view.records.length) {
+    const records = view.records.map((record) => (record.url
+      ? `<a class="step-record" href="${escapeHtml(record.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(record.id)}</a>`
+      : `<span class="step-record">${escapeHtml(record.id)}</span>`)).join("");
+    parts.push(`<div class="step-more-section"><p class="step-more-label">Records</p><div class="step-more-records">${records}</div></div>`);
+  }
+  if (view.gaps.length) {
+    const gaps = view.gaps.map((gap) => `<li>${escapeHtml(gap)}</li>`).join("");
+    parts.push(`<div class="step-more-section"><p class="step-more-label">Open questions</p><ul class="step-more-list">${gaps}</ul></div>`);
+  }
+  return parts.join("");
+}
+
+const renderedStepMore = new WeakMap();
+
+function patchPlanStepMore(item, taskId, view, line) {
+  const toggle = item.querySelector('[data-action="toggle-step"]');
+  const more = item.querySelector('[data-role="step-more"]');
+  if (!toggle || !more) return;
+  const hasMore = planStepHasMore(view, line);
+  const expanded = hasMore && isPlanStepExpanded(taskId, item.dataset.stepId);
+  if (toggle.disabled !== !hasMore) toggle.disabled = !hasMore;
+  toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+  item.classList.toggle("is-expanded", expanded);
+  more.hidden = !expanded;
+  const html = expanded ? planStepMoreHtml(view) : "";
+  if (renderedStepMore.get(more) !== html) {
+    more.innerHTML = html;
+    renderedStepMore.set(more, html);
+  }
+}
+
 function planStatusAttributes(progress) {
   const live = progress.phase === "running" || progress.phase === "writing";
   const startedAt = progress.startedAt || progress.fallbackStartedAt || "";
@@ -625,9 +691,16 @@ function planHtmlForIteration(iteration) {
       }
     }
 
-    html += `<li class="plan-step ${planStepStatusClass(stepState.status)}" data-step-id="${escapeHtml(stepId)}" data-status="${escapeHtml(stepState.status)}">`;
+    const view = progress.stepViews[stepId];
+    const hasMore = tracking && planStepHasMore(view, stepState.line);
+    const expanded = hasMore && isPlanStepExpanded(taskId, stepId);
+    const moreId = escapeHtml(`step-more-${taskId}-${stepId}`);
+    html += `<li class="plan-step ${planStepStatusClass(stepState.status)}${expanded ? " is-expanded" : ""}" data-step-id="${escapeHtml(stepId)}" data-status="${escapeHtml(stepState.status)}">`;
     html += `<span class="plan-step-marker" aria-hidden="true"></span>`;
-    html += `<span class="plan-step-title">${title}</span>`;
+    // Once research starts, a step's title opens its share of the research log.
+    html += tracking
+      ? `<button type="button" class="plan-step-toggle" data-action="toggle-step" aria-controls="${moreId}" aria-expanded="${expanded}"${hasMore ? "" : " disabled"}><span class="plan-step-title">${title}</span></button>`
+      : `<span class="plan-step-title">${title}</span>`;
     // Sources and completion criteria help a reviewer approve the plan; once research starts the
     // live status line replaces them.
     if (!tracking && (source || completion)) {
@@ -641,6 +714,9 @@ function planHtmlForIteration(iteration) {
       html += `</ul>`;
     }
     html += `<p class="plan-step-line" data-role="step-line"${stepState.line ? "" : " hidden"}>${escapeHtml(stepState.line)}</p>`;
+    if (tracking) {
+      html += `<div class="plan-step-more" id="${moreId}" data-role="step-more"${expanded ? "" : " hidden"}>${expanded ? planStepMoreHtml(view) : ""}</div>`;
+    }
     html += `</li>`;
   });
   html += `</ol>`;
@@ -653,7 +729,10 @@ function planHtmlForIteration(iteration) {
 
 // Patch the plan checklist in place for a streamed run update (no timeline re-render).
 function updateInlinePlanProgress(run) {
-  const taskId = String(run?.task_id || "").trim();
+  patchPlanChecklist(String(run?.task_id || "").trim());
+}
+
+function patchPlanChecklist(taskId) {
   if (!taskId || !el.messages) return;
   const container = Array.from(el.messages.querySelectorAll('[data-role="plan-progress"]'))
     .find((node) => node.dataset.taskId === taskId);
@@ -698,6 +777,7 @@ function updateInlinePlanProgress(run) {
       if (lineEl.textContent !== stepState.line) lineEl.textContent = stepState.line;
       lineEl.hidden = !stepState.line;
     }
+    patchPlanStepMore(item, taskId, progress.stepViews[item.dataset.stepId], stepState.line);
   }
   const announcer = container.querySelector('[data-role="plan-announcer"]');
   if (announcer && announcements.length) announcer.textContent = announcements.join(". ");
@@ -813,10 +893,8 @@ function activityDisplaySummary(text) {
   return CoScientistActivityState.sanitizeDisplaySummary(text);
 }
 
-const INTERNAL_ACTIVITY_TOOL_NAMES = new Set(["list_skills", "load_skill", "load_skill_resource"]);
-
 function isInternalActivityTool(value) {
-  return INTERNAL_ACTIVITY_TOOL_NAMES.has(normalizeActivityText(value));
+  return CoScientistActivityState.isInternalTool(normalizeActivityText(value));
 }
 
 function activityStepStatusLabel(status) {
@@ -988,8 +1066,8 @@ function buildActivitySnapshot({ taskId = "", status = "", events = [], summarie
 
   const title = "Research log";
 
-  // The plan checklist above shows per-step progress; this card summarizes the log and expands to
-  // every source query and finding.
+  // Only runs without a plan checklist show this card; it summarizes the log and expands to every
+  // source query and finding.
   const queryCount = toolCalledEvents.length;
   const queryLabel = `${queryCount} source ${queryCount === 1 ? "query" : "queries"}`;
   let summary = "";
@@ -1113,8 +1191,7 @@ function minimalLoadingSpinnerHtml(label = "") {
 function pendingRunLabel() {
   if (!state.pendingUserMessage) return "";
   const elapsed = Date.now() - (state.pendingStartedAt || Date.now());
-  const stage = CoScientistActivityState.planningStageLabel(elapsed);
-  return `${stage}\u2026 ${CoScientistActivityState.formatElapsed(elapsed)}`;
+  return `${CoScientistActivityState.planningStageLabel(elapsed)}\u2026`;
 }
 
 function updateLoadingSpinnerLabel() {
@@ -1320,7 +1397,8 @@ function renderMessages() {
     }
 
     const runForTask = getRunForTask(task.task_id);
-    const activityCard = activityCardHtml(iterationActivitySnapshot(iteration));
+    // A planned run's research log lives in its checklist steps; the card remains for anything else.
+    const activityCard = planStepsForIteration(iteration).length ? "" : activityCardHtml(iterationActivitySnapshot(iteration));
     const shouldPlaceAfterPlan = placeActivityAfterPlan(task, runForTask);
     if (activityCard && !shouldPlaceAfterPlan) parts.push(activityCard);
 
@@ -3082,6 +3160,16 @@ function bindEvents() {
   });
 
   el.messages.addEventListener("click", (event) => {
+    const stepToggle = event.target.closest('[data-action="toggle-step"]');
+    if (stepToggle) {
+      const item = stepToggle.closest("li.plan-step");
+      const taskId = String(stepToggle.closest('[data-role="plan-progress"]')?.dataset.taskId || "").trim();
+      if (!item || !taskId || stepToggle.disabled) return;
+      setPlanStepExpanded(taskId, item.dataset.stepId, !isPlanStepExpanded(taskId, item.dataset.stepId));
+      patchPlanChecklist(taskId);
+      return;
+    }
+
     const activityCard = event.target.closest('[data-action="toggle-activity"]');
     if (activityCard) {
       if (activityCard.classList.contains("expanded") && event.target.closest(".activity-details")) return;
