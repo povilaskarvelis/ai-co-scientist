@@ -2,6 +2,8 @@
 const DEBUG_UI_ENABLED = new URLSearchParams(window.location.search).has("debug");
 const TERMINAL_RUN_STATES = new Set(["completed", "failed", "awaiting_hitl", "needs_clarification"]);
 const MAX_CONSECUTIVE_POLL_FAILURES = 5;
+// The checklist's closing "Write the report" row; plan steps use ids like S1.
+const REPORT_STEP_ID = "__report";
 
 const state = {
   conversations: [],
@@ -719,6 +721,15 @@ function planHtmlForIteration(iteration) {
     }
     html += `</li>`;
   });
+  if (tracking) {
+    // The report is the run's last step, so the checklist only completes when it is written.
+    const report = progress.reportState;
+    html += `<li class="plan-step plan-step-report ${planStepStatusClass(report.status)}" data-step-id="${REPORT_STEP_ID}" data-status="${escapeHtml(report.status)}">`;
+    html += `<span class="plan-step-marker" aria-hidden="true">${orbiterHtml("writing")}</span>`;
+    html += `<span class="plan-step-title">Write the report</span>`;
+    html += `<p class="plan-step-line" data-role="step-line"${report.line ? "" : " hidden"}>${escapeHtml(report.line)}</p>`;
+    html += `</li>`;
+  }
   html += `</ol>`;
   if (!tracking) {
     html += `<p class="plan-followup">You can revise the plan, share suggestions, or start the research when you're ready.</p>`;
@@ -760,11 +771,14 @@ function patchPlanChecklist(taskId) {
 
   const announcements = [];
   for (const item of container.querySelectorAll("li.plan-step")) {
-    const stepState = progress.stepStates[item.dataset.stepId] || { status: "pending", line: "" };
+    const stepState = item.dataset.stepId === REPORT_STEP_ID
+      ? progress.reportState
+      : (progress.stepStates[item.dataset.stepId] || { status: "pending", line: "" });
     const previous = item.dataset.status;
     if (previous !== stepState.status) {
       item.dataset.status = stepState.status;
-      item.className = `plan-step ${planStepStatusClass(stepState.status)}`;
+      item.classList.remove("is-done", "is-blocked", "is-running", "is-pending", "just-finished");
+      item.classList.add(planStepStatusClass(stepState.status));
       if (stepState.status === "completed" || stepState.status === "blocked") {
         // Animate only live transitions, never a full re-render of already-finished steps.
         item.classList.add("just-finished");
@@ -1183,21 +1197,42 @@ function getRunForTask(taskId) {
   return tid ? (state.runsByTaskId[tid] || null) : null;
 }
 
+// Orbiters: electrons circling a nucleus, after the atom mark. Each stage of the work has its own
+// pattern, so the page shows progress even while the server is quiet.
+const ORBITER_ELECTRONS = {
+  reading: "<i></i>",
+  sources: '<i></i><i class="ghost half"></i><i class="inner"></i>',
+  drafting: '<i class="ellipse"><b></b></i><i class="ellipse tilt"><b></b></i>',
+  writing: '<i></i><i class="ghost third"></i><i class="ghost two-thirds"></i>',
+};
+
+function orbiterHtml(variant) {
+  const electrons = ORBITER_ELECTRONS[variant] || ORBITER_ELECTRONS.reading;
+  return `<span class="orbiter" data-variant="${escapeHtml(variant)}" aria-hidden="true">${electrons}</span>`;
+}
+
+function pendingPlanningStage() {
+  return CoScientistActivityState.planningStage(Date.now() - (state.pendingStartedAt || Date.now()));
+}
+
 function minimalLoadingSpinnerHtml(label = "") {
   const labelHtml = label ? `<span class="loading-label">${escapeHtml(label)}</span>` : "";
-  return `<article class="message assistant loading-spinner-only" data-role="loading-spinner"><span class="activity-wheel" aria-hidden="true"></span>${labelHtml}</article>`;
+  return `<article class="message assistant loading-spinner-only" data-role="loading-spinner">${orbiterHtml(pendingPlanningStage().key)}${labelHtml}</article>`;
 }
 
 function pendingRunLabel() {
   if (!state.pendingUserMessage) return "";
-  const elapsed = Date.now() - (state.pendingStartedAt || Date.now());
-  return `${CoScientistActivityState.planningStageLabel(elapsed)}\u2026`;
+  return `${pendingPlanningStage().label}\u2026`;
 }
 
 function updateLoadingSpinnerLabel() {
   if (!el.messages) return;
   const spinner = el.messages.querySelector('[data-role="loading-spinner"]');
   if (!spinner) return;
+  // Each planning stage swaps in its own orbiter.
+  const stage = pendingPlanningStage().key;
+  const orbiter = spinner.querySelector(".orbiter");
+  if (orbiter && orbiter.dataset.variant !== stage) orbiter.outerHTML = orbiterHtml(stage);
   const label = pendingRunLabel();
   let labelEl = spinner.querySelector(".loading-label");
   if (label) {

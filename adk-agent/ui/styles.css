@@ -4,12 +4,12 @@
   --line-strong: #2f2f2f;
   --text: #f6f6f6;
   --muted: #8a8a8a;
-  --ok: #58d799;
+  --ok: #79ada2;
   --warn: #f0b760;
   --danger: #ff7e94;
-  --focus: #8cf7c2;
-  --accent: #8cf7c2;
-  --accent-dim: rgba(140, 247, 194, 0.14);
+  --focus: #79ada2;
+  --accent: #79ada2;
+  --accent-dim: rgba(121, 173, 162, 0.14);
   --running: #72dbff;
   --tag-medicine: #f5a3c0;
   --tag-discovery: #9fc2ff;
@@ -889,10 +889,10 @@ body.expanded .messages {
 
 .activity-card.is-complete .activity-wheel {
   animation: none;
-  border-color: #8cf7c2;
-  border-top-color: #8cf7c2;
-  border-right-color: #8cf7c2;
-  box-shadow: 0 0 14px rgba(95, 212, 160, 0.28);
+  border-color: var(--accent);
+  border-top-color: var(--accent);
+  border-right-color: var(--accent);
+  box-shadow: 0 0 14px rgba(121, 173, 162, 0.28);
 }
 
 .activity-card.is-error .activity-wheel {
@@ -1333,8 +1333,8 @@ body.expanded .messages {
 }
 
 .plan-status[data-phase="done"] {
-  border-color: rgba(140, 247, 194, 0.35);
-  color: #c9f5df;
+  border-color: rgba(121, 173, 162, 0.4);
+  color: #cfe6e1;
 }
 
 .plan-status[data-phase="done"]::before {
@@ -1380,7 +1380,7 @@ body.expanded .messages {
 }
 
 .plan-steps.is-tracking > li.is-done:not(:last-child)::before {
-  background: rgba(140, 247, 194, 0.35);
+  background: rgba(121, 173, 162, 0.45);
 }
 
 .plan-steps.is-tracking .plan-step-marker {
@@ -1408,20 +1408,188 @@ body.expanded .messages {
   color: #dff6ff;
 }
 
+/* A running step's electron circles its marker ring. */
 .plan-steps.is-tracking .is-running .plan-step-marker::after {
   content: "";
   position: absolute;
-  inset: -1.5px;
-  border: 1.5px solid transparent;
-  border-top-color: var(--running);
+  inset: -4px;
   border-radius: 50%;
-  animation: spin 900ms linear infinite;
+  background: radial-gradient(circle at 50% 3.25px, var(--running) 0 2.2px, transparent 2.8px);
+  animation: spin 1.2s linear infinite;
+}
+
+/* The closing "Write the report" row: its orbiter shows only while the report is being written. */
+.plan-step-report .plan-step-marker .orbiter {
+  display: none;
+}
+
+.plan-steps.is-tracking .plan-step-report.is-running .plan-step-marker {
+  border-color: transparent;
+  background: transparent;
+}
+
+.plan-steps.is-tracking .plan-step-report.is-running .plan-step-marker::before,
+.plan-steps.is-tracking .plan-step-report.is-running .plan-step-marker::after {
+  content: none;
+}
+
+.plan-step-report.is-running .plan-step-marker .orbiter {
+  display: block;
+}
+
+/* Orbiters: electrons circling a nucleus, after the atom mark. Each stage of the work has its own
+   pattern, so the page shows progress even while the server is quiet. */
+.orbiter {
+  position: relative;
+  display: block;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  animation: orbiter-in 240ms ease both;
+}
+
+.orbiter::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.orbiter > i {
+  position: absolute;
+  inset: 0;
+  border: 1px solid rgba(114, 219, 255, 0.2);
+  border-radius: 50%;
+  animation: spin 1.2s linear infinite;
+}
+
+.orbiter > i::after {
+  content: "";
+  position: absolute;
+  top: -2.5px;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  margin-left: -2px;
+  border-radius: 50%;
+  background: var(--running);
+}
+
+.orbiter > i.ghost {
+  border-color: transparent;
+}
+
+.orbiter > i.half {
+  animation-delay: -0.6s;
+}
+
+.orbiter > i.third {
+  animation-delay: -0.4s;
+}
+
+.orbiter > i.two-thirds {
+  animation-delay: -0.8s;
+}
+
+.orbiter > i.inner {
+  inset: 5px;
+  animation-duration: 1.8s;
+  animation-direction: reverse;
+}
+
+.orbiter > i.inner::after {
+  top: -2px;
+  width: 3px;
+  height: 3px;
+  margin-left: -1.5px;
+}
+
+/* Drafting the plan: the atom mark itself, an electron on each of two tilted orbits. */
+.orbiter > i.ellipse {
+  inset: 7px -1px;
+  animation: none;
+  transform: rotate(45deg);
+}
+
+.orbiter > i.ellipse.tilt {
+  transform: rotate(-45deg);
+}
+
+.orbiter > i.ellipse::after {
+  content: none;
+}
+
+.orbiter > i.ellipse b {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  margin: -2px 0 0 -2px;
+  animation: orbit-x 0.8s ease-in-out infinite alternate;
+}
+
+.orbiter > i.ellipse b::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: var(--running);
+  animation: orbit-y 0.8s ease-in-out -0.4s infinite alternate;
+}
+
+.orbiter > i.ellipse.tilt b {
+  animation-delay: -0.5s;
+}
+
+.orbiter > i.ellipse.tilt b::after {
+  animation-delay: -0.9s;
+}
+
+/* Writing the report: three electrons in step around a pulsing nucleus. */
+.orbiter[data-variant="writing"]::before {
+  animation: nucleus-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes orbit-x {
+  from {
+    transform: translateX(-12px);
+  }
+  to {
+    transform: translateX(12px);
+  }
+}
+
+@keyframes orbit-y {
+  from {
+    transform: translateY(-4px);
+  }
+  to {
+    transform: translateY(4px);
+  }
+}
+
+@keyframes nucleus-pulse {
+  50% {
+    transform: scale(1.35);
+  }
+}
+
+@keyframes orbiter-in {
+  from {
+    opacity: 0;
+    transform: scale(0.85);
+  }
 }
 
 .plan-steps.is-tracking .is-done .plan-step-marker {
   border-color: var(--accent);
   background: var(--accent);
-  color: #05150d;
+  color: #0e2420;
 }
 
 .plan-steps.is-tracking .is-done .plan-step-marker::before {

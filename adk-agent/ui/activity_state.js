@@ -41,11 +41,15 @@
   }
 
   // Planning has no streamed progress, so show what is happening in stages while it runs.
-  function planningStageLabel(elapsedMs) {
+  function planningStage(elapsedMs) {
     const seconds = Math.max(0, Number(elapsedMs) || 0) / 1000;
-    if (seconds < 4) return "Reading your question";
-    if (seconds < 10) return "Choosing which databases to search";
-    return "Drafting a research plan";
+    if (seconds < 4) return { key: "reading", label: "Reading your question" };
+    if (seconds < 10) return { key: "sources", label: "Choosing which databases to search" };
+    return { key: "drafting", label: "Drafting a research plan" };
+  }
+
+  function planningStageLabel(elapsedMs) {
+    return planningStage(elapsedMs).label;
   }
 
   function formatElapsed(ms) {
@@ -232,7 +236,8 @@
     }
 
     const stepIds = Object.keys(stepStates);
-    if (phase === "running" && stepIds.length && finishedCount === stepIds.length) {
+    const allStepsFinished = stepIds.length > 0 && finishedCount === stepIds.length;
+    if (phase === "running" && allStepsFinished) {
       phase = "writing";
     } else if (phase === "running" && !runningId) {
       // The run has started but the first tool call has not arrived yet.
@@ -242,7 +247,12 @@
         stepViews[nextId] = stepDetailView(detailById.get(nextId) || {}, liveLinesById.get(nextId) || []);
       }
     }
-    return { phase, startedAt, finishedAt, stepStates, stepViews };
+    // Writing the report is the run's last step; without it a finished checklist looks like the end.
+    let reportState = { status: "pending", line: "" };
+    if (phase === "writing") reportState = { status: "in_progress", line: "Writing a cited report from the findings…" };
+    else if (phase === "done") reportState = { status: "completed", line: "" };
+    else if (phase === "failed" && allStepsFinished) reportState = { status: "blocked", line: "The report could not be written." };
+    return { phase, startedAt, finishedAt, stepStates, stepViews, reportState };
   }
 
   function planStatusText(progress, nowMs = Date.now(), fallbackStartedAt = "") {
@@ -266,6 +276,7 @@
     formatElapsed,
     isInternalTool,
     planStatusText,
+    planningStage,
     planningStageLabel,
     recordUrl,
     sanitizeDisplaySummary,

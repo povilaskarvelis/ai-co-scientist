@@ -4874,9 +4874,10 @@ def test_router_before_model_callback_forces_research_workflow_for_all_landing_p
 def test_pending_query_ui_stays_in_planning_state_until_plan_is_ready():
     app_js = (ADK_AGENT_DIR / "ui/app.js").read_text(encoding="utf-8")
 
-    # While planning there is no streamed progress, so the pending view shows a staged, timed label.
+    # While planning there is no streamed progress, so the pending view shows a staged label and orbiter.
     assert "if (!state.pendingUserMessage) return \"\";" in app_js
-    assert "CoScientistActivityState.planningStageLabel(elapsed)" in app_js
+    assert "CoScientistActivityState.planningStage(" in app_js
+    assert "orbiterHtml(pendingPlanningStage().key)" in app_js
     assert "hasResearchProgress" not in app_js
     assert "Still preparing the next research step" not in app_js
     assert "No new progress update" not in app_js

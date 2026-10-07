@@ -7,6 +7,7 @@ const {
   computePlanProgress,
   formatElapsed,
   planStatusText,
+  planningStage,
   planningStageLabel,
   recordUrl,
   sanitizeDisplaySummary,
@@ -222,4 +223,21 @@ test("a running step lists its live searches until its step log arrives", () => 
     "Fetching DailyMed label for Kisunla",
   ]);
   assert.equal(progress.stepViews.S2, undefined);
+});
+
+test("each planning stage names the orbiter it shows", () => {
+  assert.deepEqual([1000, 6000, 25000].map((ms) => planningStage(ms).key), ["reading", "sources", "drafting"]);
+});
+
+test("the report row stays pending while steps run, writes after the last step and completes with the run", () => {
+  const finished = { step_details: PLAN_STEPS.map((step) => ({ id: step.id, status: "completed" })) };
+  const running = computePlanProgress({ runStatus: "running", started: true, steps: PLAN_STEPS });
+  const writing = computePlanProgress({ runStatus: "running", started: true, summaries: [finished], steps: PLAN_STEPS });
+  const done = computePlanProgress({ taskStatus: "completed", started: true, summaries: [finished], steps: PLAN_STEPS });
+  const failed = computePlanProgress({ runStatus: "failed", started: true, summaries: [finished], steps: PLAN_STEPS });
+
+  assert.equal(running.reportState.status, "pending");
+  assert.deepEqual(writing.reportState, { status: "in_progress", line: "Writing a cited report from the findings\u2026" });
+  assert.equal(done.reportState.status, "completed");
+  assert.equal(failed.reportState.status, "blocked");
 });
