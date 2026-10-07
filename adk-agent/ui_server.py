@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import hmac
+from html import escape as escape_html
 import ipaddress
 import json
 import logging
@@ -2955,11 +2956,19 @@ def _ui_asset_version() -> str:
     return "-".join(parts) or str(int(time.time()))
 
 
-def _render_ui_page(filename: str) -> HTMLResponse:
+def _public_origin(request: Request) -> str:
+    """The scheme and host visitors used, for absolute links such as the social preview image."""
+    scheme = (request.headers.get("x-forwarded-proto") or request.url.scheme).split(",")[0].strip()
+    host = request.headers.get("host") or request.url.netloc
+    return escape_html(f"{scheme}://{host}", quote=True)
+
+
+def _render_ui_page(filename: str, request: Request) -> HTMLResponse:
     html_path = UI_DIR / filename
     html = html_path.read_text(encoding="utf-8")
     html = html.replace("<!-- GA4_SNIPPET -->", _ga4_head_snippet(), 1)
     html = html.replace("__UI_VERSION__", _ui_asset_version())
+    html = html.replace("__PUBLIC_ORIGIN__", _public_origin(request))
     return HTMLResponse(
         content=html,
         headers={"Cache-Control": "no-store, max-age=0"},
@@ -2984,13 +2993,13 @@ async def _shutdown() -> None:
 
 
 @app.api_route("/", methods=["GET", "HEAD"])
-async def index() -> HTMLResponse:
-    return _render_ui_page("index.html")
+async def index(request: Request) -> HTMLResponse:
+    return _render_ui_page("index.html", request)
 
 
 @app.api_route("/about", methods=["GET", "HEAD"])
-async def about() -> HTMLResponse:
-    return _render_ui_page("about.html")
+async def about(request: Request) -> HTMLResponse:
+    return _render_ui_page("about.html", request)
 
 
 @app.get("/api/health")

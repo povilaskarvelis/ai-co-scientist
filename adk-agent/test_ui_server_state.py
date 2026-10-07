@@ -239,6 +239,19 @@ def test_browser_session_middleware_sets_signed_http_only_cookie():
     assert "SameSite=lax" in response.headers["set-cookie"]
 
 
+def test_pages_point_social_previews_at_the_address_visitors_used():
+    client = TestClient(ui_server.app)
+
+    for path in ("/", "/about"):
+        response = client.get(path, headers={"host": "co-scientist.example.org", "x-forwarded-proto": "https"})
+
+        assert response.status_code == 200
+        assert 'content="https://co-scientist.example.org/static/og-image.png"' in response.text
+        assert "__PUBLIC_ORIGIN__" not in response.text
+    assert client.get("/static/og-image.png").status_code == 200
+    assert client.get("/static/apple-touch-icon.png").status_code == 200
+
+
 def test_query_stream_keeps_request_open_until_run_completes(tmp_path, monkeypatch):
     test_runtime = ui_server.UiRuntime(tmp_path / "workflow_tasks.json")
     test_runtime.ready = True
