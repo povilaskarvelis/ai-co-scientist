@@ -41,6 +41,7 @@ const state = {
   graphRenderedPayload: null,
   activityExpandedByTask: {},
   expandedPlanSteps: new Set(),
+  graphNeedsFit: false,
   handlingTerminalRunIds: new Set(),
   startingTaskIds: new Set(),
 };
@@ -75,29 +76,29 @@ const el = {
 };
 
 const GRAPH_NODE_TYPE_COLORS = {
-  objective: "#ffd166",
-  source: "#8ec5ff",
-  query_focus: "#ffcf70",
-  support_cluster: "#4f627c",
-  compound: "#7dd8ff",
-  gene: "#6fb7ff",
-  protein: "#8a93ff",
-  disease: "#ff8b82",
-  phenotype: "#ffb062",
-  pathway: "#6be6be",
-  trial: "#f7d96b",
-  paper: "#d6a8ff",
-  dataset: "#8ce085",
-  tissue: "#59d8c8",
-  cell_line: "#f5a7b8",
-  study: "#c5d06f",
-  literal: "#9ea7b3",
-  record: "#9ea7b3",
+  objective: "#79ada2",
+  query_focus: "#79ada2",
+  source: "#a8a8a8",
+  support_cluster: "#3a3a3a",
+  compound: "#86b8c9",
+  gene: "#8fb3d9",
+  protein: "#a3a6d9",
+  disease: "#d99a9a",
+  phenotype: "#d9b38f",
+  pathway: "#a3c28f",
+  trial: "#d9c68f",
+  paper: "#b8a3d9",
+  dataset: "#9cc28f",
+  tissue: "#8fc2bd",
+  cell_line: "#d9a3b8",
+  study: "#c2c28f",
+  literal: "#8a8a8a",
+  record: "#8a8a8a",
 };
 
 const GRAPH_EDGE_COLORS = {
-  default: "#8da2b8",
-  mixed: "#f3b46f",
+  default: "#6a6a6a",
+  mixed: "#d9b38f",
 };
 
 function formatDate(iso) {
@@ -670,7 +671,7 @@ function planHtmlForIteration(iteration) {
   const status = planStatusAttributes(progress);
 
   let html = `<div class="plan-progress phase-${escapeHtml(progress.phase)}" data-role="plan-progress" data-task-id="${escapeHtml(taskId)}">`;
-  html += `<div class="plan-progress-head"><p class="plan-intro">${tracking ? "Research plan" : "To answer your question I will:"}</p>`;
+  html += `<div class="plan-progress-head"><p class="plan-intro">Research plan</p>`;
   html += `<span class="plan-status" data-role="plan-status" data-phase="${escapeHtml(progress.phase)}" data-started-at="${escapeHtml(status.startedAt)}" data-live="${status.live}"${status.text ? "" : " hidden"}>${escapeHtml(status.text)}</span></div>`;
   html += `<ol class="plan-steps${tracking ? " is-tracking" : ""}">`;
   steps.forEach((step, idx) => {
@@ -706,14 +707,10 @@ function planHtmlForIteration(iteration) {
     // Sources and completion criteria help a reviewer approve the plan; once research starts the
     // live status line replaces them.
     if (!tracking && (source || completion)) {
-      html += `<ul class="plan-step-details">`;
-      if (source) {
-        html += `<li><span class="plan-step-label">Potential source</span>${escapeHtml(source)}</li>`;
-      }
-      if (completion) {
-        html += `<li><span class="plan-step-label">Done when</span>${escapeHtml(completion)}</li>`;
-      }
-      html += `</ul>`;
+      html += `<p class="plan-step-meta">`;
+      if (source) html += `<span class="plan-step-source">${escapeHtml(source)}</span>`;
+      if (completion) html += `<span><span class="plan-step-label">Done when</span> ${escapeHtml(completion)}</span>`;
+      html += `</p>`;
     }
     html += `<p class="plan-step-line" data-role="step-line"${stepState.line ? "" : " hidden"}>${escapeHtml(stepState.line)}</p>`;
     if (tracking) {
@@ -862,28 +859,33 @@ function reportCardHtml(iteration) {
   `;
 }
 
+// Suggestions arrive as "**Title**: description"; split them into a card title and a short line.
+function splitSuggestion(text) {
+  const value = String(text || "").trim();
+  const bold = value.match(/^\*\*(.+?)\*\*\s*:?\s*(.*)$/s);
+  if (bold) return { title: bold[1].trim(), desc: bold[2].trim() };
+  const colon = value.match(/^([^:]{4,80}):\s+(.+)$/s);
+  if (colon) return { title: colon[1].trim(), desc: colon[2].trim() };
+  return { title: value, desc: "" };
+}
+
 function followUpSuggestionsHtml(iteration) {
   if (iteration?.is_direct_response) return "";
   const task = iteration?.task || {};
   if (String(task.status || "") !== "completed") return "";
   const report = iteration?.report || {};
   if (!report.has_report) return "";
-  const suggestions = Array.isArray(iteration?.follow_up_suggestions) ? iteration.follow_up_suggestions : [];
-  const lines = ["What would you like to do next?"];
-  lines.push("");
-  lines.push("For example, we could:");
-  if (suggestions.length) {
-    for (const item of suggestions.slice(0, 3)) {
-      lines.push(`- ${String(item || "").trim()}`);
-    }
-  } else {
-    lines.push("- Ask a focused follow-up to deepen or stress-test the recommendation.");
-  }
-  return `
-    <article class="message assistant">
-      <div class="message-body markdown-body">${markdownToHtml(lines.join("\n"))}</div>
-    </article>
-  `;
+  const suggestions = (Array.isArray(iteration?.follow_up_suggestions) ? iteration.follow_up_suggestions : [])
+    .map(splitSuggestion)
+    .filter((item) => item.title)
+    .slice(0, 3);
+  if (!suggestions.length) return "";
+  const cards = suggestions.map(({ title, desc }) => {
+    const query = desc ? `${title}: ${desc}` : title;
+    const descHtml = desc ? `<span class="followup-desc">${escapeHtml(desc)}</span>` : "";
+    return `<button type="button" class="followup" data-action="follow-up" data-query="${escapeHtml(query)}"><span class="followup-title">${escapeHtml(title)}</span>${descHtml}</button>`;
+  }).join("");
+  return `<div class="message assistant followups"><p class="followups-label">Suggested follow-ups</p>${cards}</div>`;
 }
 
 function activityExpansionKey(taskId) {
@@ -1197,18 +1199,18 @@ function getRunForTask(taskId) {
   return tid ? (state.runsByTaskId[tid] || null) : null;
 }
 
-// Orbiters: electrons circling a nucleus, after the atom mark. Each stage of the work has its own
+// Orbiters: comets sweeping the orbits of the atom mark. Each stage of the work has its own
 // pattern, so the page shows progress even while the server is quiet.
-const ORBITER_ELECTRONS = {
-  reading: "<i></i>",
-  sources: '<i></i><i class="ghost half"></i><i class="inner"></i>',
-  drafting: '<i class="ellipse"><b></b></i><i class="ellipse tilt"><b></b></i>',
-  writing: '<i></i><i class="ghost third"></i><i class="ghost two-thirds"></i>',
+const ORBITER_ORBITS = {
+  reading: "<i><b></b></i>",
+  sources: '<i><b></b></i><i class="inner"><b class="reverse"></b></i>',
+  drafting: '<i class="tilt-left"><b></b></i><i class="tilt-right"><b class="lag"></b></i>',
+  writing: '<i class="tilt-left"><b></b></i><i class="tilt-right"><b class="lag"></b></i>',
 };
 
 function orbiterHtml(variant) {
-  const electrons = ORBITER_ELECTRONS[variant] || ORBITER_ELECTRONS.reading;
-  return `<span class="orbiter" data-variant="${escapeHtml(variant)}" aria-hidden="true">${electrons}</span>`;
+  const orbits = ORBITER_ORBITS[variant] || ORBITER_ORBITS.reading;
+  return `<span class="orbiter" data-variant="${escapeHtml(variant)}" aria-hidden="true">${orbits}</span>`;
 }
 
 function pendingPlanningStage() {
@@ -1341,6 +1343,24 @@ function updateInlineActivityCard(run) {
   return true;
 }
 
+const CONVERSATION_STATUS_LABELS = {
+  in_progress: "In progress",
+  running: "In progress",
+  queued: "Queued",
+  awaiting_hitl: "Awaiting approval",
+  needs_clarification: "Needs input",
+  completed: "Completed",
+  failed: "Failed",
+  blocked: "Blocked",
+};
+
+function conversationStatusLabel(status) {
+  const value = String(status || "").trim();
+  if (CONVERSATION_STATUS_LABELS[value]) return CONVERSATION_STATUS_LABELS[value];
+  const words = value.replace(/_/g, " ").trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : "Unknown";
+}
+
 function renderSidebar() {
   let html = "";
   if (!state.conversations.length) {
@@ -1353,12 +1373,12 @@ function renderSidebar() {
       const conversationId = String(conversation.conversation_id || "");
       const active = conversationId === state.selectedConversationId ? "active" : "";
       const title = escapeHtml(conversationTitle(conversation));
-      const status = escapeHtml(String(conversation.latest_status || "unknown"));
+      const status = String(conversation.latest_status || "unknown").trim();
       const count = Number(conversation.iteration_count || 0);
       return `
         <article class="task-item ${active}" data-conversation-id="${escapeHtml(conversationId)}">
           <div class="task-line">
-            <span><span class="status-dot status-${status.replace(/\s+/g, "_")}"></span>${status}</span>
+            <span><span class="status-dot status-${escapeHtml(status.replace(/\s+/g, "_"))}"></span>${escapeHtml(conversationStatusLabel(status))}</span>
             <span>${formatDate(conversation.updated_at)}</span>
           </div>
           <div class="task-objective">${title}</div>
@@ -2043,25 +2063,34 @@ function applyFocusAnchoredPositions(cy, payload, graphElements) {
     );
   });
 
+  // Big layers (dozens of papers) wrap onto extra rings so nodes keep their spacing; later layers
+  // of the same group start beyond the last ring used.
+  const subRingGap = 46;
+  const nextRadiusByGroup = new Map();
   for (const [key, nodes] of layerEntries) {
     const [groupId, rawDistance] = key.split("::");
     const distance = Math.max(1, Number(rawDistance || 1));
     const groupIndex = Number(focusOrder.get(groupId) ?? 0);
     const centerAngle = (-Math.PI / 2) + ((Math.PI * 2 * groupIndex) / Math.max(1, focusCount));
     const wedge = focusCount > 1 ? Math.min((Math.PI * 1.45) / focusCount, Math.PI / 1.8) : Math.PI * 1.65;
-    const radius = baseRingRadius + ((distance - 1) * ringGap);
+    const radius = Math.max(baseRingRadius + ((distance - 1) * ringGap), nextRadiusByGroup.get(groupId) || 0);
     const sortedNodes = [...nodes].sort((left, right) => {
       const leftWeight = Number(left.data("support_weight") || 0) + Number(left.data("connected_claim_count") || 0);
       const rightWeight = Number(right.data("support_weight") || 0) + Number(right.data("connected_claim_count") || 0);
       return rightWeight - leftWeight;
     });
-    const step = sortedNodes.length > 1 ? wedge / (sortedNodes.length - 1) : 0;
+    const perRing = Math.max(6, Math.floor((wedge * radius) / 34));
+    const ringCount = Math.ceil(sortedNodes.length / perRing);
     sortedNodes.forEach((node, index) => {
-      const angle = sortedNodes.length === 1
+      const ring = Math.floor(index / perRing);
+      const ringSize = Math.min(perRing, sortedNodes.length - (ring * perRing));
+      const step = ringSize > 1 ? wedge / (ringSize - 1) : 0;
+      const angle = ringSize === 1
         ? centerAngle
-        : centerAngle - (wedge / 2) + (step * index);
-      positions[node.id()] = polarToPosition(radius, angle);
+        : centerAngle - (wedge / 2) + (step * (index % perRing));
+      positions[node.id()] = polarToPosition(radius + (ring * subRingGap), angle);
     });
+    nextRadiusByGroup.set(groupId, radius + ((ringCount - 1) * subRingGap) + ringGap);
   }
 
   cy.layout({
@@ -2240,10 +2269,14 @@ function initializeEvidenceGraph(taskId, payload) {
 
   el.graphCanvas.className = "graph-canvas";
   el.graphCanvas.innerHTML = "";
+  // A graph built while its panel is hidden has no size to fit; the size watcher fits it later.
+  state.graphNeedsFit = !(el.graphCanvas.clientWidth && el.graphCanvas.clientHeight);
   state.graphCy = window.cytoscape({
     container: el.graphCanvas,
     elements: [...graphElements.nodes, ...graphElements.edges],
     wheelSensitivity: 0.18,
+    minZoom: 0.08,
+    maxZoom: 3.5,
     style: [
       {
         selector: "node",
@@ -2252,7 +2285,7 @@ function initializeEvidenceGraph(taskId, payload) {
           width: "data(size)",
           height: "data(size)",
           label: "data(label)",
-          color: "#f3f7fd",
+          color: "#ececec",
           "font-size": 9.25,
           "font-weight": 600,
           "text-valign": "top",
@@ -2260,9 +2293,10 @@ function initializeEvidenceGraph(taskId, payload) {
           "text-margin-y": -8,
           "text-wrap": "wrap",
           "text-max-width": 92,
-          "text-outline-color": "#0d1117",
+          "text-outline-color": "#0b0b0b",
+          "min-zoomed-font-size": 7,
           "text-outline-width": 3.1,
-          "border-color": "#d8e6ff",
+          "border-color": "#d6d6d6",
           "border-width": 0.6,
           "overlay-opacity": 0,
         },
@@ -2271,10 +2305,10 @@ function initializeEvidenceGraph(taskId, payload) {
         selector: "node[is_focus > 0]",
         style: {
           "border-width": 2.6,
-          "border-color": "#ffd98a",
-          "shadow-blur": 24,
-          "shadow-color": "#ffcf70",
-          "shadow-opacity": 0.3,
+          "border-color": "#cfe6e1",
+          "shadow-blur": 20,
+          "shadow-color": "#79ada2",
+          "shadow-opacity": 0.35,
           "font-size": 10.2,
         },
       },
@@ -2283,11 +2317,11 @@ function initializeEvidenceGraph(taskId, payload) {
         style: {
           width: "mapData(size, 20, 44, 28, 56)",
           height: "mapData(size, 20, 44, 28, 56)",
-          "border-width": 4.8,
-          "border-color": "#fff5c2",
-          "shadow-blur": 42,
-          "shadow-color": "#ffe59a",
-          "shadow-opacity": 0.64,
+          "border-width": 4.2,
+          "border-color": "#cfe6e1",
+          "shadow-blur": 30,
+          "shadow-color": "#79ada2",
+          "shadow-opacity": 0.5,
           "background-blacken": -0.16,
           "text-outline-width": 4.6,
           "font-size": 10.8,
@@ -2298,10 +2332,10 @@ function initializeEvidenceGraph(taskId, payload) {
         selector: "node.is-selected-neighbor",
         style: {
           "border-width": 2.2,
-          "border-color": "#f0dca4",
-          "shadow-blur": 18,
-          "shadow-color": "#e4c46f",
-          "shadow-opacity": 0.22,
+          "border-color": "#a7c9c1",
+          "shadow-blur": 14,
+          "shadow-color": "#79ada2",
+          "shadow-opacity": 0.2,
           opacity: 0.88,
         },
       },
@@ -2314,7 +2348,7 @@ function initializeEvidenceGraph(taskId, payload) {
           "target-arrow-shape": "triangle",
           "arrow-scale": 0.85,
           "curve-style": "bezier",
-          opacity: 0.92,
+          opacity: 0.6,
         },
       },
       {
@@ -2361,7 +2395,7 @@ function initializeEvidenceGraph(taskId, payload) {
         selector: "node.is-dimmed",
         style: {
           "background-blacken": 0.52,
-          "border-color": "#465262",
+          "border-color": "#3a3a3a",
           "text-opacity": 0.24,
           "text-outline-opacity": 0.14,
         },
@@ -2377,10 +2411,10 @@ function initializeEvidenceGraph(taskId, payload) {
         style: {
           opacity: 1,
           "border-width": 2,
-          "border-color": "#ffffff",
-          "shadow-blur": 22,
-          "shadow-color": "#7aa1d8",
-          "shadow-opacity": 0.38,
+          "border-color": "#ececec",
+          "shadow-blur": 18,
+          "shadow-color": "#79ada2",
+          "shadow-opacity": 0.35,
         },
       },
       {
@@ -2388,10 +2422,10 @@ function initializeEvidenceGraph(taskId, payload) {
         style: {
           opacity: 1,
           "border-width": 2,
-          "border-color": "#ffe7bc",
-          "shadow-blur": 18,
-          "shadow-color": "#ffca7a",
-          "shadow-opacity": 0.35,
+          "border-color": "#cfe6e1",
+          "shadow-blur": 16,
+          "shadow-color": "#79ada2",
+          "shadow-opacity": 0.4,
         },
       },
     ],
@@ -3195,6 +3229,17 @@ function bindEvents() {
   });
 
   el.messages.addEventListener("click", (event) => {
+    // A suggested follow-up goes through the composer, so it gets the same guards as typing it.
+    const followUp = event.target.closest('[data-action="follow-up"]');
+    if (followUp) {
+      const query = String(followUp.dataset.query || "").trim();
+      if (!query) return;
+      el.promptInput.value = query;
+      updateSendVisibility();
+      el.composerForm.requestSubmit();
+      return;
+    }
+
     const stepToggle = event.target.closest('[data-action="toggle-step"]');
     if (stepToggle) {
       const item = stepToggle.closest("li.plan-step");
@@ -3381,8 +3426,29 @@ function bindEvents() {
   }
 }
 
+// Keep the graph renderer in step with its panel, and fit a graph that was built while hidden.
+function watchGraphCanvasSize() {
+  if (typeof ResizeObserver !== "function" || !el.graphCanvas) return;
+  let last = { width: 0, height: 0 };
+  new ResizeObserver(() => {
+    const cy = state.graphCy;
+    const width = el.graphCanvas.clientWidth;
+    const height = el.graphCanvas.clientHeight;
+    if (!cy || !width || !height) return;
+    cy.resize();
+    // Refit after a real layout change (panel opened or restacked), not after small resizes.
+    const changed = Math.abs(width - last.width) > last.width * 0.2 || Math.abs(height - last.height) > last.height * 0.2;
+    last = { width, height };
+    if (state.graphNeedsFit || changed) {
+      state.graphNeedsFit = false;
+      cy.fit(undefined, 72);
+    }
+  }).observe(el.graphCanvas);
+}
+
 async function bootstrap() {
   bindEvents();
+  watchGraphCanvasSize();
   updatePromptPlaceholder();
   updateSendVisibility();
   renderAll();

@@ -10,7 +10,7 @@
   --focus: #79ada2;
   --accent: #79ada2;
   --accent-dim: rgba(121, 173, 162, 0.14);
-  --running: #72dbff;
+  --running: var(--accent);
   --tag-medicine: #f5a3c0;
   --tag-discovery: #9fc2ff;
   --tag-data: #f0c27a;
@@ -145,8 +145,16 @@ body {
 }
 
 .status-pending,
-.status-in_progress {
+.status-awaiting_hitl,
+.status-needs_clarification {
   background: var(--warn);
+}
+
+.status-in_progress,
+.status-running,
+.status-queued {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--accent);
 }
 
 .status-completed {
@@ -279,30 +287,19 @@ body.expanded .chat-panel {
 }
 
 .report-panel {
-  border: 1px solid #2f3237;
-  border-radius: 18px;
-  background: linear-gradient(180deg, #111112 0%, #0f0f10 100%);
+  border: 1px solid #222222;
+  border-radius: 14px;
+  background: #0d0d0e;
   height: 100%;
   min-height: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  box-shadow:
-    0 12px 30px rgba(0, 0, 0, 0.34),
-    0 0 0 1px rgba(255, 255, 255, 0.03) inset;
-  transition:
-    border-color 200ms ease,
-    box-shadow 220ms ease,
-    background 220ms ease;
+  transition: border-color 200ms ease;
 }
 
 body.expanded .workspace.report-open .report-panel {
-  border-color: #3a4047;
-  background: linear-gradient(180deg, #121315 0%, #101113 100%);
-  box-shadow:
-    0 18px 42px rgba(0, 0, 0, 0.42),
-    0 0 0 1px rgba(196, 212, 230, 0.08) inset,
-    0 0 30px rgba(122, 145, 171, 0.12);
+  border-color: #2a2a2a;
 }
 
 .report-head {
@@ -311,8 +308,8 @@ body.expanded .workspace.report-open .report-panel {
   justify-content: space-between;
   gap: 10px;
   padding: 16px 36px;
-  border-bottom: 1px solid #2d3137;
-  background: linear-gradient(180deg, #151619 0%, #121315 100%);
+  border-bottom: 1px solid #1f1f1f;
+  background: #0d0d0e;
 }
 
 .report-actions {
@@ -458,7 +455,9 @@ body.expanded .workspace.report-open .report-panel {
   flex-direction: column;
   padding: 18px 24px 24px;
   gap: 14px;
+  container-type: inline-size;
 }
+
 
 .graph-toolbar {
   display: flex;
@@ -480,24 +479,24 @@ body.expanded .workspace.report-open .report-panel {
   font-size: 0.72rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: #8f9daf;
+  color: #7a7a7a;
 }
 
 .graph-search input {
   width: 100%;
   min-width: 0;
-  border: 1px solid #2a313a;
+  border: 1px solid #2a2a2a;
   border-radius: 10px;
-  background: rgba(11, 14, 20, 0.9);
-  color: #edf3fb;
+  background: #0e0e0e;
+  color: #ececec;
   padding: 10px 12px;
   font-size: 0.82rem;
   outline: none;
 }
 
 .graph-search input:focus {
-  border-color: #567393;
-  box-shadow: 0 0 0 3px rgba(86, 115, 147, 0.18);
+  border-color: rgba(121, 173, 162, 0.6);
+  box-shadow: 0 0 0 3px rgba(121, 173, 162, 0.15);
 }
 
 .graph-toolbar-actions {
@@ -516,10 +515,10 @@ body.expanded .workspace.report-open .report-panel {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  border: 1px solid #2a323c;
+  border: 1px solid #2a2a2a;
   border-radius: 999px;
-  background: rgba(14, 18, 24, 0.82);
-  color: #d7e2ef;
+  background: #0e0e0e;
+  color: #c8c8c8;
   padding: 6px 10px;
   font-size: 0.74rem;
 }
@@ -542,15 +541,10 @@ body.expanded .workspace.report-open .report-panel {
 .graph-canvas {
   position: relative;
   min-height: 520px;
-  border: 1px solid #2a3139;
-  border-radius: 16px;
-  background:
-    radial-gradient(circle at top, rgba(74, 99, 130, 0.17), transparent 44%),
-    linear-gradient(180deg, #101316 0%, #0d1014 100%);
+  border: 1px solid #1f1f1f;
+  border-radius: 14px;
+  background: #0b0b0b;
   overflow: hidden;
-  box-shadow:
-    inset 0 0 0 1px rgba(255, 255, 255, 0.02),
-    0 14px 30px rgba(0, 0, 0, 0.28);
 }
 
 .graph-canvas.is-empty,
@@ -565,30 +559,29 @@ body.expanded .workspace.report-open .report-panel {
 .graph-empty-state {
   max-width: 460px;
   text-align: center;
-  color: #d7e1ef;
+  color: #d6d6d6;
 }
 
 .graph-empty-title {
   margin: 0 0 8px;
   font-size: 1rem;
-  color: #eff5fd;
+  color: #ececec;
 }
 
 .graph-empty-copy {
   margin: 0;
   font-size: 0.82rem;
   line-height: 1.55;
-  color: #aebdce;
+  color: #a3a3a3;
 }
 
 .graph-inspector {
   min-height: 0;
   overflow: auto;
-  border: 1px solid #2a323b;
-  border-radius: 16px;
-  background: linear-gradient(180deg, rgba(20, 25, 32, 0.94) 0%, rgba(14, 18, 24, 0.98) 100%);
+  border: 1px solid #1f1f1f;
+  border-radius: 14px;
+  background: #0e0e0f;
   padding: 14px 13px 16px;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.02);
 }
 
 .graph-inspector-card {
@@ -601,19 +594,19 @@ body.expanded .workspace.report-open .report-panel {
   font-size: 0.72rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: #8fa3bc;
+  color: #7a7a7a;
 }
 
 .graph-inspector-title {
   margin: 0;
   font-size: 1.02rem;
   line-height: 1.3;
-  color: #f3f7fd;
+  color: #ececec;
 }
 
 .graph-inspector-copy {
   margin: 0;
-  color: #c8d5e4;
+  color: #b8b8b8;
   font-size: 0.82rem;
   line-height: 1.55;
 }
@@ -625,9 +618,9 @@ body.expanded .workspace.report-open .report-panel {
 }
 
 .graph-inspector-metric {
-  border: 1px solid #243242;
+  border: 1px solid #262626;
   border-radius: 12px;
-  background: rgba(9, 13, 18, 0.68);
+  background: #0b0b0b;
   padding: 10px 11px;
 }
 
@@ -637,14 +630,14 @@ body.expanded .workspace.report-open .report-panel {
   font-size: 0.68rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: #8ca2bc;
+  color: #7a7a7a;
 }
 
 .graph-inspector-value {
   display: block;
   font-size: 0.8rem;
   line-height: 1.4;
-  color: #eef5ff;
+  color: #ececec;
   word-break: break-word;
 }
 
@@ -657,10 +650,10 @@ body.expanded .workspace.report-open .report-panel {
 .graph-chip {
   display: inline-flex;
   align-items: center;
-  border: 1px solid #33475d;
+  border: 1px solid #2a2a2a;
   border-radius: 999px;
-  background: rgba(28, 41, 58, 0.52);
-  color: #e0edf9;
+  background: #0e0e0e;
+  color: #c8c8c8;
   padding: 5px 10px;
   font-size: 0.74rem;
   line-height: 1.3;
@@ -668,9 +661,9 @@ body.expanded .workspace.report-open .report-panel {
 }
 
 .graph-chip.is-warn {
-  border-color: #6e5531;
-  background: rgba(78, 58, 24, 0.5);
-  color: #ffe7bc;
+  border-color: #5a4a2e;
+  background: rgba(78, 58, 24, 0.32);
+  color: #f0d3a0;
 }
 
 .graph-inspector-section {
@@ -682,7 +675,7 @@ body.expanded .workspace.report-open .report-panel {
 .graph-inspector-section h4 {
   margin: 0;
   font-size: 0.8rem;
-  color: #ecf3fb;
+  color: #ececec;
 }
 
 .graph-inspector-list {
@@ -692,21 +685,37 @@ body.expanded .workspace.report-open .report-panel {
 }
 
 .graph-inspector-list-item {
-  border: 1px solid #243141;
+  border: 1px solid #262626;
   border-radius: 12px;
-  background: rgba(9, 12, 17, 0.6);
+  background: #0b0b0b;
   padding: 10px 11px;
 }
 
 .graph-inspector-list-item strong {
-  color: #eef5ff;
+  color: #ececec;
 }
 
 .graph-inspector-list-item p {
   margin: 0;
   font-size: 0.77rem;
   line-height: 1.5;
-  color: #c2d0df;
+  color: #b0b0b0;
+}
+
+/* In a narrow report panel the inspector sits below the graph instead of squeezing it. */
+@container (max-width: 680px) {
+  .graph-stage {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(340px, 1fr) auto;
+  }
+
+  .graph-canvas {
+    min-height: 340px;
+  }
+
+  .graph-inspector {
+    max-height: 240px;
+  }
 }
 
 .landing-hero {
@@ -869,12 +878,8 @@ body.expanded .messages {
   width: 22px;
   height: 22px;
   border-radius: 50%;
-  border: 2px solid rgba(92, 157, 196, 0.28);
-  border-top-color: #72dbff;
-  border-right-color: #7ef2cd;
-  box-shadow:
-    0 0 12px rgba(98, 195, 255, 0.3),
-    0 0 20px rgba(72, 138, 226, 0.22);
+  border: 2px solid rgba(121, 173, 162, 0.24);
+  border-top-color: var(--running);
   animation: spin 1000ms linear infinite;
   flex: 0 0 auto;
 }
@@ -1139,22 +1144,22 @@ body.expanded .messages {
 }
 
 .report-card {
-  border: 1px solid #2c3442 !important;
-  border-radius: 12px !important;
-  background: linear-gradient(145deg, rgba(24, 28, 40, 0.94), rgba(14, 17, 26, 0.96)) !important;
-  box-shadow:
-    0 0 0 1px rgba(135, 162, 198, 0.08) inset,
-    0 12px 26px rgba(0, 0, 0, 0.24);
-  padding: 10px 12px !important;
+  border: 1px solid #2a2a2a !important;
+  border-radius: 10px !important;
+  background: #0c0c0c !important;
+  padding: 11px 14px !important;
   cursor: pointer;
   margin: 2px 0 4px;
+  transition: border-color 150ms ease, background 150ms ease;
+}
+
+.report-card:hover {
+  border-color: #3a3a3a !important;
+  background: #111111 !important;
 }
 
 .report-card.active {
-  border-color: #5f7ea0 !important;
-  box-shadow:
-    0 0 0 1px rgba(146, 190, 234, 0.22) inset,
-    0 0 18px rgba(84, 130, 183, 0.25);
+  border-color: rgba(121, 173, 162, 0.55) !important;
 }
 
 .report-card-head {
@@ -1162,13 +1167,18 @@ body.expanded .messages {
   justify-content: space-between;
   align-items: baseline;
   gap: 8px;
-  font-size: 0.76rem;
-  color: #b8c7d9;
+  font-size: 0.74rem;
+  color: #8a8a8a;
+}
+
+.report-card-head strong {
+  color: var(--accent);
+  font-weight: 600;
 }
 
 .report-card-title {
-  margin-top: 6px;
-  color: #e7eef8;
+  margin-top: 5px;
+  color: #ececec;
   font-size: 0.86rem;
   line-height: 1.35;
 }
@@ -1176,13 +1186,67 @@ body.expanded .messages {
 .branch-badge {
   display: inline-block;
   margin-top: 8px;
-  border: 1px solid #35516d;
+  border: 1px solid #2a2a2a;
   border-radius: 999px;
   padding: 3px 9px;
   font-size: 0.72rem;
   letter-spacing: 0.02em;
-  color: #b6cee8;
-  background: rgba(34, 58, 86, 0.55);
+  color: #b8b8b8;
+  background: #0e0e0e;
+}
+
+/* Suggested follow-ups: compact cards like the landing page's example queries. */
+.followups {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 10px 0 4px;
+}
+
+.followups-label {
+  margin: 0 0 2px;
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #7a7a7a;
+}
+
+.followup {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid #2a2a2a;
+  border-radius: 10px;
+  background: #0c0c0c;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 150ms ease, background 150ms ease;
+}
+
+.followup:hover {
+  border-color: #3a3a3a;
+  background: #111111;
+}
+
+.followup-title {
+  font-size: 0.84rem;
+  font-weight: 600;
+  line-height: 1.35;
+  color: #e6e6e6;
+}
+
+.followup-desc {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: #8e8e8e;
 }
 
 .message-head {
@@ -1253,49 +1317,56 @@ body.expanded .messages {
   margin-bottom: 0.3em;
   padding-left: 0;
   border-left: none;
-  color: #ebf2ff;
+  color: #f0f0f0;
 }
 
+/* The plan is one checklist from review to finish: numbered markers on a connector line. */
 .checkpoint-message .plan-steps {
-  margin: 0.7em 0 0.4em;
-  padding-left: 1.4em;
-  list-style: decimal;
+  margin: 1em 0 0.4em;
+  padding-left: 0;
+  list-style: none;
+  counter-reset: plan-step;
 }
 
 .checkpoint-message .plan-steps > li {
-  margin: 0.85em 0;
-  padding-left: 0.2em;
+  position: relative;
+  margin: 0;
+  padding: 0 0 16px 36px;
   line-height: 1.45;
+  counter-increment: plan-step;
 }
 
 .plan-step-title {
   display: block;
   font-weight: 600;
-  color: #e8f0fb;
+  color: #ececec;
   font-size: 0.9rem;
 }
 
-.plan-step-details {
-  margin: 0.35em 0 0 0.15em !important;
-  padding-left: 0.75em !important;
-  list-style: none !important;
-  border-left: 2px solid #2d3d52;
+/* Before approval each step shows where it will look and when it counts as done. */
+.checkpoint-message .plan-step-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  margin: 5px 0 0;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: #a3a3a3;
 }
 
-.plan-step-details > li {
-  margin: 0.22em 0 !important;
-  font-size: 0.83rem;
-  color: #a8b8cc;
-  line-height: 1.4;
+.plan-step-source {
+  padding: 1px 9px;
+  border: 1px solid #2a2a2a;
+  border-radius: 999px;
+  background: #0e0e0e;
+  font-size: 0.74rem;
+  color: #b8b8b8;
+  white-space: nowrap;
 }
 
 .plan-step-label {
-  font-weight: 500;
-  color: #6b8aaa;
-  margin-right: 0.35em;
-  text-transform: uppercase;
-  font-size: 0.72rem;
-  letter-spacing: 0.04em;
+  color: #7a7a7a;
 }
 
 /* Plan checklist: once research starts, each step shows its live status and a one-line result. */
@@ -1307,8 +1378,12 @@ body.expanded .messages {
   gap: 8px 12px;
 }
 
-.plan-intro {
+.checkpoint-message .plan-intro {
   margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: #a0a0a0;
 }
 
 .plan-status {
@@ -1316,11 +1391,11 @@ body.expanded .messages {
   align-items: center;
   gap: 8px;
   padding: 4px 11px;
-  border: 1px solid #2c3442;
+  border: 1px solid #2a2a2a;
   border-radius: 999px;
-  background: #10141b;
+  background: #111111;
   font-size: 0.76rem;
-  color: #b9c6d6;
+  color: #b8b8b8;
   font-variant-numeric: tabular-nums;
 }
 
@@ -1333,7 +1408,7 @@ body.expanded .messages {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #5b6676;
+  background: #6a6a6a;
 }
 
 .plan-status[data-phase="running"]::before,
@@ -1360,40 +1435,22 @@ body.expanded .messages {
   background: var(--danger);
 }
 
-.plan-step-marker {
-  display: none;
-}
-
-.checkpoint-message .plan-steps.is-tracking {
-  margin-top: 1em;
-  padding-left: 0;
-  list-style: none;
-  counter-reset: plan-step;
-}
-
-.checkpoint-message .plan-steps.is-tracking > li {
-  position: relative;
-  margin: 0;
-  padding: 0 0 16px 36px;
-  counter-increment: plan-step;
-}
-
 /* Connector between step markers. */
-.plan-steps.is-tracking > li:not(:last-child)::before {
+.plan-steps > li:not(:last-child)::before {
   content: "";
   position: absolute;
   left: 11px;
   top: 27px;
   bottom: 3px;
   width: 1px;
-  background: #253041;
+  background: #262626;
 }
 
 .plan-steps.is-tracking > li.is-done:not(:last-child)::before {
   background: rgba(121, 173, 162, 0.45);
 }
 
-.plan-steps.is-tracking .plan-step-marker {
+.plan-steps .plan-step-marker {
   position: absolute;
   left: 0;
   top: 0;
@@ -1401,31 +1458,35 @@ body.expanded .messages {
   place-items: center;
   width: 23px;
   height: 23px;
-  border: 1.5px solid #364254;
+  border: 1.5px solid #3a3a3a;
   border-radius: 50%;
-  background: #0b0f15;
-  color: #7f8ea3;
+  background: #0b0b0b;
+  color: #8a8a8a;
   font-size: 0.72rem;
   font-weight: 600;
 }
 
-.plan-steps.is-tracking .plan-step-marker::before {
+.plan-steps .plan-step-marker::before {
   content: counter(plan-step);
 }
 
 .plan-steps.is-tracking .is-running .plan-step-marker {
-  border-color: rgba(114, 219, 255, 0.25);
-  color: #dff6ff;
+  border-color: rgba(121, 173, 162, 0.25);
+  color: #e6e6e6;
 }
 
-/* A running step's electron circles its marker ring. */
+/* A running step's comet circles its marker ring. */
 .plan-steps.is-tracking .is-running .plan-step-marker::after {
   content: "";
   position: absolute;
-  inset: -4px;
+  inset: -1.5px;
   border-radius: 50%;
-  background: radial-gradient(circle at 50% 3.25px, var(--running) 0 2.2px, transparent 2.8px);
-  animation: spin 1.2s linear infinite;
+  background:
+    radial-gradient(circle at 50% 1px, var(--running) 0 1px, transparent 1.35px),
+    conic-gradient(from 0deg, transparent 0 50%, var(--running));
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1.5px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 1.5px));
+  animation: spin 1.4s linear infinite;
 }
 
 /* The closing "Write the report" row: its orbiter shows only while the report is being written. */
@@ -1447,8 +1508,8 @@ body.expanded .messages {
   display: block;
 }
 
-/* Orbiters: electrons circling a nucleus, after the atom mark. Each stage of the work has its own
-   pattern, so the page shows progress even while the server is quiet. */
+/* Orbiters: comets sweeping the orbits of the atom mark around its nucleus. Each stage of the
+   work has its own pattern, so the page shows progress even while the server is quiet. */
 .orbiter {
   position: relative;
   display: block;
@@ -1463,8 +1524,8 @@ body.expanded .messages {
   position: absolute;
   inset: 0;
   margin: auto;
-  width: 5px;
-  height: 5px;
+  width: 4px;
+  height: 4px;
   border-radius: 50%;
   background: var(--accent);
 }
@@ -1472,115 +1533,51 @@ body.expanded .messages {
 .orbiter > i {
   position: absolute;
   inset: 0;
-  border: 1px solid rgba(114, 219, 255, 0.2);
+  border: 1px solid rgba(121, 173, 162, 0.24);
   border-radius: 50%;
-  animation: spin 1.2s linear infinite;
-}
-
-.orbiter > i::after {
-  content: "";
-  position: absolute;
-  top: -2.5px;
-  left: 50%;
-  width: 4px;
-  height: 4px;
-  margin-left: -2px;
-  border-radius: 50%;
-  background: var(--running);
-}
-
-.orbiter > i.ghost {
-  border-color: transparent;
-}
-
-.orbiter > i.half {
-  animation-delay: -0.6s;
-}
-
-.orbiter > i.third {
-  animation-delay: -0.4s;
-}
-
-.orbiter > i.two-thirds {
-  animation-delay: -0.8s;
 }
 
 .orbiter > i.inner {
   inset: 5px;
-  animation-duration: 1.8s;
-  animation-direction: reverse;
 }
 
-.orbiter > i.inner::after {
-  top: -2px;
-  width: 3px;
-  height: 3px;
-  margin-left: -1.5px;
+.orbiter > i.tilt-left {
+  transform: rotate(45deg) scaleY(0.4);
 }
 
-/* Drafting the plan: the atom mark itself, an electron on each of two tilted orbits. */
-.orbiter > i.ellipse {
-  inset: 7px -1px;
-  animation: none;
-  transform: rotate(45deg);
+.orbiter > i.tilt-right {
+  transform: rotate(-45deg) scaleY(0.4);
 }
 
-.orbiter > i.ellipse.tilt {
-  transform: rotate(-45deg);
-}
-
-.orbiter > i.ellipse::after {
-  content: none;
-}
-
-.orbiter > i.ellipse b {
+/* A comet: a gradient tail sweeping along its orbit, brightest at its rounded head. */
+.orbiter > i > b {
   position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 4px;
-  height: 4px;
-  margin: -2px 0 0 -2px;
-  animation: orbit-x 0.8s ease-in-out infinite alternate;
-}
-
-.orbiter > i.ellipse b::after {
-  content: "";
-  position: absolute;
-  inset: 0;
+  inset: -1px;
   border-radius: 50%;
-  background: var(--running);
-  animation: orbit-y 0.8s ease-in-out -0.4s infinite alternate;
+  background:
+    radial-gradient(circle at 50% 0.85px, var(--running) 0 0.85px, transparent 1.2px),
+    conic-gradient(from 0deg, transparent 0 50%, var(--running));
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 1.7px), #000 calc(100% - 1.2px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 1.7px), #000 calc(100% - 1.2px));
+  animation: spin 1.4s linear infinite;
 }
 
-.orbiter > i.ellipse.tilt b {
-  animation-delay: -0.5s;
+/* A counter-rotating comet mirrors its gradient so the head still leads. */
+.orbiter > i > b.reverse {
+  background:
+    radial-gradient(circle at 50% 0.85px, var(--running) 0 0.85px, transparent 1.2px),
+    conic-gradient(from 0deg, var(--running), transparent 50%);
+  animation-direction: reverse;
+  animation-duration: 2.1s;
 }
 
-.orbiter > i.ellipse.tilt b::after {
-  animation-delay: -0.9s;
+.orbiter > i > b.lag {
+  animation-delay: -0.7s;
 }
 
-/* Writing the report: three electrons in step around a pulsing nucleus. */
+/* Writing the report: the atom's comets around a pulsing nucleus. */
 .orbiter[data-variant="writing"]::before {
   animation: nucleus-pulse 1.2s ease-in-out infinite;
-}
-
-@keyframes orbit-x {
-  from {
-    transform: translateX(-12px);
-  }
-  to {
-    transform: translateX(12px);
-  }
-}
-
-@keyframes orbit-y {
-  from {
-    transform: translateY(-4px);
-  }
-  to {
-    transform: translateY(4px);
-  }
 }
 
 @keyframes nucleus-pulse {
@@ -1621,14 +1618,14 @@ body.expanded .messages {
 }
 
 .plan-steps.is-tracking .is-pending .plan-step-title {
-  color: #8794a6;
+  color: #8a8a8a;
 }
 
 .plan-step-line {
   margin: 4px 0 0;
   font-size: 0.82rem;
   line-height: 1.45;
-  color: #9fb0c4;
+  color: #a3a3a3;
 }
 
 .plan-step-line[hidden] {
@@ -1636,7 +1633,7 @@ body.expanded .messages {
 }
 
 .plan-steps .is-running .plan-step-line {
-  color: #cfeaff;
+  color: #d4d4d4;
 }
 
 .plan-steps .is-blocked .plan-step-line {
@@ -1667,8 +1664,8 @@ body.expanded .messages {
   flex: 0 0 auto;
   width: 6px;
   height: 6px;
-  border-right: 1.5px solid #7f91a6;
-  border-bottom: 1.5px solid #7f91a6;
+  border-right: 1.5px solid #8a8a8a;
+  border-bottom: 1.5px solid #8a8a8a;
   transform: translateY(-2px) rotate(45deg);
   transition: transform 160ms ease;
 }
@@ -1698,7 +1695,7 @@ body.expanded .messages {
   margin: 0;
   font-size: 0.84rem;
   line-height: 1.5;
-  color: #c4d1e0;
+  color: #cfcfcf;
 }
 
 .plan-step-more .step-more-section {
@@ -1711,7 +1708,7 @@ body.expanded .messages {
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: #6b8aaa;
+  color: #7a7a7a;
 }
 
 .plan-step-more .step-more-list {
@@ -1724,11 +1721,11 @@ body.expanded .messages {
   margin: 0 0 4px;
   font-size: 0.8rem;
   line-height: 1.45;
-  color: #a8b8cc;
+  color: #a8a8a8;
 }
 
 .plan-step-more .step-more-result {
-  color: #7f91a6;
+  color: #8a8a8a;
 }
 
 .plan-step-more .step-more-records {
@@ -1739,18 +1736,18 @@ body.expanded .messages {
 
 .plan-step-more .step-record {
   padding: 2px 9px;
-  border: 1px solid #2a3646;
+  border: 1px solid #2a2a2a;
   border-radius: 999px;
   font-size: 0.72rem;
   line-height: 1.5;
-  color: #a8b8cc;
-  background: #0d131b;
+  color: #a8a8a8;
+  background: #0e0e0e;
   text-decoration: none;
 }
 
 .plan-step-more a.step-record:hover {
-  border-color: #3d5068;
-  color: #e3edf8;
+  border-color: #444444;
+  color: #ececec;
 }
 
 .sr-only {
@@ -1775,7 +1772,7 @@ body.expanded .messages {
 .markdown-body blockquote {
   margin: 0.4em 0;
   padding-left: 0.8em;
-  border-left: 2px solid #2f2f2f;
+  border-left: 2px solid rgba(121, 173, 162, 0.45);
   color: #cfcfcf;
 }
 
@@ -1785,7 +1782,7 @@ body.expanded .messages {
 
 .markdown-body hr {
   border: none;
-  border-top: 1px solid #2f3237;
+  border-top: 1px solid #232323;
   margin: 0.6em 0;
 }
 
@@ -1816,16 +1813,16 @@ body.expanded .messages {
   width: 100%;
   border-collapse: collapse;
   margin: 0.9em 0 1.1em;
-  border: 1px solid #2f3237;
+  border: 1px solid #262626;
   border-radius: 10px;
   overflow: hidden;
-  background: #111214;
+  background: #0f0f10;
   table-layout: fixed;
 }
 
 .markdown-body th,
 .markdown-body td {
-  border: 1px solid #2f3237;
+  border: 1px solid #262626;
   padding: 0.58em 0.72em;
   text-align: left;
   vertical-align: top;
@@ -1834,8 +1831,8 @@ body.expanded .messages {
 }
 
 .markdown-body th {
-  background: #17191d;
-  color: #f2f6fb;
+  background: #151515;
+  color: #f0f0f0;
   font-weight: 600;
 }
 
@@ -1844,8 +1841,16 @@ body.expanded .messages {
 }
 
 .markdown-body a {
-  color: #d8d8d8;
+  color: #e6e6e6;
   text-decoration: underline;
+  text-decoration-color: rgba(121, 173, 162, 0.55);
+  text-underline-offset: 2px;
+  transition: color 150ms ease, text-decoration-color 150ms ease;
+}
+
+.markdown-body a:hover {
+  color: var(--accent);
+  text-decoration-color: var(--accent);
 }
 
 .report-content.markdown-body {
@@ -1906,7 +1911,7 @@ body.expanded .messages {
 
 .report-content.markdown-body hr {
   border: none;
-  border-top: 1px solid #2f3237;
+  border-top: 1px solid #232323;
   margin: 1.3em 0;
 }
 
