@@ -1,6 +1,8 @@
 // The raw workflow-state debug panel is a developer tool; show it only with ?debug=1.
 const DEBUG_UI_ENABLED = new URLSearchParams(window.location.search).has("debug");
-const TERMINAL_RUN_STATES = new Set(["completed", "failed", "awaiting_hitl", "needs_clarification"]);
+const TERMINAL_RUN_STATES = new Set(["completed", "failed", "awaiting_hitl", "needs_clarification", "stopped"]);
+// Plan and research runs can be stopped; plan revisions and quick answers are short.
+const STOPPABLE_RUN_KINDS = new Set(["new_query", "start_task"]);
 const MAX_CONSECUTIVE_POLL_FAILURES = 5;
 // The checklist's closing "Write the report" row; plan steps use ids like S1.
 const REPORT_STEP_ID = "__report";
@@ -41,6 +43,7 @@ const state = {
   graphRenderedPayload: null,
   activityExpandedByTask: {},
   expandedPlanSteps: new Set(),
+  stoppingRunIds: new Set(),
   graphNeedsFit: false,
   handlingTerminalRunIds: new Set(),
   startingTaskIds: new Set(),
@@ -53,6 +56,7 @@ const el = {
   messages: document.getElementById("messages"),
   promptInput: document.getElementById("promptInput"),
   sendBtn: document.getElementById("sendBtn"),
+  stopBtn: document.getElementById("stopBtn"),
   composerForm: document.getElementById("composerForm"),
   newChatBtn: document.getElementById("newChatBtn"),
   notice: document.getElementById("notice"),
@@ -501,6 +505,52 @@ function updateSendVisibility() {
   const hasText = el.promptInput.value.trim().length > 0;
   el.sendBtn.classList.toggle("hidden", !hasText);
   el.sendBtn.disabled = !hasText || state.isLoading || !state.health?.ok;
+  updateStopButton();
+}
+
+// The run Stop applies to: a plan or research run shown in this view that is still working.
+function stoppableRun() {
+  const runs = [...state.activeRunIds].map((runId) => state.runsByRunId[runId]).filter(Boolean).reverse();
+  for (const run of runs) {
+    if (!STOPPABLE_RUN_KINDS.has(String(run.kind || ""))) continue;
+    if (!["running", "queued", "in_progress"].includes(String(run.status || ""))) continue;
+    const iteration = findIteration(state.selectedConversationDetail, run.task_id);
+    if (run.run_id !== state.pendingRunId && !iteration) continue;
+    // Writing the report takes seconds; stopping then would only lose it.
+    if (iteration && planProgressForIteration(iteration).phase === "writing") return null;
+    return run;
+  }
+  return null;
+}
+
+function updateStopButton() {
+  if (!el.stopBtn) return;
+  const run = stoppableRun();
+  const stopping = Boolean(run && state.stoppingRunIds.has(run.run_id));
+  el.stopBtn.classList.toggle("hidden", !run);
+  el.stopBtn.disabled = stopping;
+  const label = el.stopBtn.querySelector(".stop-label");
+  if (label) label.textContent = stopping ? "Stopping…" : "Stop";
+  if (run) el.sendBtn.classList.add("hidden");
+}
+
+async function stopActiveRun() {
+  const run = stoppableRun();
+  if (!run || state.stoppingRunIds.has(run.run_id)) return;
+  const planningQuestion = run.run_id === state.pendingRunId ? state.pendingUserMessage : "";
+  state.stoppingRunIds.add(run.run_id);
+  updateStopButton();
+  try {
+    const payload = await api(`/api/runs/${encodeURIComponent(run.run_id)}/stop`, { method: "POST" });
+    const accepted = ["running", "queued", "in_progress"].includes(String(payload?.status || ""));
+    if (!accepted) state.stoppingRunIds.delete(run.run_id);
+    // A stopped plan puts the question back in the box, ready to edit and send again.
+    if (accepted && planningQuestion && !el.promptInput.value.trim()) el.promptInput.value = planningQuestion;
+  } catch (err) {
+    state.stoppingRunIds.delete(run.run_id);
+    setNotice(`Could not stop: ${err.message}`, true);
+  }
+  updateSendVisibility();
 }
 
 function setLoading(isLoading) {
@@ -572,6 +622,7 @@ function planProgressForIteration(iteration) {
     runStatus,
     taskStatus: String(task.status || ""),
     awaitingApproval: Boolean(task.awaiting_hitl) && !isStarting,
+    paused: Boolean(task.paused) && Boolean(task.awaiting_hitl) && !isStarting,
     started: taskHasStarted(task) || isStarting,
     events: useRun ? runEvents : (Array.isArray(researchLog.events) ? researchLog.events : []),
     summaries: useRun
@@ -728,6 +779,9 @@ function planHtmlForIteration(iteration) {
     html += `</li>`;
   }
   html += `</ol>`;
+  if (progress.phase === "paused") {
+    html += `<p class="plan-followup">Paused. Resume to carry on from the next step, or type below to revise the plan.</p>`;
+  }
   if (!tracking) {
     const blocked = Array.isArray(iteration?.task?.planning_blockers) && iteration.task.planning_blockers.length > 0;
     html += blocked
@@ -1316,6 +1370,8 @@ function placeActivityAfterPlan(task, activeRun) {
 }
 
 function updateInlineActivityCard(run) {
+  // Every streamed or polled run update passes through here, so Stop follows the run's phase.
+  updateStopButton();
   if (!run || !el.messages) return false;
   updateInlinePlanProgress(run);
   const runTaskId = String(run.task_id || "").trim();
@@ -1355,6 +1411,8 @@ const CONVERSATION_STATUS_LABELS = {
   completed: "Completed",
   failed: "Failed",
   blocked: "Blocked",
+  paused: "Paused",
+  stopped: "Stopped",
 };
 
 function conversationStatusLabel(status) {
@@ -1446,6 +1504,12 @@ function renderMessages() {
     const userText = String(task.user_query || task.objective || "").trim() || "(empty query)";
     parts.push(`<article class="message user"><pre class="message-body">${escapeHtml(userText)}</pre></article>`);
 
+    // A plan the user stopped before it was ready leaves only a short note.
+    if (String(task.status || "") === "stopped") {
+      parts.push(`<article class="message assistant"><div class="message-body stopped-note">Stopped</div></article>`);
+      continue;
+    }
+
     if (iteration?.is_direct_response) {
       const directText = String(iteration?.direct_response_text || "").trim();
       if (directText) {
@@ -1470,7 +1534,9 @@ function renderMessages() {
     const planHtml = planHtmlForIteration(iteration);
     const awaiting = Boolean(task.awaiting_hitl);
     const hasBlockers = Array.isArray(task.planning_blockers) && task.planning_blockers.length > 0;
-    const buttonLabel = hasBlockers
+    const buttonLabel = task.paused
+      ? "Resume research"
+      : hasBlockers
       ? "Revise plan"
       : (task.hitl_history && (task.hitl_history.includes("approve") || task.hitl_history.includes("continue")) ? "Approve plan" : "Start research");
     parts.push(checkpointHtml(task.task_id, planHtml, awaiting, buttonLabel));
@@ -2797,7 +2863,7 @@ async function selectConversation(conversationId, { silent = false, skipRender =
         try {
           const run = await api(`/api/runs/${encodeURIComponent(runId)}`);
           storeRunData(run);
-          const terminal = ["completed", "failed", "awaiting_hitl", "needs_clarification"].includes(String(run?.status || ""));
+          const terminal = TERMINAL_RUN_STATES.has(String(run?.status || ""));
           if (!terminal) startRunPolling(runId);
         } catch {
           /* run may have finished, ignore */
@@ -2957,6 +3023,7 @@ async function handleTerminalRunState(run) {
     }
 
     state.activeRunIds.delete(run.run_id);
+    state.stoppingRunIds.delete(run.run_id);
     if (state.pendingRunId === run.run_id) state.pendingRunId = null;
     if (state.activeRunIds.size === 0) {
       if (state.pollTimer) {
@@ -3323,6 +3390,10 @@ function bindEvents() {
     el.messages.scrollTop = scrollTop;
   });
 
+  el.stopBtn?.addEventListener("click", () => {
+    stopActiveRun().catch((err) => setNotice(`Could not stop: ${err.message}`, true));
+  });
+
   el.composerForm.addEventListener("submit", (event) => {
     event.preventDefault();
     const query = el.promptInput.value.trim();
@@ -3344,11 +3415,14 @@ function bindEvents() {
     }
 
     if (state.selectedConversationId) {
-      const anchorTaskId =
-        state.selectedReportTaskId
-        || String(detail?.conversation?.selected_report_task_id || "").trim()
-        || latestCompletedTaskId(detail)
-        || "";
+      // Follow-ups build on a finished report, never on a stopped or failed attempt.
+      const anchorTaskId = [
+        state.selectedReportTaskId,
+        detail?.conversation?.selected_report_task_id,
+        latestCompletedTaskId(detail),
+      ]
+        .map((taskId) => String(taskId || "").trim())
+        .find((taskId) => taskId && String(findIteration(detail, taskId)?.task?.status || "") === "completed") || "";
       submitNewQuery(query, {
         conversationId: state.selectedConversationId,
         parentTaskId: anchorTaskId || null,

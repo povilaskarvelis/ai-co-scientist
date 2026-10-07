@@ -34,6 +34,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from google.adk import Runner
 from google.adk.agents.run_config import RunConfig
+from google.adk.events import Event, EventActions
 from google.adk.sessions import InMemorySessionService
 from google.genai.types import Content, Part
 from pydantic import BaseModel, Field
@@ -47,6 +48,7 @@ from state_store import (
     create_state_store,
     interrupt_run_payload,
     interrupt_task_payload,
+    task_display_status,
 )
 from report_pdf import write_markdown_pdf
 from co_scientist.tool_registry import TOOL_SOURCE_NAMES
@@ -322,6 +324,15 @@ _USAGE_FIELDS = (
     ("output", "candidates_token_count"),
     ("tool_prompt", "tool_use_prompt_token_count"),
 )
+
+
+# Only planning and research runs can be stopped; plan revisions and quick answers are short.
+STOPPABLE_RUN_KINDS = frozenset({"new_query", "start_task"})
+
+
+def _workflow_report_ready(wf_state: dict | None) -> bool:
+    synthesis = (wf_state or {}).get("latest_synthesis") or {}
+    return (wf_state or {}).get("plan_status") == "completed" and bool(str(synthesis.get("markdown", "")).strip())
 
 
 def _planning_blockers(wf_state: dict | None) -> list[str]:
@@ -829,6 +840,7 @@ def _task_summary(task: dict) -> dict:
         "user_query": task.get("user_query", task.get("objective", "")),
         "status": task.get("status", ""),
         "awaiting_hitl": bool(task.get("awaiting_hitl")),
+        "paused": bool(task.get("paused")),
         "planning_blockers": list(task.get("planning_blockers") or []),
         "current_step_index": task.get("current_step_index", 0),
         "step_count": len(task.get("steps", [])),
@@ -920,6 +932,8 @@ class UiRuntime:
         self._conv_sessions_lock = asyncio.Lock()
         self.runs_lock = asyncio.Lock()
         self.runs: dict[str, RunRecord] = {}
+        # Runs the user asked to stop; checked after every workflow event (see request_stop).
+        self.stop_requested_runs: set[str] = set()
         self.background_tasks: set[asyncio.Task] = set()
         self.run_tasks: dict[str, asyncio.Task] = {}
         self._run_write_guard = threading.Lock()
@@ -1428,6 +1442,8 @@ class UiRuntime:
         """Retry turns when the only returned content is a transient status line."""
         last_response = ("", "")
         for attempt in range(max_transient_retries + 1):
+            if run_id in self.stop_requested_runs:
+                return last_response
             response_text, responding_author = await self._run_workflow_turn(
                 conversation_id,
                 prompt,
@@ -1483,12 +1499,19 @@ class UiRuntime:
                 label=f"append_progress:{run_id}",
             )
 
-        async for event in cs.runner.run_async(
+        events = cs.runner.run_async(
             session_id=cs.session_id,
             user_id=self.user_id,
             new_message=current_message,
             run_config=RunConfig(max_llm_calls=MAX_LLM_CALLS_PER_TURN),
-        ):
+        )
+        # A stop takes effect between events: the model or tool call in flight finishes, its event
+        # (already saved by the runner) is reported, and no further call starts.
+        while run_id not in self.stop_requested_runs:
+            try:
+                event = await events.__anext__()
+            except StopAsyncIteration:
+                break
             usage_metadata = getattr(event, "usage_metadata", None)
             if usage_metadata is not None and not getattr(event, "partial", False):
                 _add_event_usage(turn_usage, str(getattr(event, "author", "") or ""), usage_metadata)
@@ -1712,6 +1735,9 @@ class UiRuntime:
                 continue
             partial_by_author[author] = f"{partial_by_author.get(author, '')}{text}"
 
+        if run_id in self.stop_requested_runs:
+            await events.aclose()
+
         if turn_usage:
             _fire_and_forget_threadsafe(
                 self._merge_run_usage(run_id, turn_usage),
@@ -1867,6 +1893,81 @@ class UiRuntime:
             self.runs[run.run_id] = run
         self.store.save_run(run.to_dict(), flush=True)
         return run
+
+    async def request_stop(self, run_id: str) -> dict | None:
+        """Ask a planning or research run to stop after its current model or tool call."""
+        async with self.runs_lock:
+            run = self.runs.get(run_id)
+            if not run:
+                return None
+            stoppable = run.kind in STOPPABLE_RUN_KINDS and run.status in {"queued", "running", "in_progress"}
+        if stoppable and run_id not in self.stop_requested_runs:
+            self.stop_requested_runs.add(run_id)
+            await self._append_progress_event(
+                run_id,
+                phase="execute" if run.kind == "start_task" else "plan",
+                event_type="run.stopping",
+                status="progress",
+                human_line="Stopping...",
+            )
+        return await self.get_run(run_id)
+
+    async def _write_session_state(self, conversation_id: str, updates: dict) -> None:
+        """Change workflow session state the way ADK persists it: through an event's state delta."""
+        cs = self.conv_sessions.get(conversation_id)
+        if not cs or not self.session_service:
+            return
+        session = await self.session_service.get_session(
+            app_name=cs.app_name, user_id=self.user_id, session_id=cs.session_id,
+        )
+        if session is None:
+            return
+        event = Event(author="ui_server", actions=EventActions(state_delta=dict(updates)))
+        await self.session_service.append_event(session, event)
+
+    async def _pause_research(self, run_id: str, task: dict, conv_id: str, wf_state: dict | None) -> None:
+        """Park a stopped research run at its plan checkpoint, keeping the finished steps.
+
+        Reopening the approval gate lets "Resume" continue from the next step through the normal
+        approve path, and lets typed feedback revise the plan like any other checkpoint.
+        """
+        self.stop_requested_runs.discard(run_id)
+        await self._write_session_state(conv_id, {STATE_PLAN_PENDING_APPROVAL: True})
+        task_id = task["task_id"]
+        task["steps"] = _steps_from_workflow_state(wf_state) or task.get("steps", [])
+        task["current_step_index"] = sum(1 for s in task["steps"] if s.get("status") == "completed")
+        task["awaiting_hitl"] = True
+        task["paused"] = True
+        task["status"] = "in_progress"
+        await self._save_task_with_progress(task, run_id)
+        await self._append_progress_event(
+            run_id,
+            phase="checkpoint",
+            event_type="run.stopped",
+            status="done",
+            human_line="Research paused.",
+            task_id=task_id,
+        )
+        await self._update_run(run_id, status="awaiting_hitl", task_id=task_id)
+
+    async def _stop_planning(self, run_id: str, task: dict, conv_id: str) -> None:
+        """Drop a plan the user stopped, so their next message starts a fresh plan."""
+        self.stop_requested_runs.discard(run_id)
+        await self._write_session_state(conv_id, {STATE_PLAN_PENDING_APPROVAL: False})
+        task_id = task["task_id"]
+        task["status"] = "stopped"
+        task["awaiting_hitl"] = False
+        task["steps"] = []
+        await self._save_task_with_progress(task, run_id)
+        await self._append_progress_event(
+            run_id,
+            phase="plan",
+            event_type="run.stopped",
+            status="done",
+            human_line="Stopped before the plan was ready.",
+            task_id=task_id,
+        )
+        await self._update_run(run_id, status="stopped", task_id=task_id)
 
     async def _merge_run_usage(self, run_id: str, usage: dict[str, dict[str, int]]) -> None:
         """Add one workflow turn's token counts to the run, and log them for cost tracking."""
@@ -2194,7 +2295,12 @@ class UiRuntime:
             # Approving a plan with tool-capability blockers revises it instead of starting research,
             # which looked like a glitch from the "Start research" button. Revise once now, so the plan
             # the user approves is one that can run.
-            if plan_pending and not terminal_error and _planning_blockers(wf_state):
+            if (
+                plan_pending
+                and not terminal_error
+                and run_id not in self.stop_requested_runs
+                and _planning_blockers(wf_state)
+            ):
                 await self._append_progress_event(
                     run_id,
                     phase="plan",
@@ -2212,6 +2318,10 @@ class UiRuntime:
                 planner_failed = not terminal_error and not wf_state and not plan_pending
                 task["steps"] = _steps_from_workflow_state(wf_state)
                 task["current_step_index"] = 0
+
+            if run_id in self.stop_requested_runs:
+                await self._stop_planning(run_id, task, conv_id)
+                return
 
             if terminal_error:
                 run_error = _derive_run_error_message(response_text, "Run failed.")
@@ -2314,6 +2424,7 @@ class UiRuntime:
             await self._fail_task_after_crash(task_id, run_id)
             traceback.print_exc()
         finally:
+            self.stop_requested_runs.discard(run_id)
             if conversation_acquired:
                 await self._finish_conversation_operation(
                     conv_id,
@@ -2331,7 +2442,7 @@ class UiRuntime:
             task = self.store.get_task(task_id)
             if not task or task.get("awaiting_hitl"):
                 return
-            if str(task.get("status", "")).strip() in {"completed", "failed"}:
+            if str(task.get("status", "")).strip() in {"completed", "failed", "stopped"}:
                 return
             task["status"] = "failed"
             await self._save_task_with_progress(task, run_id)
@@ -2361,6 +2472,7 @@ class UiRuntime:
             await self._update_run(run_id, task_id=task_id, title=task.get("title", ""))
             task["hitl_history"].append("approve")
             task["awaiting_hitl"] = False
+            task["paused"] = False
             await self._save_task_with_progress(task, run_id)
 
             planned_steps = list(task.get("steps") or [])
@@ -2414,6 +2526,11 @@ class UiRuntime:
                 response_text, _ = await self._run_workflow_turn_filtered(
                     conv_id, "approve", run_id=run_id,
                 )
+                if run_id in self.stop_requested_runs:
+                    stopped_state = await self._read_workflow_state(conv_id)
+                    if not _workflow_report_ready(stopped_state):
+                        await self._pause_research(run_id, task, conv_id, stopped_state)
+                        break
                 if _is_terminal_workflow_error_response(response_text):
                     run_error = _derive_run_error_message(response_text, "Run failed.")
                     task["status"] = "failed"
@@ -2556,6 +2673,7 @@ class UiRuntime:
             await self._fail_task_after_crash(task_id, run_id)
             traceback.print_exc()
         finally:
+            self.stop_requested_runs.discard(run_id)
             if conversation_acquired:
                 await self._finish_conversation_operation(
                     conv_id,
@@ -2667,6 +2785,7 @@ class UiRuntime:
             task["steps"] = _steps_from_workflow_state(wf_state)
             task["hitl_history"].append(f"revise:{message}")
             task["awaiting_hitl"] = plan_pending
+            task["paused"] = False
             task["planning_blockers"] = _planning_blockers(wf_state)
             task["status"] = "in_progress"
 
@@ -2713,6 +2832,7 @@ class UiRuntime:
             await self._fail_task_after_crash(task_id, run_id)
             traceback.print_exc()
         finally:
+            self.stop_requested_runs.discard(run_id)
             if conversation_acquired:
                 await self._finish_conversation_operation(
                     conv_id,
@@ -2827,7 +2947,7 @@ class UiRuntime:
                 "title": latest.get("title") or root.get("title") or "Research",
                 "root_task_id": root["task_id"],
                 "latest_task_id": latest["task_id"],
-                "latest_status": latest.get("status", ""),
+                "latest_status": task_display_status(latest),
                 "updated_at": latest.get("updated_at", ""),
                 "iteration_count": len(tasks),
                 "selected_report_task_id": selected_report_task_id,
@@ -3242,6 +3362,15 @@ async def _run_response(run_id: str, request: Request):
             },
         )
     payload = await runtime.wait_for_run(run_id)
+    if not payload:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found.")
+    return _public_run_payload(payload)
+
+
+@app.post("/api/runs/{run_id}/stop")
+async def stop_run(run_id: str, request: Request) -> dict:
+    await _check_run_ownership(run_id, request)
+    payload = await runtime.request_stop(run_id)
     if not payload:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found.")
     return _public_run_payload(payload)

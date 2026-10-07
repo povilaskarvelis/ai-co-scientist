@@ -1626,3 +1626,136 @@ async def test_run_new_query_revises_a_blocked_plan_before_asking_for_approval(r
     assert payload["status"] == "awaiting_hitl"
     assert task["steps"][0]["title"] == "Revised step"
     assert task["planning_blockers"] == []
+
+
+@pytest.mark.asyncio
+async def test_stopping_research_pauses_at_the_checkpoint_and_keeps_finished_steps(runtime):
+    calls = 0
+    session_writes: list[dict] = []
+
+    async def fake_turn(conversation_id: str, prompt: str, *, run_id: str):
+        nonlocal calls
+        calls += 1
+        await runtime.request_stop(run_id)
+        return "Working", "research_workflow"
+
+    async def fake_read_state(conversation_id: str):
+        return {
+            "plan_status": "in_progress",
+            "steps": [
+                {"id": "S1", "goal": "Read the labels", "status": "completed"},
+                {"id": "S2", "goal": "Compare trials", "status": "in_progress"},
+            ],
+        }
+
+    async def fake_write_state(conversation_id: str, updates: dict) -> None:
+        session_writes.append(updates)
+
+    runtime._run_workflow_turn_filtered = fake_turn  # type: ignore[method-assign]
+    runtime._read_workflow_state = fake_read_state  # type: ignore[method-assign]
+    runtime._write_session_state = fake_write_state  # type: ignore[method-assign]
+
+    task = ui_server._make_task("task_pause", "Compare antibodies", "conv_pause")
+    task["awaiting_hitl"] = True
+    runtime.store.save_task(task)
+
+    run = await runtime._create_run("start_task", task_id=task["task_id"])
+    await runtime._run_start_task(run.run_id, task["task_id"])
+
+    payload = await runtime.get_run(run.run_id)
+    stored = runtime.store.get_task(task["task_id"])
+    # Stop takes effect after the turn in flight: no further turns, and the approval gate reopens
+    # so "Resume research" continues through the normal approve path.
+    assert calls == 1
+    assert session_writes == [{STATE_PLAN_PENDING_APPROVAL: True}]
+    assert payload["status"] == "awaiting_hitl"
+    assert any(event["type"] == "run.stopped" for event in payload["progress_events"])
+    assert stored["status"] == "in_progress"
+    assert stored["awaiting_hitl"] is True
+    assert stored["paused"] is True
+    assert [step["status"] for step in stored["steps"]] == ["completed", "in_progress"]
+    assert stored["current_step_index"] == 1
+    assert ui_server._task_summary(stored)["paused"] is True
+    assert runtime.store.list_conversations()[0]["latest_status"] == "paused"
+    assert run.run_id not in runtime.stop_requested_runs
+
+
+@pytest.mark.asyncio
+async def test_stopping_a_plan_drops_it_so_the_next_message_plans_afresh(runtime):
+    prompts: list[str] = []
+    session_writes: list[dict] = []
+
+    async def fake_acquire_conversation_session(conversation_id: str):
+        return SimpleNamespace(app_name="test-app", session_id=conversation_id)
+
+    async def fake_turn(conversation_id: str, prompt: str, *, run_id: str):
+        prompts.append(prompt)
+        await runtime.request_stop(run_id)
+        return "## Research Plan\n\n1. Inspect labels.", "research_workflow"
+
+    async def fake_read_state(conversation_id: str):
+        return {
+            "objective": "Compare KRAS G12C response",
+            "plan_status": "ready",
+            "planning_blockers": ["S2: the selected tool cannot compare lineages"],
+            "steps": [{"id": "S1", "goal": "Original step", "status": "pending"}],
+        }
+
+    async def fake_plan_pending(conversation_id: str) -> bool:
+        return True
+
+    async def fake_write_state(conversation_id: str, updates: dict) -> None:
+        session_writes.append(updates)
+
+    runtime._acquire_conversation_session = fake_acquire_conversation_session  # type: ignore[method-assign]
+    runtime._run_workflow_turn_filtered = fake_turn  # type: ignore[method-assign]
+    runtime._read_workflow_state = fake_read_state  # type: ignore[method-assign]
+    runtime._is_plan_pending_approval = fake_plan_pending  # type: ignore[method-assign]
+    runtime._write_session_state = fake_write_state  # type: ignore[method-assign]
+
+    run = await runtime._create_run("new_query", query="Compare KRAS G12C response")
+    await runtime._run_new_query(run.run_id, "Compare KRAS G12C response")
+
+    payload = await runtime.get_run(run.run_id)
+    task = runtime.store.get_task(payload["task_id"])
+    # The blocked-plan revision is skipped too: a stop ends planning outright.
+    assert prompts == ["Compare KRAS G12C response"]
+    assert session_writes == [{STATE_PLAN_PENDING_APPROVAL: False}]
+    assert payload["status"] == "stopped"
+    assert task["status"] == "stopped"
+    assert task["awaiting_hitl"] is False
+    assert task["steps"] == []
+    assert run.run_id not in runtime.stop_requested_runs
+
+
+@pytest.mark.asyncio
+async def test_stop_only_applies_to_running_plan_and_research_runs(runtime):
+    feedback = await runtime._create_run("feedback_task", task_id="task_feedback")
+    await runtime._update_run(feedback.run_id, status="running")
+    finished = await runtime._create_run("start_task", task_id="task_finished")
+    await runtime._update_run(finished.run_id, status="completed")
+    research = await runtime._create_run("start_task", task_id="task_research")
+    await runtime._update_run(research.run_id, status="running")
+
+    assert await runtime.request_stop("run_missing") is None
+    await runtime.request_stop(feedback.run_id)
+    await runtime.request_stop(finished.run_id)
+    payload = await runtime.request_stop(research.run_id)
+
+    assert runtime.stop_requested_runs == {research.run_id}
+    assert payload["progress_events"][-1]["type"] == "run.stopping"
+
+
+@pytest.mark.asyncio
+async def test_session_state_writes_survive_the_session_copy(runtime):
+    session = await runtime.session_service.create_session(
+        app_name="test-app", user_id=runtime.user_id, state={STATE_PLAN_PENDING_APPROVAL: False},
+    )
+    runtime.conv_sessions["conv_write"] = SimpleNamespace(app_name="test-app", session_id=session.id)
+
+    await runtime._write_session_state("conv_write", {STATE_PLAN_PENDING_APPROVAL: True})
+
+    reloaded = await runtime.session_service.get_session(
+        app_name="test-app", user_id=runtime.user_id, session_id=session.id,
+    )
+    assert reloaded.state[STATE_PLAN_PENDING_APPROVAL] is True

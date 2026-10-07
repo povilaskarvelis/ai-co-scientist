@@ -166,6 +166,11 @@ body {
   background: var(--danger);
 }
 
+.status-paused,
+.status-stopped {
+  background: #6a6a6a;
+}
+
 .main-panel {
   background: transparent;
   border: none;
@@ -2117,6 +2122,36 @@ body.expanded .example-queries {
 
 .hidden {
   display: none !important;
+}
+
+/* Stop takes Send's place while a plan or research run is going. */
+.stop-btn {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 38px;
+  padding: 0 15px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+}
+
+.stop-btn.hidden {
+  display: none;
+}
+
+.stop-icon {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
+.stopped-note {
+  font-size: 0.84rem;
+  color: #8a8a8a;
 }
 
 .send-btn {

@@ -81,6 +81,13 @@ def compact_progress_event(event: dict[str, Any]) -> dict[str, Any]:
     return compacted
 
 
+def task_display_status(task: dict[str, Any]) -> str:
+    """The status a conversation shows: research the visitor stopped reads as paused."""
+    if task.get("paused") and task.get("awaiting_hitl"):
+        return "paused"
+    return str(task.get("status", "") or "")
+
+
 def compact_progress_state(record: dict[str, Any]) -> dict[str, Any]:
     """Bound the progress fields of a stored task or run in place and return it."""
     summaries = [item for item in list(record.get("progress_summaries") or []) if isinstance(item, dict)]
@@ -222,7 +229,7 @@ class JsonTaskStore:
                     {
                         "conversation_id": conv["conversation_id"],
                         "title": conv.get("title", "Research"),
-                        "latest_status": latest["status"] if latest else "unknown",
+                        "latest_status": task_display_status(latest) if latest else "unknown",
                         "updated_at": conv.get("updated_at", ""),
                         "iteration_count": len(tasks),
                     }
@@ -553,7 +560,11 @@ class PostgresTaskStore:
                     WHERE t.conversation_id = c.conversation_id
                 ) AS task_counts ON TRUE
                 LEFT JOIN LATERAL (
-                    SELECT status
+                    SELECT CASE
+                        WHEN t.task_json->>'paused' = 'true' AND t.task_json->>'awaiting_hitl' = 'true'
+                        THEN 'paused'
+                        ELSE t.status
+                    END AS status
                     FROM tasks t
                     WHERE t.conversation_id = c.conversation_id
                     ORDER BY t.updated_at DESC, t.task_id DESC
@@ -870,7 +881,7 @@ def interrupt_task_payload(
         return False
 
     task.pop("active_run_id", None)
-    if str(task.get("status", "") or "").strip() not in {"completed", "failed"}:
+    if str(task.get("status", "") or "").strip() not in {"completed", "failed", "stopped"}:
         task["status"] = "failed"
         task["awaiting_hitl"] = False
     task["interruption_reason"] = str(reason or "Run interrupted before completion.").strip()

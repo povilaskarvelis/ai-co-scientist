@@ -165,6 +165,7 @@
     runStatus = "",
     taskStatus = "",
     awaitingApproval = false,
+    paused = false,
     started = false,
     events = [],
     summaries = [],
@@ -209,6 +210,7 @@
     if (run === "failed" || task === "failed") phase = "failed";
     else if (isActive) phase = "running";
     else if (task === "completed") phase = "done";
+    else if (paused) phase = "paused";
     else if (started && !awaitingApproval) phase = "running";
 
     const stepStates = {};
@@ -221,6 +223,8 @@
       const detail = detailById.get(stepId) || {};
       let status = phase === "awaiting" ? "pending" : String(detail.status || step?.status || "pending").trim();
       if (!["pending", "in_progress", "completed", "blocked"].includes(status)) status = "pending";
+      // A paused run's interrupted step is not running; it resumes from the next call.
+      if (phase === "paused" && status === "in_progress") status = "pending";
       let line = "";
       if (status === "in_progress") {
         runningId = runningId || stepId;
@@ -265,6 +269,7 @@
       const endMs = Date.parse(progress?.finishedAt || "");
       return Number.isFinite(startMs) && Number.isFinite(endMs) ? `Done in ${formatElapsed(endMs - startMs)}` : "Done";
     }
+    if (phase === "paused") return "Paused";
     if (phase === "failed") return "Stopped";
     return "";
   }

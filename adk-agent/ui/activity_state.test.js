@@ -241,3 +241,29 @@ test("the report row stays pending while steps run, writes after the last step a
   assert.equal(done.reportState.status, "completed");
   assert.equal(failed.reportState.status, "blocked");
 });
+
+test("a paused run keeps finished steps, queues the interrupted one and waits to write the report", () => {
+  const stopped = {
+    step_details: [
+      { id: "S1", status: "completed", result_summary: "Found two pivotal trials with consistent benefit." },
+      { id: "S2", status: "in_progress" },
+    ],
+  };
+  const progress = computePlanProgress({
+    runStatus: "awaiting_hitl",
+    taskStatus: "in_progress",
+    awaitingApproval: true,
+    paused: true,
+    started: true,
+    summaries: [stopped],
+    steps: PLAN_STEPS,
+  });
+
+  assert.equal(progress.phase, "paused");
+  assert.deepEqual(
+    PLAN_STEPS.map((step) => progress.stepStates[step.id].status),
+    ["completed", "pending", "pending"],
+  );
+  assert.equal(progress.reportState.status, "pending");
+  assert.equal(planStatusText(progress), "Paused");
+});
