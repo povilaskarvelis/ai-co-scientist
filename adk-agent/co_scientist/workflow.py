@@ -9039,7 +9039,7 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
         available_tools=_active_mcp_tools(),
     )
 
-    focused_catalog = _format_tool_catalog(focused_tools)
+    tool_notes = _format_step_tool_notes(focused_tools, tool_hint)
     routing_guidance = _format_step_routing_guidance(tool_hint, focused_tools)
     structured_observation_guidance = _format_structured_observation_guidance(tool_hint, focused_tools)
     payload = {
@@ -9065,13 +9065,18 @@ def _react_step_context_instructions(task_state: dict[str, Any], active_step: di
     ]
     instructions.extend(_candidate_handoff_context_instructions(task_state, active_step))
 
-    tools_header = (
-        f"Tools for this step (domains: {', '.join(step_domains)}):" if step_domains
-        else "Tools for this step:"
+    # The step's tools already reach the model as function declarations with full descriptions, so
+    # only what those lack is repeated here: curated notes for the tools the step is meant to use.
+    tools_scope = f" (domains: {', '.join(step_domains)})" if step_domains else ""
+    tools_text = (
+        f"Tools for this step{tools_scope}: the {len(focused_tools)} tools declared for this call; "
+        "their descriptions are in the tool definitions."
     )
+    if tool_notes:
+        tools_text += f"\nNotes on the main tools:\n{tool_notes}"
     instructions.append(
-        f"{tools_header}\n{focused_catalog}\n"
-        "Use this step-scoped tool set. Select a documented fallback from the list only when it can supply "
+        f"{tools_text}\n"
+        "Use this step-scoped tool set. Select a documented fallback only when it can supply "
         "the evidence required by the completion condition."
     )
     if routing_guidance:
@@ -11257,6 +11262,30 @@ def _format_tool_evidence_contract(tool_name: str, *, compact: bool = False) -> 
     return "\n".join(lines)
 
 
+def _format_step_tool_notes(tool_names: list[str], tool_hint: str) -> str:
+    """Curated notes the function declarations lack, for the tools a step is meant to use.
+
+    The hinted tool and its fallbacks keep their routing descriptions; any other tool appears only when
+    it has an evidence contract. Every tool's full description already travels as a declaration.
+    """
+    hint = str(tool_hint or "").strip()
+    primary = {hint, *tool_registry.TOOL_ROUTING_METADATA.get(hint, {}).get("fallback_tools", [])}
+    lines: list[str] = []
+    for name in _dedupe_tool_names(tool_names):
+        has_contract = name in tool_registry.TOOL_EVIDENCE_CONTRACTS
+        if name not in primary and not has_contract:
+            continue
+        source = tool_registry.TOOL_SOURCE_NAMES.get(name, "").strip()
+        line = f"- `{name}`" + (f" ({source})" if source else "")
+        if name in primary:
+            desc = _compact_tool_description(tool_registry.TOOL_DESCRIPTIONS.get(name, ""))
+            line += f": {desc}" if desc else ""
+        if has_contract:
+            line += f" [{_format_tool_evidence_contract(name, compact=True)}]"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _format_tool_catalog(tool_hints: list[str]) -> str:
     available = _dedupe_tool_names(tool_hints)
     if not available:
@@ -11532,7 +11561,55 @@ def _resolve_step_tool_allowlist(
 
     if not focused_tools:
         return available
-    return _prioritize_tools_for_step(focused_tools, tool_hint)
+    return _cap_step_tools(_prioritize_tools_for_step(focused_tools, tool_hint), active_step)
+
+
+# Every declared tool is resent on each model call of a step, and a broad domain (genomics has 48
+# tools) cost about 14k tokens per call while steps use one or two tools. The cap always keeps the
+# hinted tool, its fallbacks, its source family and any tool whose source the step names, then fills
+# up to the cap with the rest of the step's domain tools.
+STEP_TOOL_CAP = max(0, int(os.getenv("ADK_STEP_TOOL_CAP", "24")))
+
+_TOOL_KEYWORD_STOPWORDS = frozenset({
+    "and", "annotate", "assay", "association", "associations", "assets", "browser", "by", "canonical",
+    "catalog", "cell", "census", "compound", "data", "dataset", "datasets", "detail", "details",
+    "discover", "drug", "evidence", "experiment", "file", "files", "for", "gene", "genes", "genome", "get",
+    "highest", "human", "info", "initiative", "landscape", "length", "list", "map", "marker", "mean",
+    "metadata", "ncbi", "nearest", "of", "ontology", "portal", "profile", "proportion", "proportions",
+    "protein", "query", "record", "records", "region", "repurposing", "resolve", "resource", "resources",
+    "response", "run", "sample", "search", "select", "sequence", "sequences", "snapshot", "snapshots",
+    "study", "studies", "subset", "summarize", "summary", "table", "tables", "term", "terms", "the", "to",
+    "top", "track", "transcript", "transcripts", "type", "version", "versions",
+})
+
+
+def _keyword_tokens(text: str) -> set[str]:
+    tokens = set()
+    for token in re.split(r"[^a-z0-9]+", str(text or "").lower()):
+        if len(token) < 3 or token in _TOOL_KEYWORD_STOPWORDS:
+            continue
+        tokens.add(token[:-1] if len(token) > 4 and token.endswith("s") else token)
+    return tokens
+
+
+def _cap_step_tools(tools: list[str], active_step: dict[str, Any]) -> list[str]:
+    if not STEP_TOOL_CAP or len(tools) <= STEP_TOOL_CAP:
+        return tools
+    hint = str(active_step.get("tool_hint", "") or "").strip()
+    fallbacks = [str(name).strip() for name in tool_registry.TOOL_ROUTING_METADATA.get(hint, {}).get("fallback_tools", [])]
+    source = tool_registry.TOOL_SOURCE_NAMES.get(hint, "").strip()
+    family = [name for name in tools if source and tool_registry.TOOL_SOURCE_NAMES.get(name, "").strip() == source]
+    step_words = _keyword_tokens(" ".join(
+        str(active_step.get(key, "") or "") for key in ("goal", "completion_condition", "source", "handoff")
+    ))
+    named = [
+        name for name in tools
+        if _keyword_tokens(f"{name} {tool_registry.TOOL_SOURCE_NAMES.get(name, '')}") & step_words
+    ]
+    available = set(tools)
+    must_keep = [name for name in _dedupe_str_list([hint, *fallbacks, *family, *named], limit=120) if name in available]
+    ordered = _dedupe_str_list([*must_keep, *tools], limit=120)
+    return ordered[: max(STEP_TOOL_CAP, len(must_keep))]
 
 
 def _get_task_state_from_state_map(state: Mapping[str, Any] | None) -> dict[str, Any] | None:

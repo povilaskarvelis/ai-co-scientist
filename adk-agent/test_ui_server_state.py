@@ -1566,3 +1566,17 @@ def test_json_store_compacts_bloated_progress_on_load(tmp_path):
     assert "rendered_step_markdown" not in task["progress_events"][-1]["metrics"]
     assert len(store.get_run("run_big")["logs"]) == 300
     assert path.stat().st_size < size_before / 20
+
+
+def test_run_usage_adds_up_model_calls_per_agent():
+    from types import SimpleNamespace
+
+    totals: dict = {}
+    ui_server._add_event_usage(totals, "step_executor", SimpleNamespace(prompt_token_count=1000, cached_content_token_count=400, thoughts_token_count=50, candidates_token_count=20, tool_use_prompt_token_count=None))
+    ui_server._add_event_usage(totals, "step_executor", SimpleNamespace(prompt_token_count=1500, cached_content_token_count=None, thoughts_token_count=0, candidates_token_count=30, tool_use_prompt_token_count=0))
+
+    assert totals == {"step_executor": {"calls": 2, "prompt": 2500, "cached": 400, "thoughts": 50, "output": 50, "tool_prompt": 0}}
+    merged = ui_server._merge_usage(totals, {"step_executor": {"calls": 1, "prompt": 500}, "planner": {"calls": 1, "prompt": 9000}})
+    assert merged["step_executor"]["calls"] == 3
+    assert merged["step_executor"]["prompt"] == 3000
+    assert merged["planner"] == {"calls": 1, "prompt": 9000}

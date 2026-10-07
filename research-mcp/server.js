@@ -799,12 +799,12 @@ function normalizeToolResponseEnvelope(toolName, rawResult, requestArgs) {
   });
   normalizedPayload.result_meta = resultMeta;
 
+  // The full text travels once, in `content`; repeating it here doubled every result the model reads.
   const structuredContent = {
     envelope_version: STRUCTURED_CONTENT_ENVELOPE_VERSION,
     tool_name: toolName,
     status,
     summary,
-    text: combinedText,
     content_part_count: safeContent.length,
     emitted_at_utc: new Date().toISOString(),
     result_meta: resultMeta,

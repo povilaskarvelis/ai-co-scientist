@@ -315,6 +315,32 @@ def _is_planner_failure_response(text: str) -> bool:
     )
 
 
+_USAGE_FIELDS = (
+    ("prompt", "prompt_token_count"),
+    ("cached", "cached_content_token_count"),
+    ("thoughts", "thoughts_token_count"),
+    ("output", "candidates_token_count"),
+    ("tool_prompt", "tool_use_prompt_token_count"),
+)
+
+
+def _add_event_usage(totals: dict[str, dict[str, int]], author: str, usage_metadata: Any) -> None:
+    """Add one model response's token counts to the totals of the agent that produced it."""
+    bucket = totals.setdefault(author or "unknown", {"calls": 0})
+    bucket["calls"] = bucket.get("calls", 0) + 1
+    for key, attr in _USAGE_FIELDS:
+        bucket[key] = bucket.get(key, 0) + int(getattr(usage_metadata, attr, 0) or 0)
+
+
+def _merge_usage(current: dict[str, dict[str, int]], extra: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
+    merged = {author: dict(counts) for author, counts in (current or {}).items()}
+    for author, counts in extra.items():
+        bucket = merged.setdefault(author, {})
+        for key, value in counts.items():
+            bucket[key] = int(bucket.get(key, 0)) + int(value or 0)
+    return merged
+
+
 def _fire_and_forget_threadsafe(coro: Any, loop: asyncio.AbstractEventLoop, *, label: str = "") -> None:
     try:
         future = asyncio.run_coroutine_threadsafe(coro, loop)
@@ -632,6 +658,8 @@ class RunRecord:
     follow_up_suggestions: list[str] = field(default_factory=list)
     clarification: str | None = None
     error: str | None = None
+    # Model token counts for this run, per agent (see _add_event_usage).
+    usage: dict = field(default_factory=dict)
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
 
@@ -651,6 +679,7 @@ class RunRecord:
             "follow_up_suggestions": list(self.follow_up_suggestions),
             "clarification": self.clarification,
             "error": self.error,
+            "usage": dict(self.usage),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -1434,6 +1463,7 @@ class UiRuntime:
         step_started_ids: set[str] = set()
         step_completed_ids: set[str] = set()
         tool_error_signatures: set[tuple[str, str, str]] = set()
+        turn_usage: dict[str, dict[str, int]] = {}
 
         def _step_source_label(tn: str) -> str:
             return _resolve_source_label(tn or "")
@@ -1453,6 +1483,9 @@ class UiRuntime:
             new_message=current_message,
             run_config=RunConfig(max_llm_calls=MAX_LLM_CALLS_PER_TURN),
         ):
+            usage_metadata = getattr(event, "usage_metadata", None)
+            if usage_metadata is not None and not getattr(event, "partial", False):
+                _add_event_usage(turn_usage, str(getattr(event, "author", "") or ""), usage_metadata)
             content = getattr(event, "content", None)
             parts = getattr(content, "parts", None)
             if not parts:
@@ -1673,6 +1706,13 @@ class UiRuntime:
                 continue
             partial_by_author[author] = f"{partial_by_author.get(author, '')}{text}"
 
+        if turn_usage:
+            _fire_and_forget_threadsafe(
+                self._merge_run_usage(run_id, turn_usage),
+                caller_loop,
+                label=f"merge_usage:{run_id}",
+            )
+
         wf_state = await self._read_workflow_state(conversation_id)
         if wf_state and step_counter > 0:
             _fire_and_forget_threadsafe(
@@ -1821,6 +1861,16 @@ class UiRuntime:
             self.runs[run.run_id] = run
         self.store.save_run(run.to_dict(), flush=True)
         return run
+
+    async def _merge_run_usage(self, run_id: str, usage: dict[str, dict[str, int]]) -> None:
+        """Add one workflow turn's token counts to the run, and log them for cost tracking."""
+        if not usage:
+            return
+        async with self.runs_lock:
+            run = self.runs.get(run_id)
+            current = dict(run.usage) if run else {}
+        await self._update_run(run_id, usage=_merge_usage(current, usage))
+        print(f"[usage] run={run_id} {json.dumps(usage, sort_keys=True)}", flush=True)
 
     async def _update_run(self, run_id: str, **updates) -> None:
         if self._run_writes_blocked(run_id):

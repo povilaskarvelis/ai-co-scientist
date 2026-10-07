@@ -5159,3 +5159,47 @@ def test_report_drops_internal_context_labels_cited_as_sources():
         "Variants were mapped [GWAS Catalog] and scored.\n"
         "See [Nazarian et al., 2023](#ref-1) and [PubMed].\n"
     )
+
+
+def test_step_tool_cap_keeps_named_and_family_tools_and_trims_the_rest():
+    step = {
+        "id": "S1",
+        "tool_hint": "get_variant_annotations",
+        "domains": ["genomics"],
+        "goal": "Annotate an SCN2A missense variant with VEP, gnomAD, and dbSNP evidence",
+        "completion_condition": "Functional predictions and allele frequencies are summarized",
+    }
+    full_cap = workflow.STEP_TOOL_CAP
+    try:
+        workflow.STEP_TOOL_CAP = 0
+        uncapped = workflow._resolve_step_tool_allowlist(step, available_tools=workflow.KNOWN_MCP_TOOLS)
+        workflow.STEP_TOOL_CAP = 24
+        capped = workflow._resolve_step_tool_allowlist(step, available_tools=workflow.KNOWN_MCP_TOOLS)
+    finally:
+        workflow.STEP_TOOL_CAP = full_cap
+
+    assert len(uncapped) > 24
+    assert len(capped) == 24
+    assert capped[0] == "get_variant_annotations"
+    for named in ("annotate_variants_vep", "get_gnomad_gene_constraint", "get_dbsnp_population_frequency", "search_variants_by_gene"):
+        assert named in capped
+
+
+def test_step_context_keeps_curated_notes_only_for_the_main_tools():
+    task_state = {
+        "objective": "What does APOE4 mean for Alzheimer's risk?",
+        "steps": [{
+            "id": "S1",
+            "status": "pending",
+            "goal": "Find GWAS associations for rs429358",
+            "tool_hint": "search_gwas_associations",
+            "domains": ["genomics"],
+            "completion_condition": "Associations with p-values are listed",
+        }],
+    }
+    text = "\n".join(workflow._react_step_context_instructions(task_state, task_state["steps"][0]))
+
+    assert "their descriptions are in the tool definitions" in text
+    assert "- `search_gwas_associations` (GWAS Catalog):" in text
+    # Tools outside the hint, its fallbacks and the evidence contracts are declared, not described again.
+    assert "- `get_jaspar_motif_profile`" not in text
