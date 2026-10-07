@@ -324,6 +324,11 @@ _USAGE_FIELDS = (
 )
 
 
+def _planning_blockers(wf_state: dict | None) -> list[str]:
+    """Plan steps the selected tools cannot answer; approving such a plan revises it first."""
+    return [str(item).strip() for item in (wf_state or {}).get("planning_blockers", []) or [] if str(item).strip()]
+
+
 def _add_event_usage(totals: dict[str, dict[str, int]], author: str, usage_metadata: Any) -> None:
     """Add one model response's token counts to the totals of the agent that produced it."""
     bucket = totals.setdefault(author or "unknown", {"calls": 0})
@@ -824,6 +829,7 @@ def _task_summary(task: dict) -> dict:
         "user_query": task.get("user_query", task.get("objective", "")),
         "status": task.get("status", ""),
         "awaiting_hitl": bool(task.get("awaiting_hitl")),
+        "planning_blockers": list(task.get("planning_blockers") or []),
         "current_step_index": task.get("current_step_index", 0),
         "step_count": len(task.get("steps", [])),
         "created_at": task.get("created_at", ""),
@@ -2185,6 +2191,28 @@ class UiRuntime:
                         if terminal_error or direct_response_detected or not planner_failed:
                             break
 
+            # Approving a plan with tool-capability blockers revises it instead of starting research,
+            # which looked like a glitch from the "Start research" button. Revise once now, so the plan
+            # the user approves is one that can run.
+            if plan_pending and not terminal_error and _planning_blockers(wf_state):
+                await self._append_progress_event(
+                    run_id,
+                    phase="plan",
+                    event_type="plan.revising",
+                    status="progress",
+                    human_line="Adjusting steps the selected tools cannot answer...",
+                    task_id=task_id,
+                )
+                response_text, responding_author = await self._run_workflow_turn_filtered(
+                    conv_id, "approve", run_id=run_id,
+                )
+                wf_state = await self._read_workflow_state(conv_id)
+                plan_pending = await self._is_plan_pending_approval(conv_id)
+                terminal_error = _is_terminal_workflow_error_response(response_text)
+                planner_failed = not terminal_error and not wf_state and not plan_pending
+                task["steps"] = _steps_from_workflow_state(wf_state)
+                task["current_step_index"] = 0
+
             if terminal_error:
                 run_error = _derive_run_error_message(response_text, "Run failed.")
                 task["status"] = "failed"
@@ -2243,6 +2271,7 @@ class UiRuntime:
             elif plan_pending:
                 task["awaiting_hitl"] = True
                 task["status"] = "in_progress"
+                task["planning_blockers"] = _planning_blockers(wf_state)
                 await self._append_progress_event(
                     run_id,
                     phase="plan",
@@ -2445,6 +2474,7 @@ class UiRuntime:
                 if plan_pending:
                     task["awaiting_hitl"] = True
                     task["status"] = "in_progress"
+                    task["planning_blockers"] = _planning_blockers(wf_state)
                     await self._save_task_with_progress(task, run_id)
                     await self._update_run(run_id, status="awaiting_hitl", task_id=task_id)
                     await self._append_progress_event(
@@ -2637,6 +2667,7 @@ class UiRuntime:
             task["steps"] = _steps_from_workflow_state(wf_state)
             task["hitl_history"].append(f"revise:{message}")
             task["awaiting_hitl"] = plan_pending
+            task["planning_blockers"] = _planning_blockers(wf_state)
             task["status"] = "in_progress"
 
             restated = (wf_state or {}).get("objective", "").strip()

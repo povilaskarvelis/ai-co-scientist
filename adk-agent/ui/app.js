@@ -729,7 +729,10 @@ function planHtmlForIteration(iteration) {
   }
   html += `</ol>`;
   if (!tracking) {
-    html += `<p class="plan-followup">You can revise the plan, share suggestions, or start the research when you're ready.</p>`;
+    const blocked = Array.isArray(iteration?.task?.planning_blockers) && iteration.task.planning_blockers.length > 0;
+    html += blocked
+      ? `<p class="plan-followup">Some steps ask for evidence their tools can't provide, so the plan will be revised before research starts.</p>`
+      : `<p class="plan-followup">You can revise the plan, share suggestions, or start the research when you're ready.</p>`;
   }
   html += `<span class="sr-only" data-role="plan-announcer" aria-live="polite"></span></div>`;
   return html;
@@ -1466,7 +1469,10 @@ function renderMessages() {
 
     const planHtml = planHtmlForIteration(iteration);
     const awaiting = Boolean(task.awaiting_hitl);
-    const buttonLabel = task.hitl_history && (task.hitl_history.includes("approve") || task.hitl_history.includes("continue")) ? "Approve plan" : "Start research";
+    const hasBlockers = Array.isArray(task.planning_blockers) && task.planning_blockers.length > 0;
+    const buttonLabel = hasBlockers
+      ? "Revise plan"
+      : (task.hitl_history && (task.hitl_history.includes("approve") || task.hitl_history.includes("continue")) ? "Approve plan" : "Start research");
     parts.push(checkpointHtml(task.task_id, planHtml, awaiting, buttonLabel));
     if (activityCard && shouldPlaceAfterPlan) parts.push(activityCard);
 

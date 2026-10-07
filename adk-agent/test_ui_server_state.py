@@ -1580,3 +1580,49 @@ def test_run_usage_adds_up_model_calls_per_agent():
     assert merged["step_executor"]["calls"] == 3
     assert merged["step_executor"]["prompt"] == 3000
     assert merged["planner"] == {"calls": 1, "prompt": 9000}
+
+
+@pytest.mark.asyncio
+async def test_run_new_query_revises_a_blocked_plan_before_asking_for_approval(runtime):
+    prompts: list[str] = []
+
+    async def fake_acquire_conversation_session(conversation_id: str):
+        return SimpleNamespace(app_name="test-app", session_id=conversation_id)
+
+    async def fake_turn(conversation_id: str, prompt: str, *, run_id: str):
+        prompts.append(prompt)
+        return "## Research Plan\n\n1. Inspect labels.", "research_workflow"
+
+    async def fake_read_state(conversation_id: str):
+        revised = len(prompts) >= 2
+        return {
+            "objective": "Compare KRAS G12C response",
+            "plan_status": "ready",
+            "planning_blockers": [] if revised else ["S2: the selected tool cannot compare lineages"],
+            "steps": [{
+                "id": "S1",
+                "goal": "Revised step" if revised else "Original step",
+                "status": "pending",
+                "tool_hint": "search_pubmed",
+                "completion_condition": "Evidence listed",
+            }],
+        }
+
+    async def fake_plan_pending(conversation_id: str) -> bool:
+        return True
+
+    runtime._acquire_conversation_session = fake_acquire_conversation_session  # type: ignore[method-assign]
+    runtime._run_workflow_turn_filtered = fake_turn  # type: ignore[method-assign]
+    runtime._read_workflow_state = fake_read_state  # type: ignore[method-assign]
+    runtime._is_plan_pending_approval = fake_plan_pending  # type: ignore[method-assign]
+
+    run = await runtime._create_run("new_query", query="Compare KRAS G12C response")
+    await runtime._run_new_query(run.run_id, "Compare KRAS G12C response")
+
+    payload = await runtime.get_run(run.run_id)
+    task = runtime.store.get_task(payload["task_id"])
+    # The blocked plan is revised once during planning, so "Start research" then starts research.
+    assert prompts == ["Compare KRAS G12C response", "approve"]
+    assert payload["status"] == "awaiting_hitl"
+    assert task["steps"][0]["title"] == "Revised step"
+    assert task["planning_blockers"] == []
