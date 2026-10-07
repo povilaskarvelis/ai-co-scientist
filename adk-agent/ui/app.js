@@ -529,8 +529,9 @@ function updateStopButton() {
   const stopping = Boolean(run && state.stoppingRunIds.has(run.run_id));
   el.stopBtn.classList.toggle("hidden", !run);
   el.stopBtn.disabled = stopping;
-  const label = el.stopBtn.querySelector(".stop-label");
-  if (label) label.textContent = stopping ? "Stopping…" : "Stop";
+  const label = stopping ? "Stopping…" : "Stop";
+  el.stopBtn.title = label;
+  el.stopBtn.setAttribute("aria-label", label);
   if (run) el.sendBtn.classList.add("hidden");
 }
 
