@@ -742,6 +742,18 @@ body.expanded .workspace.report-open .report-panel {
   color: #f8f8f8;
 }
 
+/* The Atom mark before the name, sized with the title so it scales on phones too. */
+.landing-title {
+  display: flex;
+  align-items: center;
+  gap: 0.28em;
+}
+
+.landing-mark {
+  width: 0.8em;
+  height: 0.8em;
+}
+
 .landing-subtitle {
   max-width: 860px;
   margin: 0 0 16px;
